@@ -419,7 +419,7 @@ async def start_job(project_id: str, body: StartJob, background: BackgroundTasks
         if not voice:
             raise HTTPException(409, "Choose a voice with a matched live consent recording")
         credits = estimated_job_credits(project["duration_s"], len(json.loads(project["target_langs_json"])))
-        if credits > settings.max_credits_per_job:
+        if settings.max_credits_per_job and credits > settings.max_credits_per_job:
             raise HTTPException(429, f"Estimated job cost {credits} exceeds the per-job safety cap")
         used_today = connection.execute("SELECT COALESCE(SUM(est_credits),0) FROM credit_ledger WHERE date(created_at)=date('now')").fetchone()[0]
         if used_today + credits > settings.gnani_daily_limit:

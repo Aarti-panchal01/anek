@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     numeral_style: str = "ascii"
     max_video_seconds: int = Field(default=120, le=120, gt=0)
-    max_credits_per_job: int = 2500
+    max_credits_per_job: int = 0
     gnani_daily_limit: int = 2500
     enabled_langs: Annotated[list[str], NoDecode] = Field(default_factory=lambda: list(LANGUAGES))
     low_trust_verify_langs: Annotated[list[str], NoDecode] = Field(
