@@ -1,4 +1,4 @@
-from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, transcript_sentences
+from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, targeted_silence_segments, transcript_sentences
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
 from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons
@@ -16,6 +16,31 @@ def test_short_video_uses_its_silence_boundaries_instead_of_one_fixed_cut():
     assert ranges == [(0.0, 7.37), (7.37, 15.25), (15.25, 20.625)]
 
 
+def test_targeted_segments_prefer_three_to_eight_seconds_and_never_exceed_twelve():
+    ranges = targeted_silence_segments(20.625, [0.16, 2.09, 4.65, 7.32, 10.89, 15.25, 20.38])
+    assert all(end - start <= 12 for start, end in ranges)
+    assert all(end - start >= 3 for start, end in ranges)
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == 20.625
+
+
+def test_targeted_segments_without_silences_stay_inside_video_and_hard_cap():
+    ranges = targeted_silence_segments(20.625, [])
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == 20.625
+    assert all(3 <= end - start <= 12 for start, end in ranges)
+
+
+def test_incomplete_transcript_merge_respects_hard_duration_limit():
+    chunks = [
+        {"start": 0.0, "end": 7.0, "raw": "An unfinished phrase", "lang": "en-IN"},
+        {"start": 7.0, "end": 13.0, "raw": "continues here.", "lang": "en-IN"},
+    ]
+    merged = merge_incomplete_chunks(chunks, lambda start, end: {"transcript": "combined."}, max_seconds=12)
+    assert merged[0]["cut_mid_sentence"] is True
+    assert len(merged) == 2
+
+
 def test_synthesis_sentences_and_srt_preserve_cue_times():
     assert transcript_sentences("First line. Second line! तीसरी पंक्ति।") == [
         "First line.", "Second line!", "तीसरी पंक्ति।"
@@ -25,7 +50,7 @@ def test_synthesis_sentences_and_srt_preserve_cue_times():
     assert "வணக்கம்" in srt
 
 
-def test_mid_sentence_silence_cut_is_merged_and_retranscribed():
+def test_mid_sentence_merge_does_not_cross_the_twelve_second_hard_cap():
     chunks = [
         {"start": 0.0, "end": 10.8, "raw": "Choose a wig or", "lang": "en-IN"},
         {"start": 10.8, "end": 15.2, "raw": "a headcover?", "lang": "en-IN"},
@@ -38,8 +63,10 @@ def test_mid_sentence_silence_cut_is_merged_and_retranscribed():
         return {"transcript": "Choose a wig or a headcover?", "detected_language_code": "en-IN"}
 
     result = merge_incomplete_chunks(chunks, transcribe)
-    assert calls == [(0.0, 15.2)]
-    assert [row["raw"] for row in result] == ["Choose a wig or a headcover?", "I made an app."]
+    assert calls == []
+    assert len(result) == 3
+    assert result[0]["cut_mid_sentence"] is True
+    assert all(row["end"] - row["start"] <= 12 for row in result)
 
 
 def test_uncertain_noun_is_kept_while_clear_grammar_cleanup_is_applied():

@@ -22,6 +22,7 @@ except ImportError:
 
 from backend import db
 from backend.brain.checks import run_checks
+from backend.clients.gnani import create_gnani_client
 from backend.brain.termsheet import TermSheet
 from backend.config import LANGUAGES, get_settings
 from backend.pipeline.phase3b import run_quality_pass

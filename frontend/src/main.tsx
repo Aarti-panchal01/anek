@@ -10,7 +10,12 @@ const API = '/api';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, init);
-  if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
+  if (!response.ok) {
+    const body = await response.text();
+    let detail = body || response.statusText;
+    try { detail = JSON.parse(body).detail || detail; } catch { /* Plain-text proxy/server errors are valid diagnostics too. */ }
+    throw new Error(detail);
+  }
   return response.json();
 }
 
