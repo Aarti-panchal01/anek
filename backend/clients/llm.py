@@ -44,7 +44,11 @@ class LiveLLMClient:
             },
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        if response.is_error:
+            # Include the provider's validation detail without echoing request
+            # headers, which contain credentials.
+            detail = response.text[:1200]
+            raise RuntimeError(f"LLM provider returned HTTP {response.status_code}: {detail}")
         content = response.json()["choices"][0]["message"]["content"]
         result = json.loads(content)
         if not isinstance(result, dict):

@@ -55,7 +55,9 @@ def run_checks(
         chars = [char for char in script_text if char.isalpha()]
         if chars:
             script_chars = sum(_is_target_script(char, target_lang) for char in chars)
-            if script_chars / len(chars) < 0.5:
+            # Spoken translations may retain common English terms in Latin
+            # script; still require a meaningful target-script signal.
+            if script_chars / len(chars) < 0.35:
                 failures.append({"check": "wrong_script", "detail": target_lang})
     if len(translation) > max_chars:
         failures.append({"check": "too_many_characters", "detail": str(len(translation))})
