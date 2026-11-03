@@ -1,0 +1,18 @@
+{
+  "source_lang": "en-IN",
+  "source_text": "Zorvo costs 499 rupees. Call 9876543210 on 12 March 2026.",
+  "max_chars": 220,
+  "termsheet": {
+    "terms": [
+      {
+        "term": "Zorvo",
+        "type": "brand",
+        "treatment": "keep",
+        "targets": {"hi-IN": "Zorvo"},
+        "locked": true,
+        "note": "Fictional brand; do not translate."
+      }
+    ],
+    "idioms": []
+  }
+}

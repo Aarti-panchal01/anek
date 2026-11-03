@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     max_credits_per_job: int = 400
     gnani_daily_limit: int = 300
     enabled_langs: Annotated[list[str], NoDecode] = Field(default_factory=lambda: list(LANGUAGES))
+    low_trust_verify_langs: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["mr-IN", "pa-IN"]
+    )
     gnani_mock: bool = False
     llm_mock: bool = False
     fit_tolerance: float = 1.15
@@ -47,6 +50,13 @@ class Settings(BaseSettings):
     @field_validator("enabled_langs", mode="before")
     @classmethod
     def parse_enabled_langs(cls, value: list[str] | str) -> list[str]:
+        if isinstance(value, str):
+            return [language.strip() for language in value.split(",") if language.strip()]
+        return value
+
+    @field_validator("low_trust_verify_langs", mode="before")
+    @classmethod
+    def parse_low_trust_langs(cls, value: list[str] | str) -> list[str]:
         if isinstance(value, str):
             return [language.strip() for language in value.split(",") if language.strip()]
         return value
