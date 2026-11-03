@@ -1,0 +1,9 @@
+.env
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/
+samples/
+out_*.wav
+dist/
+node_modules/

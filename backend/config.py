@@ -1,0 +1,50 @@
+"""Application configuration loaded from environment variables and .env."""
+
+from functools import lru_cache
+
+from dotenv import load_dotenv
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+LANGUAGES = {
+    "bn-IN": "Bengali",
+    "en-IN": "English",
+    "gu-IN": "Gujarati",
+    "hi-IN": "Hindi",
+    "kn-IN": "Kannada",
+    "ml-IN": "Malayalam",
+    "mr-IN": "Marathi",
+    "pa-IN": "Punjabi",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+}
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_name: str = "Anek"
+    gnani_api_key: str = ""
+    gnani_base_url: str = "https://api.vachana.ai"
+    stt_model: str = "prisma-v2.5"
+    verify_stt_model: str = "prisma-v3.0"
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: str = ""
+    numeral_style: str = "ascii"
+    max_video_seconds: int = Field(default=120, le=120, gt=0)
+    max_credits_per_job: int = 400
+    gnani_daily_limit: int = 300
+    enabled_langs: list[str] = Field(default_factory=lambda: list(LANGUAGES))
+    gnani_mock: bool = False
+    llm_mock: bool = False
+    fit_tolerance: float = 1.15
+    max_stretch: float = 1.15
+    similarity_threshold: float = 0.7
+    consent_match_threshold: int = 85
+
+
+@lru_cache
+def get_settings() -> Settings:
+    load_dotenv()
+    return Settings()
