@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_model: str = ""
     llm_api_key: str = ""
+    groq_api_keys: str = ""
+    llm_cache_path: str = "data/llm_response_cache.sqlite3"
     numeral_style: str = "ascii"
     max_video_seconds: int = Field(default=120, le=120, gt=0)
     max_credits_per_job: int = 0
