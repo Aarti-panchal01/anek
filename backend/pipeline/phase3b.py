@@ -67,6 +67,21 @@ def transcript_sentences(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"(?<=[.!?।॥])\s+", text) if part.strip()]
 
 
+def create_srt(clips: list[dict]) -> str:
+    def timestamp(seconds: float) -> str:
+        milliseconds = round(seconds * 1000)
+        hours, milliseconds = divmod(milliseconds, 3_600_000)
+        minutes, milliseconds = divmod(milliseconds, 60_000)
+        whole_seconds, milliseconds = divmod(milliseconds, 1000)
+        return f"{hours:02}:{minutes:02}:{whole_seconds:02},{milliseconds:03}"
+
+    cues = [
+        f"{index}\n{timestamp(clip['start_s'])} --> {timestamp(clip['end_s'])}\n{clip['translation']}"
+        for index, clip in enumerate(clips, 1)
+    ]
+    return "\n\n".join(cues) + "\n"
+
+
 def prompt_json(client: LiveLLMClient, system: str, payload: dict) -> dict:
     return client.chat_json([
         {"role": "system", "content": system},
@@ -91,7 +106,13 @@ def translation_candidates(
     terms: TermSheet,
     content_type: str,
     max_chars: int,
+    translation_style: str = "neutral",
 ) -> list[str]:
+    tone = {
+        "formal": "clear, respectful formal spoken register",
+        "colloquial": "everyday casual spoken language",
+        "marketing": "energetic and persuasive spoken language",
+    }.get(translation_style, CONTENT_TONES[content_type])
     response = prompt_json(
         client,
         "Generate exactly three meaning-preserving spoken translations. Use the provided tone. Keep common English words that speakers naturally code-mix in Latin script when natural; retain approved terms exactly. Avoid formal textbook constructions. Preserve every number, date, amount, and unit. Return JSON: {candidates:[string,string,string]}.",
@@ -100,7 +121,7 @@ def translation_candidates(
             "source_language": source_lang,
             "target_language": target_lang,
             "content_type": content_type,
-            "tone": CONTENT_TONES[content_type],
+            "tone": tone,
             "max_chars": max_chars,
             "terms": terms.model_dump(),
         },
@@ -185,7 +206,7 @@ def synthesize_sentence_list(client, sentences: list[str], embedding: dict, work
     return output, duration_of(output)
 
 
-def run_quality_pass(video: Path, reference: Path, targets: list[str], output_dir: Path, settings: Settings, content_type: str = "explainer") -> list[dict]:
+def run_quality_pass(video: Path, reference: Path, targets: list[str], output_dir: Path, settings: Settings, content_type: str = "explainer", translation_style: str = "neutral", speaker_embedding: dict | None = None) -> list[dict]:
     if not video.is_file() or not reference.is_file():
         raise FileNotFoundError("Video and reference audio must exist")
     duration = duration_of(video)
@@ -217,12 +238,12 @@ def run_quality_pass(video: Path, reference: Path, targets: list[str], output_di
             cleaned_rows.append(row)
 
         clean_reference, reference_seconds = denoise_reference(reference, work)
-        embedding = gnani.make_embedding(clean_reference.read_bytes())
+        embedding = speaker_embedding or gnani.make_embedding(clean_reference.read_bytes())
         for target_lang in targets:
             language_rows = []
             for index, row in enumerate(cleaned_rows):
                 slot = row["end"] - row["start"]
-                candidates = translation_candidates(llm, row["cleaned"], source_lang, target_lang, term_sheet, content_type, max(80, int(slot * 15)))
+                candidates = translation_candidates(llm, row["cleaned"], source_lang, target_lang, term_sheet, content_type, max(80, int(slot * 15)), translation_style)
                 selected, selected_index, selection_reason = select_candidate(llm, row["cleaned"], candidates, target_lang, slot, 15)
                 checks = run_checks(row["cleaned"], selected, target_lang, term_sheet, max_chars=1000)
                 if checks:
@@ -265,9 +286,11 @@ def run_quality_pass(video: Path, reference: Path, targets: list[str], output_di
             mux_outputs(video, language_rows, final_path, duration, work, settings)
             report = build_report(target_lang, [{key: val for key, val in row.items() if key != "audio_path"} for row in language_rows], settings)
             report.update({"source_language": source_lang, "content_type": content_type, "reference_audio_seconds": reference_seconds, "models": {"stt": "prisma-v3.0", "voice": "vachana-vc-v1", "translation": settings.llm_model}})
+            report["term_sheet"] = term_sheet.model_dump()
             report_path = final_path.with_suffix(".json")
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-            all_outputs.append({"language": target_lang, "mp4": str(final_path), "report": str(report_path), "clips": language_rows})
+            final_path.with_suffix(".srt").write_text(create_srt(language_rows), encoding="utf-8")
+            all_outputs.append({"language": target_lang, "mp4": str(final_path), "report": str(report_path), "clips": language_rows, "term_sheet": term_sheet.model_dump()})
     return all_outputs
 
 

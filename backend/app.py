@@ -2,14 +2,16 @@
 
 import asyncio
 import json
+import math
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from difflib import SequenceMatcher
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 try:
     from rapidfuzz.fuzz import ratio
@@ -56,6 +58,8 @@ class DubEdit(BaseModel):
 
 class StartJob(BaseModel):
     voice_id: str
+    content_type: str = "explainer"
+    translation_style: str = "neutral"
 
 
 class ExportRequest(BaseModel):
@@ -95,6 +99,10 @@ def probe_video(path: Path) -> tuple[float, bool]:
     return float(probe.stdout.strip()), bool(streams.stdout.strip())
 
 
+def estimated_job_credits(duration_s: float, language_count: int) -> int:
+    return max(1, math.ceil(duration_s / 12) * language_count * 4)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     db.initialize()
@@ -112,12 +120,15 @@ async def health() -> dict:
 
 @app.get("/api/config")
 async def get_config() -> dict:
+    with db.connect() as connection:
+        used = connection.execute("SELECT COALESCE(SUM(est_credits),0) FROM credit_ledger WHERE date(created_at)=date('now')").fetchone()[0]
     return {
         "app_name": settings.app_name,
         "languages": {code: LANGUAGES[code] for code in settings.enabled_langs if code in LANGUAGES},
         "max_video_seconds": settings.max_video_seconds,
         "llm_model": settings.llm_model,
         "daily_credit_limit": settings.gnani_daily_limit,
+        "remaining_daily_credits": max(0, settings.gnani_daily_limit - int(used)),
         "low_trust_verify_langs": settings.low_trust_verify_langs,
     }
 
@@ -178,15 +189,35 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id}
 
 
+@app.get("/api/projects/{project_id}/video")
+async def project_video(project_id: str):
+    project = project_row(project_id)
+    if not project["video_path"]:
+        raise HTTPException(404, "Project video not found")
+    return FileResponse(project["video_path"], media_type="video/mp4")
+
+
+@app.get("/api/projects/{project_id}/media")
+async def dubbed_media(project_id: str, lang: str):
+    project_row(project_id)
+    folder = DATA_ROOT / "exports" / project_id
+    matches = list(folder.glob(f"*_{lang}*ai-dubbed.mp4"))
+    if not matches:
+        raise HTTPException(404, "Dubbed video is not ready")
+    return FileResponse(matches[0], media_type="video/mp4")
+
+
 @app.get("/api/projects/{project_id}/estimate")
 async def estimate(project_id: str) -> dict:
     project = project_row(project_id)
     if not project["duration_s"]:
         raise HTTPException(409, "Upload a video to estimate processing")
     targets = json.loads(project["target_langs_json"])
-    clips = max(1, round(project["duration_s"] / 12))
-    estimated = min(settings.gnani_daily_limit, len(targets) * clips * 4)
-    return {"duration_s": project["duration_s"], "estimated_clips": clips, "languages": len(targets), "estimated_credits": estimated, "remaining_daily_credits": settings.gnani_daily_limit}
+    clips = max(1, math.ceil(project["duration_s"] / 12))
+    estimated = estimated_job_credits(project["duration_s"], len(targets))
+    with db.connect() as connection:
+        used = connection.execute("SELECT COALESCE(SUM(est_credits),0) FROM credit_ledger WHERE date(created_at)=date('now')").fetchone()[0]
+    return {"duration_s": project["duration_s"], "estimated_clips": clips, "languages": len(targets), "estimated_credits": estimated, "remaining_daily_credits": max(0, settings.gnani_daily_limit - int(used))}
 
 
 @app.get("/api/voices/consent-phrase")
@@ -210,15 +241,26 @@ async def create_voice(
         raise HTTPException(400, "Request a consent phrase and record it live before voice setup")
     consent_bytes = await consent_audio.read()
     reference_bytes = await reference_audio.read()
+    voice_id = new_id()
+    voice_dir = DATA_ROOT / "voices"
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    reference_path = voice_dir / f"{voice_id}.wav"
+    with tempfile.TemporaryDirectory(dir=voice_dir, prefix="convert-") as folder:
+        source = Path(folder) / safe_upload_name(consent_audio.filename)
+        consent_wav = Path(folder) / "consent.wav"
+        source.write_bytes(consent_bytes)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ac", "1", "-ar", "16000", str(consent_wav)], check=True, capture_output=True)
+        consent_bytes = consent_wav.read_bytes()
+        reference_source = Path(folder) / safe_upload_name(reference_audio.filename)
+        reference_wav = Path(folder) / "reference.wav"
+        reference_source.write_bytes(reference_bytes)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(reference_source), "-ac", "1", "-ar", "24000", str(reference_wav)], check=True, capture_output=True)
+        reference_bytes = reference_wav.read_bytes()
     consent_client = create_gnani_client(settings.gnani_mock)
     transcript = consent_client.stt(consent_bytes, "indic-auto", "prisma-v3.0")
     match = ratio(phrase.casefold(), transcript.get("transcript", "").casefold())
     if match < settings.consent_match_threshold:
         raise HTTPException(422, f"Consent phrase did not match (similarity {match:.0f}%)")
-    voice_id = new_id()
-    voice_dir = DATA_ROOT / "voices"
-    voice_dir.mkdir(parents=True, exist_ok=True)
-    reference_path = voice_dir / f"{voice_id}.wav"
     reference_path.write_bytes(reference_bytes)
     embedding = consent_client.make_embedding(reference_bytes)
     with db.connect() as connection:
@@ -323,26 +365,42 @@ async def run_job(job_id: str) -> None:
         connection.execute("UPDATE jobs SET state='running',stage='processing',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
     try:
         targets = json.loads(project["target_langs_json"])
-        results = await asyncio.to_thread(
-            run_quality_pass,
-            Path(project["video_path"]), Path(voice["reference_path"]), targets,
-            DATA_ROOT / "exports" / project["id"], settings,
-        )
+        completed = set()
         with db.connect() as connection:
+            completed = {row["lang"] for row in connection.execute("SELECT DISTINCT lang FROM dubs WHERE clip_id IN (SELECT id FROM clips WHERE project_id=?)", (project["id"],)).fetchall()}
+        output_dir = DATA_ROOT / "exports" / project["id"]
+        embedding = json.loads(voice["embedding_json"])
+        for target_index, lang in enumerate(targets):
+            if lang in completed and list(output_dir.glob(f"*_{lang}*.json")):
+                continue
+            with db.connect() as connection:
+                connection.execute("UPDATE jobs SET stage=?,done=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (f"processing {lang}", target_index, job_id))
+            results = await asyncio.to_thread(
+                run_quality_pass,
+                Path(project["video_path"]), Path(voice["reference_path"]), [lang],
+                output_dir, settings, job["content_type"], job["translation_style"], embedding,
+            )
             for result in results:
                 lang = result["language"]
-                for clip in result["clips"]:
-                    clip_id = new_id()
-                    row = connection.execute("SELECT id FROM clips WHERE project_id=? AND idx=?", (project["id"], clip["clip"]-1)).fetchone()
-                    if row:
-                        clip_id = row["id"]
-                    else:
-                        connection.execute("INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)", (clip_id, project["id"], clip["clip"]-1, clip["start_s"], clip["end_s"], clip["source_cleaned"]))
-                    connection.execute(
-                        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json) VALUES(?,?,?,?,?,?,?,?) "
-                        "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,updated_at=CURRENT_TIMESTAMP",
-                        (new_id(), clip_id, lang, clip["translation"], clip["translation"], clip["status"], json.dumps(clip["reasons"], ensure_ascii=False), json.dumps([])),
-                    )
+                with db.connect() as connection:
+                    for term in result.get("term_sheet", {}).get("terms", []):
+                        exists = connection.execute("SELECT id FROM terms WHERE project_id=? AND term=?", (project["id"], term["term"])).fetchone()
+                        if not exists:
+                            connection.execute(
+                                "INSERT INTO terms(id,project_id,term,type,treatment,locked,targets_json,source) VALUES(?,?,?,?,?,?,?,?)",
+                                (new_id(), project["id"], term["term"], term["type"], term["treatment"], int(term["locked"]), json.dumps(term["targets"], ensure_ascii=False), "brain"),
+                            )
+                    for clip in result["clips"]:
+                        row = connection.execute("SELECT id FROM clips WHERE project_id=? AND idx=?", (project["id"], clip["clip"]-1)).fetchone()
+                        clip_id = row["id"] if row else new_id()
+                        if not row:
+                            connection.execute("INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)", (clip_id, project["id"], clip["clip"]-1, clip["start_s"], clip["end_s"], clip["source_cleaned"]))
+                        connection.execute(
+                            "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json) VALUES(?,?,?,?,?,?,?,?) "
+                            "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,updated_at=CURRENT_TIMESTAMP",
+                            (new_id(), clip_id, lang, clip["translation"], clip["translation"], clip["status"], json.dumps(clip["reasons"], ensure_ascii=False), json.dumps([])),
+                        )
+        with db.connect() as connection:
             connection.execute("UPDATE jobs SET state='complete',stage='complete',done=total,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             connection.execute("UPDATE projects SET status='complete' WHERE id=?", (project["id"],))
     except Exception as error:
@@ -360,9 +418,16 @@ async def start_job(project_id: str, body: StartJob, background: BackgroundTasks
         voice = connection.execute("SELECT id FROM voices WHERE id=? AND consent_ok=1", (body.voice_id,)).fetchone()
         if not voice:
             raise HTTPException(409, "Choose a voice with a matched live consent recording")
+        credits = estimated_job_credits(project["duration_s"], len(json.loads(project["target_langs_json"])))
+        if credits > settings.max_credits_per_job:
+            raise HTTPException(429, f"Estimated job cost {credits} exceeds the per-job safety cap")
+        used_today = connection.execute("SELECT COALESCE(SUM(est_credits),0) FROM credit_ledger WHERE date(created_at)=date('now')").fetchone()[0]
+        if used_today + credits > settings.gnani_daily_limit:
+            raise HTTPException(429, "Daily Gnani safety cap reached; try again tomorrow")
         job_id = new_id()
-        connection.execute("INSERT INTO jobs(id,project_id,kind,voice_id,state,stage,total) VALUES(?,?,?,?,?,?,?)", (job_id, project_id, "dub", body.voice_id, "pending", "queued", len(json.loads(project["target_langs_json"]))))
+        connection.execute("INSERT INTO jobs(id,project_id,kind,voice_id,content_type,translation_style,state,stage,total) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, project_id, "dub", body.voice_id, body.content_type, body.translation_style, "pending", "queued", len(json.loads(project["target_langs_json"]))))
         connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
+        connection.execute("INSERT INTO credit_ledger(id,project_id,kind,units,est_credits) VALUES(?,?,?,?,?)", (new_id(), project_id, "dub-job-estimate", 1, credits))
     background.add_task(run_job, job_id)
     return {"job_id": job_id, "state": "pending"}
 
@@ -446,3 +511,9 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("backend.app:app", host="127.0.0.1", port=8000)
+
+
+if Path("backend/static/index.html").exists():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory="backend/static", html=True), name="studio")

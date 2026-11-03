@@ -57,6 +57,8 @@ def initialize() -> None:
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL,
       lang TEXT, clip_id TEXT, voice_id TEXT, state TEXT NOT NULL DEFAULT 'pending',
+      content_type TEXT NOT NULL DEFAULT 'explainer',
+      translation_style TEXT NOT NULL DEFAULT 'neutral',
       error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       stage TEXT NOT NULL DEFAULT 'queued', done INTEGER NOT NULL DEFAULT 0,
       total INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +73,11 @@ def initialize() -> None:
     """
     with connect() as db:
         db.executescript(schema)
+        job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+        if "content_type" not in job_columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN content_type TEXT NOT NULL DEFAULT 'explainer'")
+        if "translation_style" not in job_columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN translation_style TEXT NOT NULL DEFAULT 'neutral'")
 
 
 def json_value(value):
