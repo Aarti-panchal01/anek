@@ -1,7 +1,7 @@
 from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, transcript_sentences
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
-from backend.pipeline.phase3b import clean_source_detail
+from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons
 
 
 def test_silence_chunks_prefer_detected_pause_boundaries_and_stay_below_hard_limit():
@@ -42,8 +42,8 @@ def test_mid_sentence_silence_cut_is_merged_and_retranscribed():
     assert [row["raw"] for row in result] == ["Choose a wig or a headcover?", "I made an app."]
 
 
-def test_contextual_source_cleanup_corrects_product_and_duplicate_modal():
-    client = MockLLMClient([{"cleaned_text": "I built a head and wonder which wig will might look better.", "changes": []}])
+def test_uncertain_noun_is_kept_while_clear_grammar_cleanup_is_applied():
+    client = MockLLMClient([{"cleaned_text": "I built an app and wonder which wig will might look better.", "changes": []}])
     cleaned, changes = clean_source_detail(
         client,
         "I built a head and wonder which wig will might look better.",
@@ -51,5 +51,18 @@ def test_contextual_source_cleanup_corrects_product_and_duplicate_modal():
         "en-IN",
         "This video explains choosing a wig and talking to a specialist.",
     )
-    assert cleaned == "I built an app and wonder which wig might look better."
+    assert cleaned == "I built a head and wonder which wig might look better."
     assert len(changes) == 2
+    assert any("uncertain source retained" in item["reason"] for item in changes)
+
+
+def test_meaning_check_flags_statement_to_instruction_and_agency_changes():
+    reasons = meaning_check_reasons({
+        "meaning_preserved": False,
+        "speech_act_preserved": False,
+        "agency_preserved": False,
+        "issues": ["The statement became a command."],
+    })
+    assert "The statement became a command." in reasons
+    assert any("Speech act changed" in item for item in reasons)
+    assert any("Who performs the action" in item for item in reasons)
