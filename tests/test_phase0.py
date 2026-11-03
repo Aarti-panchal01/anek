@@ -66,6 +66,13 @@ def test_locked_term_and_number_failures_are_authoritative():
     assert {failure["check"] for failure in failures} == {"number_missing", "number_extra", "term_missing"}
 
 
+def test_term_sheet_accepts_clear_category_synonyms_from_llm():
+    sheet = TermSheet.model_validate(
+        {"terms": [{"term": "Zorvo", "type": "product", "treatment": "keep"}]}
+    )
+    assert sheet.terms[0].type == "brand"
+
+
 def test_autocorrect_logs_failed_draft_then_accepts_corrected_text():
     responses = [
         {"translation": "ज़ोरवो की कीमत 498", "terms_used": [], "notes": ""},

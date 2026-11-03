@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backend.brain.prompts import TERM_SHEET_SYSTEM
 from backend.clients.llm import LLMClient
@@ -15,6 +15,18 @@ class Term(BaseModel):
     targets: dict[str, str] = Field(default_factory=dict)
     locked: bool = False
     note: str = ""
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def normalize_type(cls, value: str) -> str:
+        aliases = {
+            "product": "brand",
+            "company": "brand",
+            "medical": "jargon",
+            "profession": "jargon",
+            "technical": "jargon",
+        }
+        return aliases.get(value, value)
 
 
 class Idiom(BaseModel):
