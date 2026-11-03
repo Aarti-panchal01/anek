@@ -3,6 +3,7 @@ import pytest
 from backend.clients.gnani import MockGnaniClient, create_gnani_client
 from backend.clients.llm import MockLLMClient, create_llm_client
 from backend.config import LANGUAGES, Settings
+from scripts.cloning_gate import TEST_SENTENCES, extract_numbers
 
 
 def test_supported_language_table_is_exact():
@@ -15,6 +16,11 @@ def test_settings_enforce_video_hard_cap():
     assert Settings(max_video_seconds=120).max_video_seconds == 120
     with pytest.raises(ValueError):
         Settings(max_video_seconds=121)
+
+
+def test_cloning_gate_covers_each_supported_language_and_local_numerals():
+    assert set(TEST_SENTENCES) == set(LANGUAGES)
+    assert extract_numbers("क़ीमत ४७ रुपये, साल ২০২৬") == ["47", "2026"]
 
 
 def test_mock_clients_are_selectable_and_never_call_live_services():

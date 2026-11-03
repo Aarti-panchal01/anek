@@ -3,8 +3,9 @@
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from typing import Annotated
 
 LANGUAGES = {
     "bn-IN": "Bengali",
@@ -35,13 +36,20 @@ class Settings(BaseSettings):
     max_video_seconds: int = Field(default=120, le=120, gt=0)
     max_credits_per_job: int = 400
     gnani_daily_limit: int = 300
-    enabled_langs: list[str] = Field(default_factory=lambda: list(LANGUAGES))
+    enabled_langs: Annotated[list[str], NoDecode] = Field(default_factory=lambda: list(LANGUAGES))
     gnani_mock: bool = False
     llm_mock: bool = False
     fit_tolerance: float = 1.15
     max_stretch: float = 1.15
     similarity_threshold: float = 0.7
     consent_match_threshold: int = 85
+
+    @field_validator("enabled_langs", mode="before")
+    @classmethod
+    def parse_enabled_langs(cls, value: list[str] | str) -> list[str]:
+        if isinstance(value, str):
+            return [language.strip() for language in value.split(",") if language.strip()]
+        return value
 
 
 @lru_cache

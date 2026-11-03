@@ -1,6 +1,11 @@
-"""Gnani client boundary; live request methods are added after doc verification."""
+"""Gnani REST client using the request shapes in its public API docs."""
 
+import json
 from typing import Protocol
+
+import httpx
+
+from backend.config import Settings
 
 
 class GnaniClient(Protocol):
@@ -22,7 +27,81 @@ class MockGnaniClient:
         return b"mock-audio"
 
 
+class LiveGnaniClient:
+    def __init__(self, settings: Settings, timeout: float = 60.0):
+        if not settings.gnani_api_key:
+            raise ValueError("GNANI_API_KEY is required for live requests")
+        self.base_url = settings.gnani_base_url.rstrip("/")
+        self.headers = {"X-API-Key-ID": settings.gnani_api_key}
+        self.timeout = timeout
+
+    def stt(
+        self,
+        audio: bytes,
+        language_code: str,
+        model: str,
+        keyterms: list[str] | None = None,
+        format: str | None = None,
+    ) -> dict:
+        form = {"model": model, "language_code": language_code}
+        if format is not None:
+            form["format"] = format
+        if keyterms:
+            form["keyterms"] = json.dumps(keyterms, ensure_ascii=False)
+        response = httpx.post(
+            f"{self.base_url}/stt/v3",
+            headers=self.headers,
+            files={"audio_file": ("clip.wav", audio, "audio/wav")},
+            data=form,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not body.get("success"):
+            raise RuntimeError(f"Gnani STT failed: {body.get('error', body)}")
+        return body
+
+    def make_embedding(self, audio: bytes) -> dict:
+        response = httpx.post(
+            f"{self.base_url}/api/v1/tts/voice-clone/embeddings",
+            headers=self.headers,
+            files={"audio_file": ("reference.wav", audio, "audio/wav")},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not body.get("success"):
+            raise RuntimeError(f"Gnani embedding failed: {body}")
+        return body["data"]["voice_clone_embedding"]
+
+    def synth(self, text: str, speaker_embedding: dict) -> bytes:
+        if len(text) >= 300:
+            raise ValueError("Voice-clone synthesis text must be under 300 characters")
+        payload = {
+            "text": text,
+            "model": "vachana-vc-v1",
+            "audio_config": {
+                "sample_rate": 44100,
+                "num_channels": 1,
+                "sample_width": 2,
+                "encoding": "linear_pcm",
+                "container": "wav",
+            },
+            "speaker_embedding": speaker_embedding,
+        }
+        response = httpx.post(
+            f"{self.base_url}/api/v1/tts/inference",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.content
+
+
 def create_gnani_client(mock: bool = False) -> GnaniClient:
     if mock:
         return MockGnaniClient()
-    raise NotImplementedError("Live Gnani methods require the documented request shapes.")
+    from backend.config import get_settings
+
+    return LiveGnaniClient(get_settings())
