@@ -1,6 +1,7 @@
 """Compare cloned speech from two unprocessed voice-reference files."""
 
 import argparse
+import sys
 from pathlib import Path
 
 from backend.clients.gnani import LiveGnaniClient
@@ -10,6 +11,8 @@ DEFAULT_HINDI_LINE = "इस चुनाव को ज़्यादा व्
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-reference", type=Path, default=Path("samples/my_voice.wav"))
     parser.add_argument("--alternative-reference", type=Path, required=True)

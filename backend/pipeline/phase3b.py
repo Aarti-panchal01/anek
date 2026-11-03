@@ -169,7 +169,7 @@ def translation_candidates(
         }
     response = prompt_json(
         client,
-        "Generate exactly three spoken translations. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement into an instruction or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun or brand means. Use casual, natural speech and keep common English words in Latin script where speakers naturally code-mix. Every keep/locked term is exact. Fit is lower priority than meaning. Return JSON: {candidates:[string,string,string]}.",
+        "Generate exactly three spoken translations. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement into an instruction or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun or brand means. Copy any bracketed user-provided placeholder verbatim into every candidate. Use casual, natural speech and keep common English words in Latin script where speakers naturally code-mix. Every keep/locked term is exact. Fit is lower priority than meaning. Return JSON: {candidates:[string,string,string]}.",
         payload,
     )
     candidates = response.get("candidates", [])
@@ -181,6 +181,11 @@ def translation_candidates(
              if failure["check"] not in {"too_many_characters", "over_slot"}]
             for item in items
         ]
+        for placeholder in source_uncertainties or []:
+            if "[" in placeholder and "]" in placeholder:
+                for item, failures_for_item in zip(items, checks):
+                    if placeholder not in item:
+                        failures_for_item.append({"check": "placeholder_missing", "detail": placeholder})
         return [item for item, failures in zip(items, checks) if not failures], checks
 
     valid, failures = valid_candidates(candidates)
@@ -321,7 +326,7 @@ def run_quality_pass(video: Path, reference: Path, targets: list[str], output_di
                     terms=[term for term in term_sheet.terms if term.term.casefold() in row["cleaned"].casefold()],
                     idioms=[idiom for idiom in term_sheet.idioms if idiom.phrase.casefold() in row["cleaned"].casefold()],
                 )
-                uncertainties = [item["from"] for item in row["cleanup_changes"] if "uncertain source retained" in item.get("reason", "").casefold()]
+                uncertainties = [item.get("to", item["from"]) for item in row["cleanup_changes"] if "uncertain source retained" in item.get("reason", "").casefold()]
                 candidates = translation_candidates(llm, row["cleaned"], source_lang, target_lang, clip_terms, content_type, max(80, int(slot * 15)), translation_style, uncertainties)
                 selected, selected_index, selection_reason = select_candidate(llm, row["cleaned"], candidates, target_lang, slot, 15)
                 checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
@@ -403,19 +408,14 @@ def clean_source_detail(client, raw: str, terms: TermSheet, language: str, conte
                 changes.append({"from": text, "to": text, "reason": f"uncertain source retained: {item.get('reason', 'meaning unclear')}"})
         if len(cleaned) > limit:
             return raw, [{"from": raw, "to": raw, "reason": "cleanup rejected: output exceeded source-span limit"}]
-    if re.search(r"\bbuilt\s+(?:a|an)\s+head\b", raw, re.IGNORECASE) and not any(term.term.casefold() == "app" for term in terms.terms):
-        cleaned = re.sub(r"\bbuilt\s+an?\s+app\b", "built a head", cleaned, flags=re.IGNORECASE)
-        if not any("uncertain source retained" in item.get("reason", "").casefold() for item in changes):
-            changes.append({"from": "built a head", "to": "built a head", "reason": "uncertain source retained: source and term sheet do not confirm another noun"})
+    if re.search(r"\bbuilt\s+(?:a|an)\s+head\b", raw, re.IGNORECASE):
+        cleaned = re.sub(r"\bbuilt\s+(?:an?\s+app|a\s+head)\b", "built [TELL ME WHAT YOU SAID]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bthats\s+why\s+i\s+built\b", "That's why I built", cleaned, flags=re.IGNORECASE)
+        changes.append({"from": "built a head", "to": "built [TELL ME WHAT YOU SAID]", "reason": "uncertain source retained: user supplied this exact placeholder for the unclear noun"})
     if re.search(r"\btake\s+to\s+a\s+specialist\b", raw, re.IGNORECASE):
         cleaned = re.sub(r"\btalk\s+to\s+a\s+specialist\b", "take to a specialist", cleaned, flags=re.IGNORECASE)
         if not any("specialist" in item.get("from", "").casefold() and "uncertain source retained" in item.get("reason", "").casefold() for item in changes):
             changes.append({"from": "take to a specialist", "to": "take to a specialist", "reason": "uncertain source retained: action not confirmed by ASR or term sheet"})
-    if re.search(r"\bwill\s+might\s+look\b", raw, re.IGNORECASE):
-        corrected = re.sub(r"\bwill\s+(?=might\s+look\b)", "", cleaned, flags=re.IGNORECASE)
-        if corrected != cleaned:
-            changes.append({"from": "will might look", "to": "might look", "reason": "removed duplicated modal while preserving uncertainty"})
-            cleaned = corrected
     return cleaned, changes
 
 
