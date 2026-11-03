@@ -6,11 +6,13 @@ import math
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
+from collections import defaultdict, deque
 from pathlib import Path
 from difflib import SequenceMatcher
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 try:
@@ -33,6 +35,30 @@ CONSENT_PHRASES = [
     "This is my voice, and I am choosing to create an AI dub.",
 ]
 consent_sessions: dict[str, str] = {}
+_rate_events: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+
+
+def enforce_ip_limit(request: Request, category: str) -> None:
+    limits = {}
+    for entry in settings.per_ip_limits.split(","):
+        try:
+            name, count = entry.strip().split("=", 1)
+            limits[name.strip()] = int(count)
+        except (ValueError, TypeError):
+            continue
+    limit = limits.get(category)
+    if limit is None or limit < 1:
+        return
+    ip = request.client.host if request.client else "unknown"
+    key = (ip, category)
+    now = time.monotonic()
+    events = _rate_events[key]
+    while events and now - events[0] >= 3600:
+        events.popleft()
+    if len(events) >= limit:
+        retry_after = max(1, int(3600 - (now - events[0])))
+        raise HTTPException(429, f"Hourly {category} limit reached", headers={"Retry-After": str(retry_after)})
+    events.append(now)
 
 
 class ProjectCreate(BaseModel):
@@ -198,7 +224,8 @@ async def project_video(project_id: str):
 
 
 @app.get("/api/projects/{project_id}/media")
-async def dubbed_media(project_id: str, lang: str):
+async def dubbed_media(project_id: str, lang: str, request: Request):
+    enforce_ip_limit(request, "previews")
     project_row(project_id)
     folder = DATA_ROOT / "exports" / project_id
     matches = list(folder.glob(f"*_{lang}*ai-dubbed.mp4"))
@@ -231,11 +258,13 @@ async def consent_phrase(session_id: str = "default") -> dict:
 
 @app.post("/api/voices")
 async def create_voice(
+    request: Request,
     session_id: str = Form("default"),
     label: str = Form("My voice"),
     consent_audio: UploadFile = File(...),
     reference_audio: UploadFile = File(...),
 ) -> dict:
+    enforce_ip_limit(request, "voice_clones")
     phrase = consent_sessions.get(session_id)
     if not phrase:
         raise HTTPException(400, "Request a consent phrase and record it live before voice setup")
@@ -279,7 +308,9 @@ async def delete_voice(voice_id: str) -> dict:
         if row is None:
             raise HTTPException(404, "Voice not found")
         if row["reference_path"]:
-            Path(row["reference_path"]).unlink(missing_ok=True)
+            reference = Path(row["reference_path"]).resolve()
+            if reference.is_relative_to(DATA_ROOT.resolve()):
+                reference.unlink(missing_ok=True)
         connection.execute("DELETE FROM voices WHERE id=?", (voice_id,))
     return {"deleted": True}
 
@@ -410,7 +441,8 @@ async def run_job(job_id: str) -> None:
 
 
 @app.post("/api/projects/{project_id}/start", status_code=202)
-async def start_job(project_id: str, body: StartJob, background: BackgroundTasks) -> dict:
+async def start_job(request: Request, project_id: str, body: StartJob, background: BackgroundTasks) -> dict:
+    enforce_ip_limit(request, "jobs")
     project = project_row(project_id)
     if not project["video_path"]:
         raise HTTPException(409, "Upload a video first")
@@ -474,7 +506,8 @@ async def revert_dub(clip_id: str, lang: str) -> dict:
 
 
 @app.post("/api/projects/{project_id}/export")
-async def export_project(project_id: str, body: ExportRequest) -> dict:
+async def export_project(request: Request, project_id: str, body: ExportRequest) -> dict:
+    enforce_ip_limit(request, "previews")
     project_row(project_id)
     folder = DATA_ROOT / "exports" / project_id
     files = {suffix: str(path) for suffix in (".mp4", ".srt", ".json") for path in folder.glob(f"*_{body.lang}*{suffix}")}
@@ -495,7 +528,12 @@ async def project_report(project_id: str, lang: str):
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str) -> dict:
-    project_row(project_id)
+    project = project_row(project_id)
+    if project.get("video_path"):
+        source = Path(project["video_path"]).resolve()
+        upload_dir = (DATA_ROOT / "uploads" / project_id).resolve()
+        if source.is_relative_to(upload_dir):
+            source.unlink(missing_ok=True)
     shutil.rmtree(DATA_ROOT / "uploads" / project_id, ignore_errors=True)
     shutil.rmtree(DATA_ROOT / "exports" / project_id, ignore_errors=True)
     with db.connect() as connection:
@@ -504,6 +542,19 @@ async def delete_project(project_id: str) -> dict:
         connection.execute("DELETE FROM terms WHERE project_id=?", (project_id,))
         connection.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
         connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    return {"deleted": True}
+
+
+@app.delete("/api/data")
+async def delete_all_user_data() -> dict:
+    """Remove local uploads, generated exports, voice references and database rows."""
+    for folder in ("uploads", "exports", "voices"):
+        shutil.rmtree(DATA_ROOT / folder, ignore_errors=True)
+    with db.connect() as connection:
+        for table in ("dubs", "clips", "terms", "jobs", "credit_ledger", "projects", "voices"):
+            connection.execute(f"DELETE FROM {table}")
+    consent_sessions.clear()
+    _rate_events.clear()
     return {"deleted": True}
 
 

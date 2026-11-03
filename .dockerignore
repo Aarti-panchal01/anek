@@ -1,0 +1,9 @@
+.env
+.git
+.gitignore
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+**/data
+**/samples
+**/out_*.wav

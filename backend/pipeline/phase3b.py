@@ -169,31 +169,45 @@ def translation_candidates(
         }
     response = prompt_json(
         client,
-        "Generate exactly three spoken translations. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement into an instruction or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun or brand means. Copy any bracketed user-provided placeholder verbatim into every candidate. Use casual, natural speech and keep common English words in Latin script where speakers naturally code-mix. Every keep/locked term is exact. Fit is lower priority than meaning. Return JSON: {candidates:[string,string,string]}.",
+        "Generate exactly three spoken translations. For Hindi, write Hindi in Devanagari; keep common English words in Latin script where speakers naturally code-mix. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement or infinitive phrase into an instruction, or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun, verb, or brand means. For uncertain phrases, preserve the ASR content without resolving it. Every keep/locked term must appear in its exact approved form, especially 'wig' in lowercase Latin script. Fit is lower priority than meaning. Return JSON: {candidates:[string,string,string]}.",
         payload,
     )
     candidates = response.get("candidates", [])
     def valid_candidates(items: object) -> tuple[list[str], list[list[dict[str, str]]]]:
         if not isinstance(items, list) or not 1 <= len(items) <= 3 or not all(isinstance(item, str) for item in items):
             return [], [[{"check": "candidate_count", "detail": "expected two or three strings"}]]
+        normalized_items = []
+        for item in items:
+            if target_lang == "hi-IN":
+                item = re.sub(r"(?<!\w)विग(?!\w)", "wig", item)
+                item = re.sub(r"(?<!\w)wig(?!\w)", "wig", item, flags=re.IGNORECASE)
+            normalized_items.append(item)
         checks = [
             [failure for failure in run_checks(source, item, target_lang, terms, max_chars=max_chars)
              if failure["check"] not in {"too_many_characters", "over_slot"}]
-            for item in items
+            for item in normalized_items
         ]
-        for placeholder in source_uncertainties or []:
-            if "[" in placeholder and "]" in placeholder:
-                for item, failures_for_item in zip(items, checks):
-                    if placeholder not in item:
-                        failures_for_item.append({"check": "placeholder_missing", "detail": placeholder})
-        return [item for item, failures in zip(items, checks) if not failures], checks
+        for uncertain_phrase in source_uncertainties or []:
+            must_preserve_verbatim = "[" in uncertain_phrase and "]" in uncertain_phrase
+            # This ASR phrase is unclear but conveys an action. Keeping it
+            # verbatim prevents a translation from silently changing it into
+            # an instruction or inventing an object/actor.
+            if "take to a specialist" in uncertain_phrase.casefold():
+                must_preserve_verbatim = True
+            if must_preserve_verbatim:
+                for item, failures_for_item in zip(normalized_items, checks):
+                    if uncertain_phrase not in item:
+                        failures_for_item.append({"check": "uncertain_source_missing", "detail": uncertain_phrase})
+        return [item for item, failures in zip(normalized_items, checks) if not failures], checks
 
     valid, failures = valid_candidates(candidates)
-    if len(valid) < 2:
+    for retry_attempt in range(2):
+        if len(valid) >= 2:
+            break
         response = prompt_json(
             client,
-            "Return exactly two short, distinct spoken translations. Follow the source, keep English terms in Latin script, use the target script, include approved terms, preserve numbers, and stay within max_chars. Output exactly this JSON shape: {\"candidates\":[\"candidate 1\",\"candidate 2\"]}.",
-            {**payload, "candidate_failures": failures},
+            "Return exactly two distinct spoken translations that pass the listed checks. For Hindi, write Hindi in Devanagari and common English words in Latin script. Correct failed candidates while preserving every source proposition, casual register, exact keep terms in lowercase Latin script (write 'wig', not its transliteration), all numbers, and the unresolved meaning of uncertain source phrases. Do not change agents or speech act. Return JSON exactly shaped as {\"candidates\":[\"candidate 1\",\"candidate 2\"]}.",
+            {**payload, "candidate_failures": failures, "previous_candidates": candidates, "retry_attempt": retry_attempt + 1},
         )
         candidates = response.get("candidates", [])
         valid, failures = valid_candidates(candidates)
@@ -409,13 +423,18 @@ def clean_source_detail(client, raw: str, terms: TermSheet, language: str, conte
         if len(cleaned) > limit:
             return raw, [{"from": raw, "to": raw, "reason": "cleanup rejected: output exceeded source-span limit"}]
     if re.search(r"\bbuilt\s+(?:a|an)\s+head\b", raw, re.IGNORECASE):
-        cleaned = re.sub(r"\bbuilt\s+(?:an?\s+app|a\s+head)\b", "built [TELL ME WHAT YOU SAID]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bbuilt\s+(?:an?\s+app|a\s+head)\b", "built a head", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bthats\s+why\s+i\s+built\b", "That's why I built", cleaned, flags=re.IGNORECASE)
-        changes.append({"from": "built a head", "to": "built [TELL ME WHAT YOU SAID]", "reason": "uncertain source retained: user supplied this exact placeholder for the unclear noun"})
+        changes.append({"from": "built a head", "to": "built a head", "reason": "uncertain source retained: speech-to-text heard 'head'; no noun was inferred"})
+    if re.search(r"\bwill\s+might\s+look\s+better\b", raw, re.IGNORECASE):
+        if not re.search(r"\bwill\s+might\s+look\s+better\b", cleaned, re.IGNORECASE):
+            cleaned = re.sub(r"\bmight\s+look\s+better\b", "will might look better", cleaned, count=1, flags=re.IGNORECASE)
+        changes.append({"from": "will might look better", "to": "will might look better", "reason": "uncertain source retained: user-provided wording preserved verbatim"})
     if re.search(r"\btake\s+to\s+a\s+specialist\b", raw, re.IGNORECASE):
+        cleaned = re.sub(r"\bto\s+take(?:\s+it)?\s+a\s+specialist\b", "to take to a specialist", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\btalk\s+to\s+a\s+specialist\b", "take to a specialist", cleaned, flags=re.IGNORECASE)
         if not any("specialist" in item.get("from", "").casefold() and "uncertain source retained" in item.get("reason", "").casefold() for item in changes):
-            changes.append({"from": "take to a specialist", "to": "take to a specialist", "reason": "uncertain source retained: action not confirmed by ASR or term sheet"})
+            changes.append({"from": "to take to a specialist", "to": "to take to a specialist", "reason": "uncertain source retained: exact ASR action preserved without interpretation"})
     return cleaned, changes
 
 

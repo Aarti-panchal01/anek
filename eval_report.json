@@ -1,0 +1,287 @@
+{
+  "evaluation_type": "offline synthetic deterministic text-checker probes",
+  "generated_at": "2026-11-03T19:09:04.387058+05:30",
+  "enabled_languages": [
+    "bn-IN",
+    "en-IN",
+    "gu-IN",
+    "hi-IN",
+    "kn-IN",
+    "ml-IN",
+    "mr-IN",
+    "pa-IN",
+    "ta-IN",
+    "te-IN"
+  ],
+  "disabled_languages": [],
+  "fixtures": [
+    {
+      "id": "zorvo-intro",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-price",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-date",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-phone",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-units",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-idiom",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-hinglish",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-physics",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-cricket",
+      "audio_available": false,
+      "native_verified": false
+    },
+    {
+      "id": "zorvo-summary",
+      "audio_available": false,
+      "native_verified": false
+    }
+  ],
+  "languages": {
+    "bn-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "en-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "gu-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "hi-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "kn-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "ml-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "mr-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "pa-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "ta-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    },
+    "te-IN": {
+      "metrics": {
+        "caught": {
+          "count": 40,
+          "of": 40
+        },
+        "false_alarms": {
+          "count": 0,
+          "of": 10
+        },
+        "fixed": {
+          "count": 10,
+          "of": 10
+        },
+        "broken": {
+          "count": 10
+        }
+      },
+      "misses": [],
+      "credit_cost": 0
+    }
+  },
+  "limitations": [
+    "Metrics cover deterministic number and protected-brand checks plus scripted autocorrect probes only.",
+    "The ten fixtures have authored source transcripts but no audio recordings; ASR, synthesis, timing, and voice cloning were not evaluated.",
+    "Reference translations are not native-speaker verified; this run does not measure semantic fidelity or naturalness.",
+    "A public demo URL has not been configured."
+  ]
+}

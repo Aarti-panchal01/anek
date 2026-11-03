@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     low_trust_verify_langs: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["mr-IN", "pa-IN"]
     )
+    per_ip_limits: str = "voice_clones=3,previews=30,jobs=5"
     gnani_mock: bool = False
     llm_mock: bool = False
     fit_tolerance: float = 1.15

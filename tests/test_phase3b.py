@@ -51,9 +51,18 @@ def test_uncertain_noun_is_kept_while_clear_grammar_cleanup_is_applied():
         "en-IN",
         "This video explains choosing a wig and talking to a specialist.",
     )
-    assert cleaned == "That's why I built [TELL ME WHAT YOU SAID] and wonder which wig will might look better."
-    assert len(changes) == 1
-    assert any("uncertain source retained" in item["reason"] for item in changes)
+    assert cleaned == "That's why I built a head and wonder which wig will might look better."
+    assert len(changes) == 2
+    assert any(item["to"] == "built a head" and "uncertain source retained" in item["reason"] for item in changes)
+    assert any(item["to"] == "will might look better" and "uncertain source retained" in item["reason"] for item in changes)
+
+
+def test_uncertain_take_phrase_keeps_exact_asr_action():
+    raw = "To make that choice feel more personal and easier, to take to a specialist."
+    client = MockLLMClient([{"cleaned_text": "To make that choice feel more personal and easier, to take a specialist.", "changes": []}])
+    cleaned, changes = clean_source_detail(client, raw, TermSheet(), "en-IN", raw)
+    assert cleaned == raw
+    assert any(item["to"] == "to take to a specialist" and "uncertain source retained" in item["reason"] for item in changes)
 
 
 def test_meaning_check_flags_statement_to_instruction_and_agency_changes():
