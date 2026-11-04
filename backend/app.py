@@ -23,6 +23,7 @@ from difflib import SequenceMatcher
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 try:
@@ -219,6 +220,35 @@ def probe_video(path: Path) -> tuple[float, bool]:
         text=True,
     )
     return float(probe.stdout.strip()), bool(streams.stdout.strip())
+
+
+def browser_video_path(source: Path) -> Path:
+    """Return an H.264/AAC MP4 browser copy, preserving the uploaded original."""
+    browser_copy = source.parent / "browser.mp4"
+    if browser_copy.is_file() and browser_copy.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+        return browser_copy
+    metadata = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json", str(source)],
+        check=True, capture_output=True, text=True,
+    )
+    streams = json.loads(metadata.stdout).get("streams", [])
+    video_codec = next((item.get("codec_name") for item in streams if item.get("codec_type") == "video"), None)
+    audio_codec = next((item.get("codec_name") for item in streams if item.get("codec_type") == "audio"), None)
+    is_mp4 = source.suffix.lower() == ".mp4"
+    if is_mp4 and video_codec == "h264" and audio_codec in {None, "aac"}:
+        return source
+    temporary = source.parent / "browser.part.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(temporary)],
+            check=True, capture_output=True,
+        )
+        temporary.replace(browser_copy)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return browser_copy
 
 
 def estimated_job_credits(duration_s: float, language_count: int) -> int:
@@ -494,9 +524,51 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if duration > settings.max_video_seconds:
         path.unlink(missing_ok=True)
         raise HTTPException(413, f"Video is {duration:.1f}s; maximum is {settings.max_video_seconds}s")
+    try:
+        browser_video_path(path)
+    except Exception as error:
+        path.unlink(missing_ok=True)
+        (folder / "browser.mp4").unlink(missing_ok=True)
+        raise HTTPException(400, f"Video preview conversion failed: {error}") from error
     with db.connect() as connection:
         connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='uploaded' WHERE id=?", (str(path), duration, project_id))
     return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id}
+
+
+@app.post("/api/media/browser-preview")
+async def convert_browser_preview(request: Request, video: UploadFile = File(...)):
+    """Convert a pre-upload selection to a browser-playable preview, then remove it."""
+    enforce_ip_limit(request, "previews")
+    suffix = Path(safe_upload_name(video.filename)).suffix.lower()
+    if suffix not in {".mp4", ".mov", ".webm"}:
+        raise HTTPException(415, "Upload an MP4, MOV, or WebM video")
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(dir=DATA_ROOT, prefix="browser-preview-"))
+    source = folder / f"source{suffix}"
+    size = 0
+    try:
+        with source.open("wb") as target:
+            while block := await video.read(1024 * 1024):
+                size += len(block)
+                if size > 500 * 1024 * 1024:
+                    raise HTTPException(413, "Video exceeds the 500 MB upload cap")
+                target.write(block)
+        duration, has_video = probe_video(source)
+        if not has_video:
+            raise HTTPException(400, "The upload does not contain a video stream")
+        if duration > settings.max_video_seconds:
+            raise HTTPException(413, f"Video exceeds the {settings.max_video_seconds}s limit")
+        playable = browser_video_path(source)
+        return FileResponse(
+            playable, media_type="video/mp4", content_disposition_type="inline",
+            background=BackgroundTask(shutil.rmtree, folder, ignore_errors=True),
+        )
+    except HTTPException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    except Exception as error:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(400, f"Video preview conversion failed: {error}") from error
 
 
 @app.get("/api/projects/{project_id}/video")
@@ -504,8 +576,11 @@ async def project_video(project_id: str):
     project = project_row(project_id)
     if not project["video_path"]:
         raise HTTPException(404, "Project video not found")
-    media_type = mimetypes.guess_type(project["video_path"])[0] or "application/octet-stream"
-    return FileResponse(project["video_path"], media_type=media_type)
+    try:
+        playable = browser_video_path(Path(project["video_path"]))
+    except Exception as error:
+        raise HTTPException(415, f"Video preview conversion failed: {error}") from error
+    return FileResponse(playable, media_type="video/mp4", content_disposition_type="inline")
 
 
 @app.get("/api/projects/{project_id}/voice-reference-preview")

@@ -45,6 +45,35 @@ def test_settings_and_usage_are_derived_from_config_and_database(monkeypatch):
         assert usage["spent"] == 17
 
 
+def test_video_upload_keeps_original_and_review_serves_browser_copy(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Playable video", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        browser_copy = data_root / "uploads" / project["id"] / "browser.mp4"
+        browser_copy.parent.mkdir(parents=True, exist_ok=True)
+        browser_copy.write_bytes(b"h264 preview")
+        monkeypatch.setattr(app_module, "probe_video", lambda path: (20.0, True))
+        monkeypatch.setattr(app_module, "browser_video_path", lambda path: browser_copy)
+        class Upload:
+            filename = "source.mov"
+            blocks = [b"original hevc bytes", b""]
+
+            async def read(self, size):
+                return self.blocks.pop(0)
+
+        upload = Upload()
+
+        result = _resolve(app_module.upload_video(project["id"], upload))
+        response = _resolve(app_module.project_video(project["id"]))
+
+        assert result["filename"] == "source.mov"
+        assert (browser_copy.parent / "source.mov").read_bytes() == b"original hevc bytes"
+        assert Path(response.path) == browser_copy
+        assert response.media_type == "video/mp4"
+        assert "attachment" not in response.headers.get("content-disposition", "")
+
+
 def test_global_term_memory_crud_persists_and_validates(monkeypatch):
     with _sandbox(monkeypatch):
         created = _resolve(app_module.create_global_term(app_module.GlobalTermRequest(
@@ -138,6 +167,8 @@ def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypa
         upload_dir.mkdir(parents=True)
         source_video = upload_dir / "source.mp4"
         source_video.write_bytes(b"local test video bytes")
+        browser_copy = upload_dir / "browser.mp4"
+        browser_copy.write_bytes(b"browser preview bytes")
         export_dir = data_root / "exports" / project_id
         export_dir.mkdir(parents=True)
         muxed = export_dir / "sample_hi-IN_ai-dubbed.mp4"
@@ -165,7 +196,7 @@ def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypa
         assert "embedding_json" not in voices[0] and "reference_path" not in voices[0]
         result = _resolve(app_module.delete_project_audio(project_id))
         assert result["source_video_removed"] is True
-        assert not source_video.exists() and not muxed.exists() and not wav.exists()
+        assert not source_video.exists() and not browser_copy.exists() and not muxed.exists() and not wav.exists()
         assert srt.exists() and report.exists() and reference.exists()
         with db.connect() as connection:
             project_row = connection.execute("SELECT video_path,status FROM projects WHERE id=?", (project_id,)).fetchone()
