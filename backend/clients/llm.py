@@ -23,6 +23,24 @@ class LLMClient(Protocol):
     def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]: ...
 
 
+def clear_response_cache(settings: Settings) -> None:
+    """Erase cached model responses, which may contain submitted source text."""
+    cache_path = Path(settings.llm_cache_path or (Path(settings.anek_data_dir) / "llm_response_cache.sqlite3"))
+    if not cache_path.is_file():
+        return
+    with closing(sqlite3.connect(cache_path, timeout=10)) as connection:
+        connection.execute("PRAGMA busy_timeout=10000")
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_responses'"
+        ).fetchone()
+        if not exists:
+            return
+        with connection:
+            connection.execute("DELETE FROM llm_responses")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("VACUUM")
+
+
 class MockLLMClient:
     def __init__(self, responses: list[Any] | None = None):
         self.responses = list(responses or [])

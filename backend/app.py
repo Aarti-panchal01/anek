@@ -32,6 +32,7 @@ except ImportError:
 from backend import db
 from backend.brain.checks import run_checks
 from backend.clients.gnani import create_gnani_client
+from backend.clients.llm import clear_response_cache
 from backend.brain.termsheet import TermSheet
 from backend.config import LANGUAGES, get_settings
 from backend.pipeline.phase3b import run_quality_pass
@@ -1382,7 +1383,8 @@ async def delete_project(project_id: str) -> dict:
 
 @app.delete("/api/data")
 async def delete_all_user_data() -> dict:
-    """Remove local uploads, generated exports, voice references and database rows."""
+    """Remove local uploads, generated exports, voice references, cached responses and database rows."""
+    clear_response_cache(settings)
     for folder in ("uploads", "exports", "voices"):
         shutil.rmtree(DATA_ROOT / folder, ignore_errors=True)
     with db.connect() as connection:
@@ -1390,7 +1392,7 @@ async def delete_all_user_data() -> dict:
             connection.execute(f"DELETE FROM {table}")
     consent_sessions.clear()
     _rate_events.clear()
-    return {"deleted": True}
+    return {"deleted": True, "llm_response_cache_cleared": True}
 
 
 @app.get("/studio", include_in_schema=False)
