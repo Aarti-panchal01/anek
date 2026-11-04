@@ -243,9 +243,11 @@ class LiveLLMClient:
             if response.status_code in {502, 503, 504} and service_error_attempts < 3:
                 service_error_attempts += 1
                 delay = 2 ** service_error_attempts
+                self.current_key_index = (key_index + 1) % len(self.keys)
                 LOGGER.warning(
-                    "LLM model %s returned HTTP %d; retry %d/3 in %ds",
-                    self.model, response.status_code, service_error_attempts, delay,
+                    "LLM model %s returned HTTP %d on key index %d; retry %d/3 with key index %d in %ds",
+                    self.model, response.status_code, key_index + 1, service_error_attempts,
+                    self.current_key_index + 1, delay,
                 )
                 time.sleep(delay)
                 continue

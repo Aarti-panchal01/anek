@@ -95,6 +95,26 @@ def test_invalid_key_is_skipped_without_logging_secret(monkeypatch, caplog):
     client.cache_path.unlink(missing_ok=True)
 
 
+def test_transient_service_error_rotates_to_next_key(cache_path, monkeypatch, caplog):
+    client = LiveLLMClient(_settings(cache_path))
+    calls = []
+
+    def post(url, headers, json, timeout):
+        calls.append(headers["Authorization"])
+        if len(calls) == 1:
+            return _response(503, {"error": {"message": "temporarily unavailable"}})
+        return _response(200, {"choices": [{"message": {"content": '{"answer":"ok"}'}}]})
+
+    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
+    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda delay: None)
+    caplog.set_level(logging.WARNING, logger="backend.clients.llm")
+
+    assert client.chat_json([{"role": "user", "content": "transient retry"}]) == {"answer": "ok"}
+    assert calls == ["Bearer key-one", "Bearer key-two"]
+    assert "key index 2" in caplog.text
+    assert "key-one" not in caplog.text and "key-two" not in caplog.text
+
+
 def test_retry_delay_parses_groq_retry_time_and_quota_error():
     response = _response(
         429,
