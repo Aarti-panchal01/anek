@@ -78,6 +78,8 @@ Run `python -m backend.eval.run_eval` to regenerate [EVAL.md](EVAL.md) and `eval
 
 ## Supported use and limitations
 
-Anek is intended for short, speech-led, single-speaker explainers, lessons, tutorials, talks, and solo podcasts up to two minutes. Multi-speaker conversations, music-heavy videos, legal/medical-critical publication without expert review, and guaranteed lip synchronization are not supported. Translation, speech recognition, cloning, and automatic meaning checks can make mistakes. Yellow and red clips require human review; unclear source wording should remain unresolved instead of being guessed. Marathi and Punjabi audio-number verification is explicitly low trust. A public demo URL is not configured.
+Anek is intended for short, speech-led, single-speaker explainers, lessons, tutorials, talks, and solo podcasts up to two minutes. Multi-speaker conversations, music-heavy videos, legal/medical-critical publication without expert review, and guaranteed lip synchronization are not supported. Translation, speech recognition, cloning, and automatic meaning checks can make mistakes. Yellow and red clips require human review; unclear source wording should remain unresolved instead of being guessed. Marathi and Punjabi audio-number verification is explicitly low trust.
+
+Hosted demo: https://anek-tau.vercel.app (workspace password required). The API runs at https://anek-production.up.railway.app.
 
 Delete a project from its review screen, or use the footer's **Delete my data** control to remove all local project data and voice references. This is irreversible.
