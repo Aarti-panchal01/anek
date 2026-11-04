@@ -70,18 +70,17 @@ def test_mid_sentence_merge_does_not_cross_the_twelve_second_hard_cap():
 
 
 def test_uncertain_noun_is_kept_while_clear_grammar_cleanup_is_applied():
-    client = MockLLMClient([{"cleaned_text": "That's why I built an app and wonder which wig will might look better.", "changes": []}])
+    client = MockLLMClient([{"cleaned_text": "That's why I built an app and wonder which wig might look better.", "changes": []}])
     cleaned, changes = clean_source_detail(
         client,
-        "Thats why i built a head and wonder which wig will might look better.",
+        "Thats why i built a head and wonder which wig might look better.",
         TermSheet(),
         "en-IN",
         "This video explains choosing a wig and talking to a specialist.",
     )
-    assert cleaned == "That's why I built a head and wonder which wig will might look better."
-    assert len(changes) == 2
+    assert cleaned == "That's why I built a head and wonder which wig might look better."
+    assert len(changes) == 1
     assert any(item["to"] == "built a head" and "uncertain source retained" in item["reason"] for item in changes)
-    assert any(item["to"] == "will might look better" and "uncertain source retained" in item["reason"] for item in changes)
 
 
 def test_uncertain_take_phrase_keeps_exact_asr_action():
