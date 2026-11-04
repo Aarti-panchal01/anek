@@ -12,7 +12,7 @@ from backend.brain.autocorrect import translate_with_autocorrect, combine_audio_
 from backend.brain.termsheet import extract_termsheet
 from backend.pipeline.phase3b import back_translate, meaning_check_reasons
 from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import LiveLLMClient, create_translation_client
+from backend.clients.llm import LiveLLMClient, create_translation_client, create_workflow_client
 from backend.config import Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -82,6 +82,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
         chunks = split_audio(source_audio, work_dir, duration)
         gnani = LiveGnaniClient(settings)
         llm = LiveLLMClient(settings)
+        workflow_llm = create_workflow_client(llm, settings)
         translator = create_translation_client(llm, settings)
         ref_audio = reference_path.read_bytes()
         with wave.open(str(reference_path), "rb") as wav:
@@ -104,7 +105,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
             )
         source_langs = [row["source_lang"] for row in transcripts if row["source_lang"] != "unknown"]
         source_lang = max(set(source_langs), key=source_langs.count) if source_langs else "unknown"
-        term_sheet = extract_termsheet(llm, [row["text"] for row in transcripts], source_lang)
+        term_sheet = extract_termsheet(workflow_llm, [row["text"] for row in transcripts], source_lang)
 
         results = []
         for index, row in enumerate(transcripts):
@@ -151,7 +152,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
                 text_status,
                 settings.low_trust_verify_langs,
             )
-            meaning = back_translate(llm, row["text"], translated, source_lang, "hi-IN")
+            meaning = back_translate(workflow_llm, row["text"], translated, source_lang, "hi-IN")
             meaning_reasons = meaning_check_reasons(meaning)
             if meaning_reasons:
                 final_status["status"] = "yellow" if final_status["status"] != "red" else "red"

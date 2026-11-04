@@ -16,7 +16,7 @@ import httpx
 from backend.brain.checks import run_checks
 from backend.brain.termsheet import TermSheet, extract_termsheet
 from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import LiveLLMClient, create_translation_client
+from backend.clients.llm import LiveLLMClient, create_translation_client, create_workflow_client
 from backend.config import LANGUAGES, Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -504,6 +504,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         prior_clip = prior_rows[only_clip_index]
     gnani = LiveGnaniClient(settings)
     llm = LiveLLMClient(settings)
+    workflow_llm = create_workflow_client(llm, settings)
     translator = create_translation_client(llm, settings)
     all_outputs = []
 
@@ -553,7 +554,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             source_chunks = merge_incomplete_chunks(source_chunks, transcribe_range, max_seconds=8.0)
             langs = [row["lang"] for row in source_chunks if row["lang"] != "unknown"]
             source_lang = max(set(langs), key=langs.count) if langs else "unknown"
-            term_sheet = extract_termsheet(llm, [row["raw"] for row in source_chunks], source_lang)
+            term_sheet = extract_termsheet(workflow_llm, [row["raw"] for row in source_chunks], source_lang)
             full_raw_source = " ".join(row["raw"] for row in source_chunks)
             term_sheet.terms = [term for term in term_sheet.terms if re.search(rf"(?<!\w){re.escape(term.term)}(?!\w)", full_raw_source, re.IGNORECASE)]
             known_terms = {term.term.casefold() for term in term_sheet.terms}
@@ -610,7 +611,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             cleaned_rows = []
             source_context = " ".join(row["raw"] for row in source_chunks)
             for row in source_chunks:
-                row["cleaned"], row["cleanup_changes"] = clean_source_detail(llm, row["raw"], term_sheet, source_lang, source_context)
+                row["cleaned"], row["cleanup_changes"] = clean_source_detail(workflow_llm, row["raw"], term_sheet, source_lang, source_context)
                 cleaned_rows.append(row)
         if stock_voice:
             embedding = None
@@ -742,7 +743,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                 transcript = gnani.stt(sentence_audio.read_bytes(), target_lang, settings.verify_stt_model, format="transcribe")
                 audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
-                meaning = back_translate(llm, row["cleaned"], selected, source_lang, target_lang)
+                meaning = back_translate(workflow_llm, row["cleaned"], selected, source_lang, target_lang)
                 reasons = list(audio_flag["reasons"])
                 reasons.extend(meaning_check_reasons(meaning))
                 if any("uncertain source retained" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):

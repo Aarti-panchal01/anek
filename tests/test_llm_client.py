@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from backend.clients.llm import LiveLLMClient
+from backend.clients.llm import FallbackLLMClient, LiveLLMClient, create_translation_client, create_workflow_client
 from backend.config import Settings
 
 
@@ -103,3 +103,39 @@ def test_retry_delay_parses_groq_retry_time_and_quota_error():
     assert LiveLLMClient._retry_delay(response) == 193.5
     quota = _response(402, {"error": {"code": "insufficient_quota", "message": "quota exceeded"}})
     assert LiveLLMClient._is_quota_error(quota)
+
+
+def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkeypatch):
+    settings = Settings(
+        llm_base_url="https://groq.example/v1",
+        llm_model="groq-model",
+        groq_api_keys="groq-key",
+        llm_2_base_url="https://gemini.example/v1",
+        llm_2_model="gemini-model",
+        llm_2_api_keys="gemini-key-1,gemini-key-2",
+        llm_cache_path=str(Path("data") / f"provider-fallback-{uuid.uuid4().hex}.sqlite3"),
+    )
+
+    class Provider:
+        def __init__(self, provider_settings):
+            self.model = provider_settings.llm_model
+            self.keys = provider_settings.groq_api_keys
+
+        def chat_json(self, messages):
+            if self.model == "groq-model":
+                raise RuntimeError("organization restricted")
+            return {"provider": self.model}
+
+    monkeypatch.setattr("backend.clients.llm.LiveLLMClient", Provider)
+    groq = Provider(settings)
+
+    translation = create_translation_client(groq, settings)
+    assert isinstance(translation, FallbackLLMClient)
+    assert translation.primary.model == "gemini-model"
+    assert translation.secondary is groq
+
+    workflow = create_workflow_client(groq, settings)
+    assert isinstance(workflow, FallbackLLMClient)
+    assert workflow.primary is groq
+    assert workflow.secondary.model == "gemini-model"
+    assert workflow.chat_json([{"role": "user", "content": "check"}]) == {"provider": "gemini-model"}

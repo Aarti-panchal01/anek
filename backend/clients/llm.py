@@ -291,14 +291,24 @@ def create_llm_client(mock: bool = False) -> LLMClient:
 
 def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClient:
     """Prefer Gemini for translation and fall back to the configured Groq pool."""
+    gemini = _create_gemini_client(settings)
+    return FallbackLLMClient(gemini, primary) if gemini else primary
+
+
+def create_workflow_client(primary: LLMClient, settings: Settings) -> LLMClient:
+    """Use Groq first for cleanup/checks, with Gemini as a provider fallback."""
+    gemini = _create_gemini_client(settings)
+    return FallbackLLMClient(primary, gemini) if gemini else primary
+
+
+def _create_gemini_client(settings: Settings) -> LiveLLMClient | None:
     gemini_keys = settings.llm_2_api_keys or settings.llm_2_api_key
     if not gemini_keys:
-        return primary
+        return None
     gemini_settings = settings.model_copy(update={
         "llm_base_url": settings.llm_2_base_url,
         "llm_model": settings.llm_2_model,
         "llm_api_key": "",
         "groq_api_keys": gemini_keys,
     })
-    gemini = LiveLLMClient(gemini_settings)
-    return FallbackLLMClient(gemini, primary)
+    return LiveLLMClient(gemini_settings)
