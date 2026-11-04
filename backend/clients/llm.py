@@ -78,7 +78,7 @@ class LiveLLMClient:
         self.invalid_keys: set[int] = set()
         self.raise_on_quota = raise_on_quota
         self.timeout = timeout
-        self.cache_path = Path(settings.llm_cache_path)
+        self.cache_path = Path(settings.llm_cache_path or (Path(settings.anek_data_dir) / "llm_response_cache.sqlite3"))
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_cache()
 

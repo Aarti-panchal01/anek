@@ -1,13 +1,14 @@
 """Small SQLite persistence layer for projects, assets, and resumable work."""
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
 from backend.config import get_settings
 
-DB_PATH = Path("data/anek.db")
+DB_PATH = Path(os.getenv("ANEK_DATA_DIR", "data")) / "anek.db"
 
 
 @contextmanager

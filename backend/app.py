@@ -1,12 +1,16 @@
 """Anek HTTP API and static frontend host."""
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import html
 import json
 import math
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +22,7 @@ from difflib import SequenceMatcher
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 try:
     from rapidfuzz.fuzz import ratio
@@ -33,7 +38,7 @@ from backend.pipeline.phase3b import run_quality_pass
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
-DATA_ROOT = Path("data")
+DATA_ROOT = Path(settings.anek_data_dir)
 CONSENT_PHRASES = [
     "Today I am recording my voice for an AI dubbing test.",
     "I consent to use this recording to create my own voice model.",
@@ -41,6 +46,49 @@ CONSENT_PHRASES = [
 ]
 consent_sessions: dict[str, str] = {}
 _rate_events: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+_login_events: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _issue_access_token() -> str:
+    expires = str(int(time.time()) + 7 * 24 * 60 * 60).encode("ascii")
+    signature = hmac.new(settings.anek_auth_secret.encode(), expires, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(expires).decode().rstrip("=") + "." + base64.urlsafe_b64encode(signature).decode().rstrip("=")
+
+
+def _valid_access_token(token: str) -> bool:
+    try:
+        encoded_expiry, encoded_signature = token.split(".", 1)
+        expiry_bytes = base64.urlsafe_b64decode(encoded_expiry + "=" * (-len(encoded_expiry) % 4))
+        signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        expected = hmac.new(settings.anek_auth_secret.encode(), expiry_bytes, hashlib.sha256).digest()
+        return int(expiry_bytes) > int(time.time()) and hmac.compare_digest(signature, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+@app.middleware("http")
+async def require_access_token(request: Request, call_next):
+    if not settings.require_access_auth or not request.url.path.startswith("/api/") or request.url.path == "/api/auth/login" or request.method == "OPTIONS":
+        return await call_next(request)
+    if not settings.anek_access_password or not settings.anek_auth_secret:
+        return JSONResponse({"detail": "Application access is not configured."}, status_code=503)
+    authorization = request.headers.get("authorization", "")
+    token = authorization[7:] if authorization.lower().startswith("bearer ") else request.query_params.get("token", "")
+    if not _valid_access_token(token):
+        return JSONResponse({"detail": "Sign in to use Anek."}, status_code=401)
+    return await call_next(request)
+
+
+origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+if origins or settings.cors_origin_regex:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_origin_regex=settings.cors_origin_regex or None,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 
 def enforce_ip_limit(request: Request, category: str) -> None:
@@ -70,6 +118,10 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source_lang: str = "auto"
     target_langs: list[str]
+
+
+class AccessLogin(BaseModel):
+    password: str
 
 
 class TermsUpdate(BaseModel):
@@ -182,7 +234,27 @@ async def startup() -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "app": settings.app_name}
+    return {"status": "ok", "app": settings.app_name, "auth_required": settings.require_access_auth}
+
+
+@app.post("/api/auth/login")
+async def access_login(body: AccessLogin, request: Request) -> dict:
+    if not settings.require_access_auth:
+        raise HTTPException(404, "Sign-in is not enabled")
+    if not settings.anek_access_password or not settings.anek_auth_secret:
+        raise HTTPException(503, "Application access is not configured")
+    address = request.client.host if request.client else "unknown"
+    events = _login_events[address]
+    now = time.monotonic()
+    while events and now - events[0] >= 3600:
+        events.popleft()
+    if len(events) >= 8:
+        raise HTTPException(429, "Too many sign-in attempts. Try again later.", headers={"Retry-After": "3600"})
+    if not secrets.compare_digest(body.password, settings.anek_access_password):
+        events.append(now)
+        raise HTTPException(401, "That access password is incorrect")
+    events.clear()
+    return {"access_token": _issue_access_token(), "token_type": "bearer", "expires_in": 604800}
 
 
 @app.get("/api/config")

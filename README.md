@@ -57,6 +57,21 @@ docker run --rm -p 8000:8000 --env-file .env -v anek-data:/app/data anek
 
 Do not publish a port to the public internet without a TLS-terminating reverse proxy, authentication, and suitable persistent rate-limit storage. The included per-IP limits are in-process and reset when the server restarts; multiple workers do not share counters.
 
+## Hosted deployment
+
+The production layout uses Vercel for the static frontend and Railway for the API, FFmpeg worker, SQLite database, uploads, voice references, generated audio, and LLM cache. Railway must have a persistent volume mounted at `/data`; run one API replica because the job queue and rate limits are process-local.
+
+Set these Railway variables before deploying:
+
+- `ANEK_DATA_DIR=/data`
+- `REQUIRE_ACCESS_AUTH=true`
+- `ANEK_ACCESS_PASSWORD` to a strong private workspace password
+- `ANEK_AUTH_SECRET` to a separate random secret of at least 32 bytes
+- `CORS_ORIGINS` to the exact Vercel production origin
+- `GNANI_API_KEY`, `GROQ_API_KEYS`, and `LLM_2_API_KEYS` (or the corresponding configured provider variables)
+
+Set `VITE_API_BASE_URL` on Vercel to the Railway HTTPS origin, without a trailing slash. The UI asks for the workspace password; provider keys stay server-side. Browser media and event-stream URLs use a short-lived signed token in the query string, so keep Railway access logs disabled. Use only your own voice or a voice whose speaker explicitly consented.
+
 ## Evaluation
 
 Run `python -m backend.eval.run_eval` to regenerate [EVAL.md](EVAL.md) and `eval_report.json`. The checked-in evaluation is an offline synthetic probe of number/brand checks and scripted correction outcomes across all enabled languages. It has no audio assets and no native-speaker verified translations, so it does not establish ASR quality, spoken naturalness, semantic fidelity, cloning quality, or real-world accuracy. See EVAL.md for per-language caught, false-alarm, fixed, broken, misses, and credit-cost results.

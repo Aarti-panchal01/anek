@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     llm_2_api_keys: str = ""
     llm_2_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_2_model: str = "gemini-3.5-flash"
-    llm_cache_path: str = "data/llm_response_cache.sqlite3"
+    llm_cache_path: str = ""
     numeral_style: str = "ascii"
     max_video_seconds: int = Field(default=120, le=120, gt=0)
     max_credits_per_job: int = 0
@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     max_stretch: float = 1.15
     similarity_threshold: float = 0.7
     consent_match_threshold: int = 85
+    anek_data_dir: str = "data"
+    require_access_auth: bool = False
+    anek_access_password: str = ""
+    anek_auth_secret: str = ""
+    cors_origins: str = ""
+    cors_origin_regex: str = ""
 
     @field_validator("enabled_langs", mode="before")
     @classmethod

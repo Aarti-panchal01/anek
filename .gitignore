@@ -10,3 +10,6 @@ out_*.wav
 dist/
 node_modules/
 .gstack/
+.vercel/
+.railway/
+.deploy-secrets.env
