@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -38,6 +39,7 @@ from backend.config import LANGUAGES, get_settings
 from backend.pipeline.phase3b import run_quality_pass
 
 settings = get_settings()
+LOGGER = logging.getLogger(__name__)
 app = FastAPI(title=settings.app_name)
 DATA_ROOT = Path(settings.anek_data_dir)
 CONSENT_PHRASES = [
@@ -912,6 +914,7 @@ async def run_job(job_id: str) -> None:
             connection.execute("UPDATE jobs SET state='complete',stage='complete',done=total,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             connection.execute("UPDATE projects SET status='complete' WHERE id=?", (project["id"],))
     except Exception as error:
+        LOGGER.exception("Dub job %s failed", job_id)
         with db.connect() as connection:
             connection.execute("UPDATE jobs SET state='failed',stage='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (str(error)[:1000], job_id))
             connection.execute("UPDATE projects SET status='failed' WHERE id=?", (project["id"],))
