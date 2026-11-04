@@ -472,7 +472,11 @@ def synthesize_sentence_list(client, sentences: list[str], embedding: dict | Non
             gap_frames = int(params.framerate * 0.16)
             frames.append(b"\x00" * gap_frames * params.nchannels * params.sampwidth)
     with wave.open(str(output), "wb") as joined:
-        joined.setparams(params)
+        # Gnani can mark streaming WAVs with 0x7fffffff frames. The actual
+        # frames are read above; carrying that sentinel into the joined file
+        # produces an invalid RIFF size (and may exceed the 4 GiB limit).
+        joined.setparams((params.nchannels, params.sampwidth, params.framerate, 0,
+                          params.comptype, params.compname))
         for frame_bytes in frames:
             joined.writeframesraw(frame_bytes)
     return output, duration_of(output)

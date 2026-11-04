@@ -1,7 +1,11 @@
+import io
+import struct
+import wave
+
 from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, targeted_silence_segments, transcript_sentences
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
-from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons
+from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons, synthesize_sentence_list
 
 
 def test_silence_chunks_prefer_detected_pause_boundaries_and_stay_below_hard_limit():
@@ -48,6 +52,30 @@ def test_synthesis_sentences_and_srt_preserve_cue_times():
     srt = create_srt([{"start_s": 0, "end_s": 2.5, "translation": "வணக்கம்"}])
     assert "00:00:00,000 --> 00:00:02,500" in srt
     assert "வணக்கம்" in srt
+
+
+def test_sentence_join_rewrites_gnani_streaming_frame_count(monkeypatch, tmp_path):
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(48_000)
+        audio.writeframes(b"\x00\x00" * 1600)
+    streaming_wav = bytearray(buffer.getvalue())
+    streaming_wav[40:44] = struct.pack("<I", 0x7FFFFFFF)
+
+    class PreviewClient:
+        def synth_stock(self, text, voice, language):
+            return bytes(streaming_wav)
+
+    monkeypatch.setattr("backend.pipeline.phase3b.duration_of", lambda path: 1600 / 48_000)
+    output, duration = synthesize_sentence_list(
+        PreviewClient(), ["नमस्ते।"], None, tmp_path, "sentinel", "hi-IN", "Shivani"
+    )
+
+    with wave.open(str(output), "rb") as audio:
+        assert audio.getnframes() == 1600
+    assert duration == 1600 / 48_000
 
 
 def test_mid_sentence_merge_does_not_cross_the_twelve_second_hard_cap():
