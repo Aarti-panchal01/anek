@@ -43,7 +43,7 @@ def run_checks(
                     failures.append({"check": "term_missing", "detail": expected})
             elif term.treatment == "transliterate" and expected not in translation:
                 failures.append({"check": "term_form_missing", "detail": expected})
-            elif term.treatment == "translate" and expected not in translation:
+            elif term.treatment == "translate" and term.targets.get(target_lang) and expected not in translation:
                 failures.append({"check": "term_translation_missing", "detail": expected})
     if target_lang != "en-IN" and translation:
         script_text = translation

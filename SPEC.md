@@ -152,9 +152,10 @@ Base URL: `https://api.vachana.ai`. Auth header on every request: `X-API-Key-ID:
 **Languages (10):** Bengali `bn-IN`, English `en-IN`, Gujarati `gu-IN`, Hindi `hi-IN`, Kannada `kn-IN`, Malayalam `ml-IN`, Marathi `mr-IN`, Punjabi `pa-IN`, Tamil `ta-IN`, Telugu `te-IN`. Source: https://docs.gnani.ai/api/STT/languages.md. Odia and Assamese are NOT supported; do not offer them.
 
 **Speech-to-text (Prisma):**
-- REST: `POST /stt/v3` (the `3` is the URL version, not the model version). Model chosen by the `model` value: `prisma-v2.5` (default) or `prisma-v3.0`.
-- Prisma v3.0: language detection with `language_code=indic-auto` (reply carries `detected_language_code`), mixed-language speech, context hints (names/topics), romanised output option. Prisma v2.5: monolingual per language, number formatting, word boosting, find-and-replace.
-- REST audio length limit: docs disagree (30 s on one page, 60 s on another). **Chunk at 25 s or less.** With the 2-minute cap, **Batch STT is not used**: every clip goes through REST. (This also avoids Batch not supporting Gujarati and Punjabi.)
+- REST: `POST /stt/v3` (the `3` is the URL version, not the model version). Pass `model=prisma-v3.0` explicitly to opt in; `prisma-v2.5` remains the fallback.
+- Prisma v3.0: nine Indian languages plus English, `language_code=indic-auto` detection (`detected_language_code` in the reply), `format=codemix`, and optional context hints. `keyterms` is a JSON array of up to 200 words or short phrases. Prisma provides transcripts, not translation or word-level timestamps.
+- REST audio limit: **30 seconds per request**. Anek's 2-minute cap is split at silence boundaries into spans of at most 8 seconds, so use REST for each span; Batch is unnecessary for this cap.
+- Compare Prisma v3.0 without hints and with term-sheet `keyterms`; also compare v3.0 with v2.5 on the same audio. Keep the plain v3.0 transcript as the initial source and highlight transcript disagreements for human review rather than accepting a hint-driven change silently.
 - Exact request fields: read https://docs.gnani.ai/api/STT/speech-to-text.md and https://docs.gnani.ai/api/STT/models/prisma-v3.md. **Do not guess them.**
 - **Verification step (9.6):** Prisma v2.5 returns numbers as spoken words except for `hi-IN` and `en-IN`. Prisma v3.0 with `format=transcribe` writes digits itself, so use `VERIFY_STT_MODEL=prisma-v3.0` for audio verification and keep v2.5 only as a fallback (then fall back to the model-based number-word check). v3.0 also accepts up to 200 `keyterms` phrases for term hints; v2.5 accepts only single-word boost terms.
 - Challenge pages name Prisma v2.5. v3.0 is in the docs. VERIFY that v3.0 works with the programme credits before depending on it; make the model a config value.
@@ -173,7 +174,7 @@ Base URL: `https://api.vachana.ai`. Auth header on every request: `X-API-Key-ID:
 - Docs: https://docs.gnani.ai/api/VC/vc-inference.md and https://docs.gnani.ai/api/VC/voice-clone-embeddings.md
 - Maximum text length per call for the API is not confirmed (the playground shows 800 characters). **Keep each synthesis call under 300 characters.**
 
-**Not offered by Gnani (as far as the docs show):** machine translation and a dubbing API. Translation uses an LLM through an OpenAI-compatible API (`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`). Gnani Evon (open-weight reasoning model) is the preferred brain if a hosted endpoint is available; otherwise use another open-weight model. **The README must name the LLM actually used.**
+**Not offered by Gnani:** machine translation or a hosted dubbing API. Evon v3.3 is an open-weights model (`gnani/gnani-evon-v3.3-30B-A3B`) intended for self-hosting on a single node. No hosted Evon inference endpoint or API-key flow is documented, so Evon is not a translation provider for Anek. Translation uses the configured LLM provider. **The README must name the LLM actually used.**
 
 **Cloning model naming:** the docs page for cloning has mentioned "Timbre v2.0" in places while v2.0 is deprecated. In the submission, name the component as "Gnani voice cloning (`vachana-vc-v1`)" and do not claim a Timbre version for it unless the docs say so.
 
@@ -324,15 +325,17 @@ Rules for the prompt: list names, brands, products, people, places, units, numbe
 The user can edit, add and lock terms in the UI. This approved sheet is saved per project. Optional: save a per-user "term memory" so approved terms are suggested in future projects.
 
 ### 9.3 Stage B: Translate a clip
-Input: `{clip_text, prev_clip_text, next_clip_text, source_lang, target_lang, tone_hint, term_sheet_subset, idioms_in_clip, max_chars}`.
-Output: `{"translation": "...", "terms_used": ["Zorvo"], "notes": ""}`.
+Translate the full cleaned source paragraph in one request, with the sentence/silence spans and their timestamps included for context. Return aligned target spans so timing can be assigned after translation; preserve each sentence's meaning and do not merge separate sentence boundaries.
 Prompt rules:
 - Translate **meaning and register**, not word-for-word. For idioms, express the meaning naturally in the target language.
 - Obey the term sheet exactly (keep / transliterate / approved term).
 - Preserve every number, currency amount, date, phone number and unit exactly (digits may be written in the target script's numerals OR ASCII digits, as set in config `NUMERAL_STYLE`).
 - Keep code-mixed English words that the term sheet says to keep.
-- Stay under `max_chars` (derived from slot duration x calibrated chars-per-second). Be concise, not lossy.
+- Use the per-span character budget as guidance for concise phrasing, never as a reason to drop meaning. Synthesize each translated sentence/span, measure its real duration, and retranslate it with paragraph context if it overruns the source slot before applying the bounded speed change.
 - Output only the JSON.
+
+### 9.3b Translation provider selection
+Gemini `gemini-3.5-flash` is the default translation model, using `LLM_2_BASE_URL`, `LLM_2_MODEL`, and the comma-separated `LLM_2_API_KEYS` (legacy single-key `LLM_2_API_KEY` is also accepted). Gemini keys rotate on quota responses and use the provider retry time for cooldowns; Groq `openai/gpt-oss-120b` performs source cleanup and independent back-translation meaning checks. If translation falls back to Groq, the meaning check is marked non-independent. Evon v3.3 is open weights but has no hosted inference provider, so it is not a translation option for Anek. Do not infer translation quality from MILU knowledge scores. The README names the model actually used.
 
 ### 9.4 Stage C: Checks on text (`checks.py`, `judge.py`)
 **Deterministic (authoritative):**
@@ -514,7 +517,7 @@ Create `backend/eval/fixtures/` with:
 
 ## 13. Config (all in `config.py` / env)
 
-`GNANI_API_KEY`, `GNANI_BASE_URL`, `STT_MODEL` (default `prisma-v2.5`), `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `NUMERAL_STYLE` (`ascii`|`native`), `MAX_VIDEO_SECONDS` (default 120, hard cap), `APP_NAME` (`Anek`), `TRANSLATION_STYLES` and `CONTENT_TYPES` (lists in Sections 1a and 2a), `VERIFY_STT_MODEL` (default `prisma-v3.0`, fallback `prisma-v2.5`; decided in Phase 1), `MAX_CREDITS_PER_JOB`, `GNANI_DAILY_LIMIT` (hard stop for the whole app per day; protects the 5,000 programme credits on a public demo), `PER_IP_LIMITS` (voice clones, previews, jobs per hour), `FIT_TOLERANCE` (1.15), `MAX_STRETCH` (1.15), `SIMILARITY_THRESHOLD`, `CONSENT_MATCH_THRESHOLD`, `ENABLED_LANGS` (set after the cloning gate), `GNANI_MOCK`, `LLM_MOCK`.
+`GNANI_API_KEY`, `GNANI_BASE_URL`, `STT_MODEL` (explicit `prisma-v3.0` opt-in for automatic language detection), `VERIFY_STT_MODEL`, `LLM_BASE_URL`, `LLM_MODEL`, `GROQ_API_KEYS`, `LLM_2_BASE_URL`, `LLM_2_MODEL`, `LLM_2_API_KEYS` (or legacy single-key `LLM_2_API_KEY`), `NUMERAL_STYLE` (`ascii`|`native`), `MAX_VIDEO_SECONDS` (default 120, hard cap), `APP_NAME` (`Anek`), `TRANSLATION_STYLES` and `CONTENT_TYPES` (lists in Sections 1a and 2a), `MAX_CREDITS_PER_JOB`, `GNANI_DAILY_LIMIT`, `PER_IP_LIMITS`, `FIT_TOLERANCE`, `MAX_STRETCH`, `SIMILARITY_THRESHOLD`, `CONSENT_MATCH_THRESHOLD`, `ENABLED_LANGS`, `GNANI_MOCK`, `LLM_MOCK`.
 
 ---
 

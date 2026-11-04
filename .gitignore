@@ -9,3 +9,4 @@ out_*.wav
 .gnani-docs/
 dist/
 node_modules/
+.gstack/

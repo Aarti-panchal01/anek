@@ -36,8 +36,31 @@ class MockLLMClient:
         return {"ok": True, "mock": True, "messages": len(messages)}
 
 
+class FallbackLLMClient:
+    """Use the configured primary provider and fall back only on request failure."""
+
+    def __init__(self, primary: LLMClient, secondary: LLMClient):
+        self.primary = primary
+        self.secondary = secondary
+        self.models_used: list[str] = []
+
+    def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        for client in (self.primary, self.secondary):
+            model = str(getattr(client, "model", client.__class__.__name__))
+            try:
+                result = client.chat_json(messages)
+                self.models_used.append(model)
+                return result
+            except Exception as exc:
+                LOGGER.warning("LLM model %s failed (%s); %s", model, type(exc).__name__,
+                               "trying fallback" if client is self.primary else "no provider fallback remains")
+                if client is self.secondary:
+                    raise
+        raise RuntimeError("All configured translation providers failed")
+
+
 class LiveLLMClient:
-    def __init__(self, settings: Settings, timeout: float = 60.0):
+    def __init__(self, settings: Settings, timeout: float = 60.0, *, raise_on_quota: bool = False):
         configured_keys = [
             key.strip().strip('"').strip("'")
             for key in settings.groq_api_keys.split(",")
@@ -53,6 +76,7 @@ class LiveLLMClient:
         self.current_key_index = 0
         self.cooldowns: dict[int, float] = {}
         self.invalid_keys: set[int] = set()
+        self.raise_on_quota = raise_on_quota
         self.timeout = timeout
         self.cache_path = Path(settings.llm_cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,15 +169,34 @@ class LiveLLMClient:
                 except (TypeError, ValueError, OverflowError):
                     pass
         body = response.text[:4000]
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = {}
+        if isinstance(error_body, dict):
+            error = error_body.get("error", {})
+            details = error.get("details", []) if isinstance(error, dict) else []
+            if isinstance(details, list):
+                for detail in details:
+                    if isinstance(detail, dict):
+                        retry_delay = detail.get("retryDelay")
+                        if isinstance(retry_delay, str):
+                            match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*s\s*", retry_delay)
+                            if match:
+                                return max(0.0, float(match.group(1)))
         patterns = (
             r"try again in\s*(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?",
             r"retry after\s*(\d+(?:\.\d+)?)\s*seconds?",
+            r"retry in\s*(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?",
         )
         match = re.search(patterns[0], body, re.IGNORECASE)
         if match:
             hours, minutes, seconds = (float(value or 0) for value in match.groups())
             return max(0.0, hours * 3600 + minutes * 60 + seconds)
         match = re.search(patterns[1], body, re.IGNORECASE)
+        if match:
+            return max(0.0, float(match.group(1)))
+        match = re.search(patterns[2], body, re.IGNORECASE)
         if match:
             return max(0.0, float(match.group(1)))
         return _DEFAULT_COOLDOWN_SECONDS
@@ -170,6 +213,7 @@ class LiveLLMClient:
             "messages": messages,
             "response_format": {"type": "json_object"},
         }
+        service_error_attempts = 0
         while True:
             key_index = self._available_key_index()
             response = httpx.post(
@@ -178,8 +222,22 @@ class LiveLLMClient:
                 json=request_body,
                 timeout=self.timeout,
             )
+            if response.status_code in {502, 503, 504} and service_error_attempts < 3:
+                service_error_attempts += 1
+                delay = 2 ** service_error_attempts
+                LOGGER.warning(
+                    "LLM model %s returned HTTP %d; retry %d/3 in %ds",
+                    self.model, response.status_code, service_error_attempts, delay,
+                )
+                time.sleep(delay)
+                continue
             if self._is_quota_error(response):
                 cooldown = self._retry_delay(response)
+                if self.raise_on_quota:
+                    raise RuntimeError(
+                        f"LLM provider {self.model} returned a quota or rate-limit response "
+                        f"(HTTP {response.status_code}; retry_in={cooldown:.1f})"
+                    )
                 self.cooldowns[key_index] = time.monotonic() + cooldown
                 self.current_key_index = (key_index + 1) % len(self.keys)
                 LOGGER.warning(
@@ -211,3 +269,18 @@ def create_llm_client(mock: bool = False) -> LLMClient:
     from backend.config import get_settings
 
     return LiveLLMClient(get_settings())
+
+
+def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClient:
+    """Prefer Gemini for translation and fall back to the configured Groq pool."""
+    gemini_keys = settings.llm_2_api_keys or settings.llm_2_api_key
+    if not gemini_keys:
+        return primary
+    gemini_settings = settings.model_copy(update={
+        "llm_base_url": settings.llm_2_base_url,
+        "llm_model": settings.llm_2_model,
+        "llm_api_key": "",
+        "groq_api_keys": gemini_keys,
+    })
+    gemini = LiveLLMClient(gemini_settings)
+    return FallbackLLMClient(gemini, primary)

@@ -59,6 +59,8 @@ def initialize() -> None:
       lang TEXT, clip_id TEXT, voice_id TEXT, state TEXT NOT NULL DEFAULT 'pending',
       content_type TEXT NOT NULL DEFAULT 'explainer',
       translation_style TEXT NOT NULL DEFAULT 'neutral',
+      voice_mode TEXT NOT NULL DEFAULT 'clone',
+      stock_voice TEXT,
       error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       stage TEXT NOT NULL DEFAULT 'queued', done INTEGER NOT NULL DEFAULT 0,
       total INTEGER NOT NULL DEFAULT 0,
@@ -70,14 +72,34 @@ def initialize() -> None:
       id TEXT PRIMARY KEY, project_id TEXT, kind TEXT NOT NULL, units INTEGER NOT NULL,
       est_credits REAL NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS global_terms (
+      id TEXT PRIMARY KEY, term TEXT NOT NULL, type TEXT NOT NULL,
+      treatment TEXT NOT NULL, locked INTEGER NOT NULL DEFAULT 0,
+      targets_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(term, type)
+    );
+    CREATE TABLE IF NOT EXISTS export_events (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, lang TEXT NOT NULL,
+      formats_json TEXT NOT NULL, unresolved_red_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
     """
     with connect() as db:
         db.executescript(schema)
         job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+        if "clip_id" not in job_columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN clip_id TEXT")
         if "content_type" not in job_columns:
             db.execute("ALTER TABLE jobs ADD COLUMN content_type TEXT NOT NULL DEFAULT 'explainer'")
         if "translation_style" not in job_columns:
             db.execute("ALTER TABLE jobs ADD COLUMN translation_style TEXT NOT NULL DEFAULT 'neutral'")
+        if "voice_mode" not in job_columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN voice_mode TEXT NOT NULL DEFAULT 'clone'")
+        if "stock_voice" not in job_columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN stock_voice TEXT")
 
 
 def json_value(value):

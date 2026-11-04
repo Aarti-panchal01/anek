@@ -10,8 +10,9 @@ from pathlib import Path
 
 from backend.brain.autocorrect import translate_with_autocorrect, combine_audio_verification
 from backend.brain.termsheet import extract_termsheet
+from backend.pipeline.phase3b import back_translate, meaning_check_reasons
 from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import LiveLLMClient
+from backend.clients.llm import LiveLLMClient, create_translation_client
 from backend.config import Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -81,6 +82,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
         chunks = split_audio(source_audio, work_dir, duration)
         gnani = LiveGnaniClient(settings)
         llm = LiveLLMClient(settings)
+        translator = create_translation_client(llm, settings)
         ref_audio = reference_path.read_bytes()
         with wave.open(str(reference_path), "rb") as wav:
             ref_duration = wav.getnframes() / wav.getframerate()
@@ -90,7 +92,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
 
         transcripts = []
         for audio_path, start, end in chunks:
-            response = gnani.stt(audio_path.read_bytes(), "indic-auto", "prisma-v3.0")
+            response = gnani.stt(audio_path.read_bytes(), "indic-auto", settings.stt_model, format="codemix")
             transcripts.append(
                 {
                     "start_s": start,
@@ -107,7 +109,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
         results = []
         for index, row in enumerate(transcripts):
             translation_result = translate_with_autocorrect(
-                llm,
+                translator,
                 row["text"],
                 source_lang,
                 "hi-IN",
@@ -149,6 +151,11 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
                 text_status,
                 settings.low_trust_verify_langs,
             )
+            meaning = back_translate(llm, row["text"], translated, source_lang, "hi-IN")
+            meaning_reasons = meaning_check_reasons(meaning)
+            if meaning_reasons:
+                final_status["status"] = "yellow" if final_status["status"] != "red" else "red"
+                final_status["reasons"] = list(dict.fromkeys(final_status["reasons"] + meaning_reasons))
             results.append(
                 {
                     "index": index,
@@ -159,6 +166,8 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
                     "audio_transcript": verification["transcript"],
                     "status": final_status["status"],
                     "reasons": final_status["reasons"],
+                    "back_translation": meaning.get("back_translation", ""),
+                    "meaning_preserved": meaning.get("meaning_preserved"),
                     "attempts": translation_result["attempts"],
                     "audio_path": speech_path,
                 }
@@ -184,7 +193,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
         srt_path.write_text(create_srt(results), encoding="utf-8")
         clean_results = [{key: value for key, value in row.items() if key != "audio_path"} for row in results]
         report = build_report("hi-IN", clean_results, settings)
-        report.update({"source_language": source_lang, "models": {"stt": "prisma-v3.0", "voice": "vachana-vc-v1", "translation": settings.llm_model}, "export_label": "AI dubbed"})
+        report.update({"source_language": source_lang, "models": {"stt": settings.stt_model, "voice": "vachana-vc-v1", "translation": settings.llm_2_model if (settings.llm_2_api_keys or settings.llm_2_api_key) else settings.llm_model, "translation_checker": settings.llm_model, "checker_independent": bool(settings.llm_2_api_keys or settings.llm_2_api_key)}, "export_label": "AI dubbed"})
         report_path = output_path.with_suffix(".json")
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         if abs(probe_duration(output_path) - duration) > 0.1:

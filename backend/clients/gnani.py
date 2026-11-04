@@ -1,6 +1,7 @@
 """Gnani REST client using the request shapes in its public API docs."""
 
 import json
+import time
 from typing import Protocol
 
 import httpx
@@ -15,6 +16,8 @@ class GnaniClient(Protocol):
 
     def synth(self, text: str, speaker_embedding: dict) -> bytes: ...
 
+    def synth_stock(self, text: str, voice: str, language: str, speed: float = 1.0) -> bytes: ...
+
 
 class MockGnaniClient:
     def stt(self, audio: bytes, language_code: str, model: str) -> dict:
@@ -24,6 +27,9 @@ class MockGnaniClient:
         return {"embedding": "mock-embedding", "shape": [1, 768], "dtype": "mock"}
 
     def synth(self, text: str, speaker_embedding: dict) -> bytes:
+        return b"mock-audio"
+
+    def synth_stock(self, text: str, voice: str, language: str, speed: float = 1.0) -> bytes:
         return b"mock-audio"
 
 
@@ -48,13 +54,17 @@ class LiveGnaniClient:
             form["format"] = format
         if keyterms:
             form["keyterms"] = json.dumps(keyterms, ensure_ascii=False)
-        response = httpx.post(
-            f"{self.base_url}/stt/v3",
-            headers=self.headers,
-            files={"audio_file": ("clip.wav", audio, "audio/wav")},
-            data=form,
-            timeout=self.timeout,
-        )
+        for attempt in range(2):
+            response = httpx.post(
+                f"{self.base_url}/stt/v3",
+                headers=self.headers,
+                files={"audio_file": ("clip.wav", audio, "audio/wav")},
+                data=form,
+                timeout=self.timeout,
+            )
+            if response.status_code not in {502, 503, 504} or attempt == 1:
+                break
+            time.sleep(1.5)
         response.raise_for_status()
         body = response.json()
         if not body.get("success"):
@@ -88,6 +98,34 @@ class LiveGnaniClient:
                 "container": "wav",
             },
             "speaker_embedding": speaker_embedding,
+        }
+        response = httpx.post(
+            f"{self.base_url}/api/v1/tts/inference",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.content
+
+    def synth_stock(self, text: str, voice: str, language: str, speed: float = 1.0) -> bytes:
+        if len(text) >= 800:
+            raise ValueError("Timbre synthesis text must be under 800 characters")
+        if not 0.85 <= speed <= 1.15:
+            raise ValueError("Timbre v3 speed must be between 0.85 and 1.15")
+        payload = {
+            "text": text,
+            "voice": voice,
+            "model": "timbre-v3.0",
+            "language": language,
+            "speed": speed,
+            "audio_config": {
+                "sample_rate": 48000,
+                "num_channels": 1,
+                "sample_width": 2,
+                "encoding": "linear_pcm",
+                "container": "wav",
+            },
         }
         response = httpx.post(
             f"{self.base_url}/api/v1/tts/inference",

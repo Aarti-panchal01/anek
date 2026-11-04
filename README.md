@@ -4,9 +4,9 @@ Anek is a local-first, single-speaker video dubbing studio for Indian languages.
 
 ## Models and services
 
-- Speech recognition and audio round-trip verification: Gnani Prisma (`prisma-v3.0` for current verification; `prisma-v2.5` remains the configured baseline).
+- Speech recognition and audio round-trip verification: Gnani Prisma v3.0 (`model=prisma-v3.0`, opt-in through `STT_MODEL`). Source transcripts are compared against Prisma v2.5 and, when approved names exist, v3.0 with and without `keyterms`; disagreements are flagged for review.
 - Voice cloning: Gnani Vachana voice-clone embedding and inference (`vachana-vc-v1`).
-- Translation, cleanup, candidate selection and meaning checks: Groq OpenAI-compatible chat completions, configured by `LLM_BASE_URL` and `LLM_MODEL` (the supplied example uses `openai/gpt-oss-120b`).
+- Translation default: Gemini `gemini-3.5-flash`. Groq `openai/gpt-oss-120b` independently back-translates and checks meaning, and performs source cleanup. Translation is requested with full-paragraph context, then aligned spans are synthesized and measured against their source slots; overlong spans are retranslated before the limited speed adjustment.
 - Media processing: FFmpeg.
 
 ## Contributors
