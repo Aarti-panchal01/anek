@@ -133,6 +133,7 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
         llm_2_base_url="https://gemini.example/v1",
         llm_2_model="gemini-model",
         llm_2_api_keys="gemini-key-1,gemini-key-2",
+        llm_2_fallback_models="gemini-backup-a,gemini-backup-b",
         llm_cache_path=str(Path("data") / f"provider-fallback-{uuid.uuid4().hex}.sqlite3"),
     )
 
@@ -151,11 +152,38 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
 
     translation = create_translation_client(groq, settings)
     assert isinstance(translation, FallbackLLMClient)
-    assert translation.primary.model == "gemini-model"
+    assert isinstance(translation.primary, FallbackLLMClient)
+    assert translation.primary.primary.model == "gemini-model"
+    assert translation.primary.secondary.primary.model == "gemini-backup-a"
+    assert translation.primary.secondary.secondary.model == "gemini-backup-b"
     assert translation.secondary is groq
 
     workflow = create_workflow_client(groq, settings)
     assert isinstance(workflow, FallbackLLMClient)
     assert workflow.primary is groq
-    assert workflow.secondary.model == "gemini-model"
+    assert isinstance(workflow.secondary, FallbackLLMClient)
+    assert workflow.secondary.primary.model == "gemini-model"
     assert workflow.chat_json([{"role": "user", "content": "check"}]) == {"provider": "gemini-model"}
+
+
+def test_model_fallback_records_model_that_actually_answered(cache_path, monkeypatch):
+    settings = _settings(cache_path, keys="groq-key")
+    settings.llm_2_api_key = "gemini-key"
+    settings.llm_2_model = "gemini-primary"
+    settings.llm_2_fallback_models = "gemini-backup"
+
+    class Provider:
+        def __init__(self, provider_settings):
+            self.model = provider_settings.llm_model
+
+        def chat_json(self, messages):
+            if self.model == "gemini-primary":
+                raise RuntimeError("temporary service error")
+            return {"provider": self.model}
+
+    monkeypatch.setattr("backend.clients.llm.LiveLLMClient", Provider)
+    from backend.clients.llm import create_translation_client
+
+    client = create_translation_client(Provider(settings), settings)
+    assert client.chat_json([{"role": "user", "content": "translation"}]) == {"provider": "gemini-backup"}
+    assert client.models_used == ["gemini-backup"]

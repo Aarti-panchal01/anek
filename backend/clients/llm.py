@@ -65,9 +65,14 @@ class FallbackLLMClient:
     def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         for client in (self.primary, self.secondary):
             model = str(getattr(client, "model", client.__class__.__name__))
+            nested_models = getattr(client, "models_used", None)
+            nested_count = len(nested_models) if nested_models is not None else 0
             try:
                 result = client.chat_json(messages)
-                self.models_used.append(model)
+                if nested_models is not None and len(nested_models) > nested_count:
+                    self.models_used.extend(nested_models[nested_count:])
+                else:
+                    self.models_used.append(model)
                 return result
             except Exception as exc:
                 LOGGER.warning("LLM model %s failed (%s); %s", model, type(exc).__name__,
@@ -293,23 +298,35 @@ def create_llm_client(mock: bool = False) -> LLMClient:
 
 def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClient:
     """Prefer Gemini for translation and fall back to the configured Groq pool."""
-    gemini = _create_gemini_client(settings)
+    gemini = _create_gemini_fallback_chain(settings)
     return FallbackLLMClient(gemini, primary) if gemini else primary
 
 
 def create_workflow_client(primary: LLMClient, settings: Settings) -> LLMClient:
     """Use Groq first for cleanup/checks, with Gemini as a provider fallback."""
-    gemini = _create_gemini_client(settings)
+    gemini = _create_gemini_fallback_chain(settings)
     return FallbackLLMClient(primary, gemini) if gemini else primary
 
 
-def _create_gemini_client(settings: Settings) -> LiveLLMClient | None:
+def _create_gemini_fallback_chain(settings: Settings) -> LLMClient | None:
     gemini_keys = settings.llm_2_api_keys or settings.llm_2_api_key
     if not gemini_keys:
         return None
+    models = [settings.llm_2_model]
+    models.extend(model.strip() for model in settings.llm_2_fallback_models.split(",") if model.strip())
+    # Preserve order while avoiding a repeated configured model.
+    models = list(dict.fromkeys(models))
+    clients = [_create_gemini_client(settings, gemini_keys, model) for model in models]
+    chain: LLMClient = clients[-1]
+    for client in reversed(clients[:-1]):
+        chain = FallbackLLMClient(client, chain)
+    return chain
+
+
+def _create_gemini_client(settings: Settings, gemini_keys: str, model: str) -> LiveLLMClient:
     gemini_settings = settings.model_copy(update={
         "llm_base_url": settings.llm_2_base_url,
-        "llm_model": settings.llm_2_model,
+        "llm_model": model,
         "llm_api_key": "",
         "groq_api_keys": gemini_keys,
     })
