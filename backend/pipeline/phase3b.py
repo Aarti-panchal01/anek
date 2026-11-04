@@ -617,6 +617,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             for row in source_chunks:
                 row["cleaned"], row["cleanup_changes"] = clean_source_detail(workflow_llm, row["raw"], term_sheet, source_lang, source_context)
                 cleaned_rows.append(row)
+        reference_seconds = None
         if stock_voice:
             embedding = None
         else:
@@ -832,7 +833,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             track_files = mux_outputs(video, language_rows, final_path, duration, work, settings, room_tone_path, source_wav, output_dir, target_lang)
             report = build_report(target_lang, [{key: val for key, val in row.items() if key not in {"audio_path", "timeline_audio_path"}} for row in language_rows], settings)
             used_translation_models = list(dict.fromkeys(getattr(translator, "models_used", [])))
-            report.update({"source_language": source_lang, "content_type": content_type, "reference_audio_seconds": reference_seconds, "reference_preprocessing": "none; raw reference uploaded for embedding", "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "retry_over_slot_ratio": 1.10, "retry_under_slot_ratio": 0.75, "max_speed_change": 0.08, "overflow_policy": "withhold overflowing candidate from timeline and mark red; never overlap the next segment", "sentence_pause_s": 0.16}, "models": {"stt": source_stt_model, "voice": "vachana-vc-v1", "translation": used_translation_models or [settings.llm_2_model if settings.llm_2_api_key else settings.llm_model], "translation_checker": settings.llm_model, "checker_independent": bool(settings.llm_2_api_key) and settings.llm_model not in used_translation_models, "translation_fallback": settings.llm_model if settings.llm_model in used_translation_models else None}})
+            report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "retry_over_slot_ratio": 1.10, "retry_under_slot_ratio": 0.75, "max_speed_change": 0.08, "overflow_policy": "withhold overflowing candidate from timeline and mark red; never overlap the next segment", "sentence_pause_s": 0.16}, "models": {"stt": source_stt_model, "voice": stock_voice or "vachana-vc-v1", "translation": used_translation_models or [settings.llm_2_model if settings.llm_2_api_key else settings.llm_model], "translation_checker": settings.llm_model, "checker_independent": bool(settings.llm_2_api_key) and settings.llm_model not in used_translation_models, "translation_fallback": settings.llm_model if settings.llm_model in used_translation_models else None}})
             report["term_sheet"] = term_sheet.model_dump()
             report_path = final_path.with_suffix(".json")
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -879,6 +880,23 @@ def clean_source_detail(client, raw: str, terms: TermSheet, language: str, conte
         if not any("specialist" in item.get("from", "").casefold() and "uncertain source retained" in item.get("reason", "").casefold() for item in changes):
             changes.append({"from": "to take to a specialist", "to": "to take to a specialist", "reason": "uncertain source retained: exact ASR action preserved without interpretation"})
     return cleaned, changes
+
+
+def voice_report_metadata(stock_voice: str | None, reference_seconds: float | None) -> dict:
+    """Describe the selected voice without implying a reference upload for stock voices."""
+    if stock_voice:
+        return {
+            "voice_mode": "stock",
+            "reference_audio_seconds": None,
+            "reference_preprocessing": "not applicable; Gnani Timbre stock voice selected",
+            "voice_model": stock_voice,
+        }
+    return {
+        "voice_mode": "clone",
+        "reference_audio_seconds": reference_seconds,
+        "reference_preprocessing": "none; raw reference uploaded for embedding",
+        "voice_model": "vachana-vc-v1",
+    }
 
 
 def mux_outputs(video: Path, clips: list[dict], output: Path, duration: float, work: Path, settings: Settings,

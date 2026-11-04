@@ -2,7 +2,7 @@ import io
 import struct
 import wave
 
-from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, targeted_silence_segments, transcript_sentences
+from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, targeted_silence_segments, transcript_sentences, voice_report_metadata
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
 from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons, synthesize_sentence_list
@@ -76,6 +76,14 @@ def test_sentence_join_rewrites_gnani_streaming_frame_count(monkeypatch, tmp_pat
     with wave.open(str(output), "rb") as audio:
         assert audio.getnframes() == 1600
     assert duration == 1600 / 48_000
+
+
+def test_stock_voice_report_does_not_claim_a_reference_upload():
+    metadata = voice_report_metadata("Shivani", None)
+    assert metadata["voice_mode"] == "stock"
+    assert metadata["reference_audio_seconds"] is None
+    assert "not applicable" in metadata["reference_preprocessing"]
+    assert metadata["voice_model"] == "Shivani"
 
 
 def test_mid_sentence_merge_does_not_cross_the_twelve_second_hard_cap():
