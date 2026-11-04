@@ -23,6 +23,10 @@ class LLMClient(Protocol):
     def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]: ...
 
 
+class QuotaPoolExhausted(RuntimeError):
+    """Raised after every key for a provider has been quota-limited."""
+
+
 def clear_response_cache(settings: Settings) -> None:
     """Erase cached model responses, which may contain submitted source text."""
     cache_path = Path(settings.llm_cache_path or (Path(settings.anek_data_dir) / "llm_response_cache.sqlite3"))
@@ -57,9 +61,10 @@ class MockLLMClient:
 class FallbackLLMClient:
     """Use the configured primary provider and fall back only on request failure."""
 
-    def __init__(self, primary: LLMClient, secondary: LLMClient):
+    def __init__(self, primary: LLMClient, secondary: LLMClient, *, propagate_quota: bool = False):
         self.primary = primary
         self.secondary = secondary
+        self.propagate_quota = propagate_quota
         self.models_used: list[str] = []
 
     def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -77,13 +82,22 @@ class FallbackLLMClient:
             except Exception as exc:
                 LOGGER.warning("LLM model %s failed (%s); %s", model, type(exc).__name__,
                                "trying fallback" if client is self.primary else "no provider fallback remains")
+                if client is self.primary and self.propagate_quota and isinstance(exc, QuotaPoolExhausted):
+                    raise
                 if client is self.secondary:
                     raise
         raise RuntimeError("All configured translation providers failed")
 
 
 class LiveLLMClient:
-    def __init__(self, settings: Settings, timeout: float = 60.0, *, raise_on_quota: bool = False):
+    def __init__(
+        self,
+        settings: Settings,
+        timeout: float = 60.0,
+        *,
+        raise_on_quota: bool = False,
+        fallback_on_quota: bool = False,
+    ):
         configured_keys = [
             key.strip().strip('"').strip("'")
             for key in settings.groq_api_keys.split(",")
@@ -100,6 +114,7 @@ class LiveLLMClient:
         self.cooldowns: dict[int, float] = {}
         self.invalid_keys: set[int] = set()
         self.raise_on_quota = raise_on_quota
+        self.fallback_on_quota = fallback_on_quota
         self.timeout = timeout
         self.cache_path = Path(settings.llm_cache_path or (Path(settings.anek_data_dir) / "llm_response_cache.sqlite3"))
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +172,10 @@ class LiveLLMClient:
                 raise RuntimeError("All configured LLM key indexes were rejected as invalid")
             shortest_index = min(usable_indices, key=lambda index: self.cooldowns.get(index, 0.0))
             delay = max(0.0, self.cooldowns[shortest_index] - now)
+            if self.fallback_on_quota:
+                raise QuotaPoolExhausted(
+                    f"LLM provider {self.model} has no available keys; shortest_retry_in={delay:.1f}s"
+                )
             LOGGER.warning(
                 "All %d LLM keys are on cooldown; waiting %.1f seconds for key index %d",
                 len(self.keys), delay, shortest_index + 1,
@@ -237,6 +256,7 @@ class LiveLLMClient:
             "response_format": {"type": "json_object"},
         }
         service_error_attempts = 0
+        quota_keys_this_request: set[int] = set()
         while True:
             key_index = self._available_key_index()
             response = httpx.post(
@@ -265,10 +285,16 @@ class LiveLLMClient:
                     )
                 self.cooldowns[key_index] = time.monotonic() + cooldown
                 self.current_key_index = (key_index + 1) % len(self.keys)
+                quota_keys_this_request.add(key_index)
                 LOGGER.warning(
                     "LLM key index %d reached quota; cooling down for %.1f seconds",
                     key_index + 1, cooldown,
                 )
+                if self.fallback_on_quota and len(quota_keys_this_request | self.invalid_keys) >= len(self.keys):
+                    raise QuotaPoolExhausted(
+                        f"LLM provider {self.model} quota-limited every configured key; "
+                        f"shortest_retry_in={cooldown:.1f}s"
+                    )
                 continue
             if response.status_code == 401:
                 self.invalid_keys.add(key_index)
@@ -319,7 +345,7 @@ def _create_gemini_fallback_chain(settings: Settings) -> LLMClient | None:
     clients = [_create_gemini_client(settings, gemini_keys, model) for model in models]
     chain: LLMClient = clients[-1]
     for client in reversed(clients[:-1]):
-        chain = FallbackLLMClient(client, chain)
+        chain = FallbackLLMClient(client, chain, propagate_quota=True)
     return chain
 
 
@@ -330,4 +356,7 @@ def _create_gemini_client(settings: Settings, gemini_keys: str, model: str) -> L
         "llm_api_key": "",
         "groq_api_keys": gemini_keys,
     })
-    return LiveLLMClient(gemini_settings)
+    # Try every Gemini key once for this request. When the entire Gemini pool is
+    # limited, bubble up to the provider-level fallback instead of sleeping in
+    # this worker indefinitely. Groq remains the translation fallback.
+    return LiveLLMClient(gemini_settings, fallback_on_quota=True)

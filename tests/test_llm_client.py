@@ -14,6 +14,8 @@ def _settings(cache_path, keys="key-one,key-two"):
         llm_base_url="https://example.invalid/v1",
         llm_model="test-model",
         groq_api_keys=keys,
+        llm_2_api_key="",
+        llm_2_api_keys="",
         llm_cache_path=str(cache_path),
     )
 
@@ -62,6 +64,46 @@ def test_quota_response_rotates_key_and_success_is_cached(cache_path, monkeypatc
     second_client = LiveLLMClient(_settings(cache_path))
     assert second_client.chat_json(messages) == {"answer": "ok"}
     assert len(calls) == 2
+
+
+def test_translation_falls_back_to_groq_after_all_gemini_keys_are_limited(
+    cache_path, monkeypatch, caplog
+):
+    settings = Settings(
+        llm_base_url="https://groq.example/v1",
+        llm_model="groq-model",
+        groq_api_keys="groq-key",
+        llm_2_base_url="https://gemini.example/v1",
+        llm_2_model="gemini-model",
+        llm_2_api_keys="gemini-key-1,gemini-key-2",
+        llm_2_fallback_models="gemini-backup",
+        llm_cache_path=str(cache_path),
+    )
+    gemini_calls = []
+
+    def post(url, headers, json, timeout):
+        gemini_calls.append((url, headers["Authorization"]))
+        return _response(
+            429,
+            {"error": {"code": "rate_limit_exceeded", "message": "quota exceeded"}},
+            {"Retry-After": "60"},
+        )
+
+    class Groq:
+        model = "groq-model"
+
+        def chat_json(self, messages):
+            return {"provider": "groq"}
+
+    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
+    caplog.set_level(logging.WARNING, logger="backend.clients.llm")
+    client = create_translation_client(Groq(), settings)
+
+    assert client.chat_json([{"role": "user", "content": "translate this"}]) == {"provider": "groq"}
+    assert [auth for _, auth in gemini_calls] == ["Bearer gemini-key-1", "Bearer gemini-key-2"]
+    assert all(url.startswith("https://gemini.example/") for url, _ in gemini_calls)
+    assert "QuotaPoolExhausted" in caplog.text
+    assert "gemini-key-1" not in caplog.text and "gemini-key-2" not in caplog.text
 
 
 def test_all_six_cooling_down_waits_for_the_shortest(cache_path, monkeypatch):
@@ -138,9 +180,10 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
     )
 
     class Provider:
-        def __init__(self, provider_settings):
+        def __init__(self, provider_settings, **kwargs):
             self.model = provider_settings.llm_model
             self.keys = provider_settings.groq_api_keys
+            self.fallback_on_quota = kwargs.get("fallback_on_quota", False)
 
         def chat_json(self, messages):
             if self.model == "groq-model":
@@ -154,6 +197,7 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
     assert isinstance(translation, FallbackLLMClient)
     assert isinstance(translation.primary, FallbackLLMClient)
     assert translation.primary.primary.model == "gemini-model"
+    assert translation.primary.primary.fallback_on_quota is True
     assert translation.primary.secondary.primary.model == "gemini-backup-a"
     assert translation.primary.secondary.secondary.model == "gemini-backup-b"
     assert translation.secondary is groq
@@ -169,11 +213,12 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
 def test_model_fallback_records_model_that_actually_answered(cache_path, monkeypatch):
     settings = _settings(cache_path, keys="groq-key")
     settings.llm_2_api_key = "gemini-key"
+    settings.llm_2_api_keys = ""
     settings.llm_2_model = "gemini-primary"
     settings.llm_2_fallback_models = "gemini-backup"
 
     class Provider:
-        def __init__(self, provider_settings):
+        def __init__(self, provider_settings, **kwargs):
             self.model = provider_settings.llm_model
 
         def chat_json(self, messages):
