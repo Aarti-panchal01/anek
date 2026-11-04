@@ -265,14 +265,16 @@ class LiveLLMClient:
                 json=request_body,
                 timeout=self.timeout,
             )
-            if response.status_code in {502, 503, 504} and service_error_attempts < 3:
+            if response.status_code in {502, 503, 504} and service_error_attempts < 1:
                 service_error_attempts += 1
-                delay = 2 ** service_error_attempts
-                self.current_key_index = (key_index + 1) % len(self.keys)
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = min(8.0, max(0.0, float(retry_after)))
+                except ValueError:
+                    delay = 1.0
                 LOGGER.warning(
-                    "LLM model %s returned HTTP %d on key index %d; retry %d/3 with key index %d in %ds",
-                    self.model, response.status_code, key_index + 1, service_error_attempts,
-                    self.current_key_index + 1, delay,
+                    "LLM model %s returned HTTP %d; retrying provider once with the same key in %.1fs",
+                    self.model, response.status_code, delay,
                 )
                 time.sleep(delay)
                 continue

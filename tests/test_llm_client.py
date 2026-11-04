@@ -137,7 +137,7 @@ def test_invalid_key_is_skipped_without_logging_secret(monkeypatch, caplog):
     client.cache_path.unlink(missing_ok=True)
 
 
-def test_transient_service_error_rotates_to_next_key(cache_path, monkeypatch, caplog):
+def test_transient_service_error_retries_same_key(cache_path, monkeypatch, caplog):
     client = LiveLLMClient(_settings(cache_path))
     calls = []
 
@@ -152,9 +152,28 @@ def test_transient_service_error_rotates_to_next_key(cache_path, monkeypatch, ca
     caplog.set_level(logging.WARNING, logger="backend.clients.llm")
 
     assert client.chat_json([{"role": "user", "content": "transient retry"}]) == {"answer": "ok"}
-    assert calls == ["Bearer key-one", "Bearer key-two"]
-    assert "key index 2" in caplog.text
+    assert calls == ["Bearer key-one", "Bearer key-one"]
+    assert "same key" in caplog.text
     assert "key-one" not in caplog.text and "key-two" not in caplog.text
+
+
+def test_persistent_service_error_raises_after_one_retry_and_falls_back(cache_path, monkeypatch):
+    primary = LiveLLMClient(_settings(cache_path, keys="gemini-key"))
+    secondary = LiveLLMClient(_settings(cache_path, keys="groq-key"))
+    calls = []
+
+    def post(url, headers, json, timeout):
+        calls.append(headers["Authorization"])
+        if headers["Authorization"] == "Bearer gemini-key":
+            return _response(503, {"error": {"message": "provider unavailable"}})
+        return _response(200, {"choices": [{"message": {"content": '{"answer":"fallback"}'}}]})
+
+    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
+    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda delay: None)
+    result = FallbackLLMClient(primary, secondary).chat_json([{"role": "user", "content": "fallback after outage"}])
+
+    assert result == {"answer": "fallback"}
+    assert calls == ["Bearer gemini-key", "Bearer gemini-key", "Bearer groq-key"]
 
 
 def test_retry_delay_parses_groq_retry_time_and_quota_error():
