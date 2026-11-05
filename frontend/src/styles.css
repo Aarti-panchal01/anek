@@ -39,6 +39,11 @@
 .translation-save{min-height:28px;display:flex;align-items:center;justify-content:flex-end;margin-top:5px}
 .translation-save small{color:var(--ok);font-size:11px}
 .source-preview,.voice-source-preview{width:100%;max-height:360px;aspect-ratio:16/9;display:block;border:1px solid var(--line);border-radius:12px;background:#1b1714;object-fit:contain}
+.source-preview-wrap{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:12px;background:var(--sand)}
+.source-preview-wrap .source-preview{border:0;border-radius:0}
+.source-preview-status{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:20px;background:color-mix(in srgb,var(--paper) 92%,transparent);color:var(--ink);text-align:center}
+.source-preview-status strong{font-size:13px;font-weight:600}
+.source-preview-status span{max-width:360px;color:var(--muted);font-size:11.5px;line-height:1.5}
 .voice-source-preview{margin-top:12px;max-height:420px}
 .video-pending{aspect-ratio:16/9;display:grid;place-items:center;padding:20px;color:var(--muted);font-size:12px;text-align:center;background:linear-gradient(145deg,#211b17,#33271f)}
 .voice-video-card .helper-line{line-height:1.55}
