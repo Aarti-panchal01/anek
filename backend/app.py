@@ -236,7 +236,7 @@ def browser_video_path(source: Path) -> Path:
     video_codec = next((item.get("codec_name") for item in streams if item.get("codec_type") == "video"), None)
     audio_codec = next((item.get("codec_name") for item in streams if item.get("codec_type") == "audio"), None)
     is_mp4 = source.suffix.lower() == ".mp4"
-    if is_mp4 and video_codec == "h264" and audio_codec in {None, "aac"}:
+    if is_mp4 and video_codec == "h264" and audio_codec in {None, "aac"} and mp4_has_faststart(source):
         return source
     temporary = source.parent / "browser.part.mp4"
     try:
@@ -259,6 +259,106 @@ def browser_video_path(source: Path) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return browser_copy
+
+
+def mp4_has_faststart(path: Path) -> bool:
+    """Check that the top-level moov atom precedes mdat for progressive playback."""
+    moov_position = None
+    mdat_position = None
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as video:
+            position = 0
+            while position + 8 <= file_size:
+                video.seek(position)
+                atom_size = int.from_bytes(video.read(4), "big")
+                atom_type = video.read(4)
+                header_size = 8
+                if atom_size == 1:
+                    atom_size = int.from_bytes(video.read(8), "big")
+                    header_size = 16
+                elif atom_size == 0:
+                    atom_size = file_size - position
+                if atom_size < header_size or position + atom_size > file_size:
+                    return False
+                if atom_type == b"moov":
+                    moov_position = position
+                elif atom_type == b"mdat":
+                    mdat_position = position
+                position += atom_size
+                if moov_position is not None and mdat_position is not None:
+                    return moov_position < mdat_position
+        return False
+    except OSError:
+        return False
+
+
+def browser_dubbed_video_path(source: Path) -> Path:
+    """Return a seekable H.264/AAC faststart MP4 copy when the export needs one."""
+    browser_copy = source.with_name(f"{source.stem}.browser.mp4")
+    if browser_copy.is_file() and browser_copy.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+        return browser_copy
+    metadata = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json", str(source)],
+        check=True, capture_output=True, text=True,
+    )
+    streams = json.loads(metadata.stdout).get("streams", [])
+    video_codec = next((row.get("codec_name") for row in streams if row.get("codec_type") == "video"), None)
+    audio_codec = next((row.get("codec_name") for row in streams if row.get("codec_type") == "audio"), None)
+    if video_codec == "h264" and audio_codec in {None, "aac"} and mp4_has_faststart(source):
+        return source
+    temporary = source.with_name(f"{source.stem}.browser.part.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+             "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+             "-threads", "1", "-threads:v", "1", "-filter_threads", "1",
+             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-movflags", "+faststart", str(temporary)],
+            check=True, capture_output=True, timeout=180,
+        )
+        temporary.replace(browser_copy)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return browser_copy
+
+
+def media_response(path: Path, request: Request) -> Response:
+    """Serve a media file with single byte-range support for browser seeking."""
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    size = path.stat().st_size
+    range_header = request.headers.get("range")
+    if not range_header:
+        return FileResponse(path, media_type=media_type, headers={"Accept-Ranges": "bytes"})
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match or (not match.group(1) and not match.group(2)):
+        return Response(status_code=416, headers={"Accept-Ranges": "bytes", "Content-Range": f"bytes */{size}"})
+    first, last = match.groups()
+    if first:
+        start = int(first)
+        end = min(int(last), size - 1) if last else size - 1
+    else:
+        length = int(last)
+        start, end = max(0, size - length), size - 1
+    if start >= size or start > end:
+        return Response(status_code=416, headers={"Accept-Ranges": "bytes", "Content-Range": f"bytes */{size}"})
+    end = min(end, size - 1)
+
+    def chunks():
+        with path.open("rb") as media:
+            media.seek(start)
+            remaining = end - start + 1
+            while remaining:
+                chunk = media.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(chunks(), status_code=206, media_type=media_type, headers={
+        "Accept-Ranges": "bytes", "Content-Range": f"bytes {start}-{end}/{size}",
+        "Content-Length": str(end - start + 1),
+    })
 
 
 def estimated_job_credits(duration_s: float, language_count: int) -> int:
@@ -579,7 +679,7 @@ async def convert_browser_preview(request: Request, video: UploadFile = File(...
 
 
 @app.get("/api/projects/{project_id}/video")
-async def project_video(project_id: str):
+async def project_video(project_id: str, request: Request):
     project = project_row(project_id)
     if not project["video_path"]:
         raise HTTPException(404, "Project video not found")
@@ -588,10 +688,7 @@ async def project_video(project_id: str):
     except Exception as error:
         LOGGER.exception("Project video preview conversion failed for project %s", project_id)
         raise HTTPException(422, "The uploaded video is saved, but this server could not prepare its preview. Try an H.264 MP4 export.") from error
-    return FileResponse(
-        playable, media_type=mimetypes.guess_type(playable.name)[0] or "application/octet-stream",
-        content_disposition_type="inline",
-    )
+    return media_response(playable, request)
 
 
 @app.get("/api/projects/{project_id}/voice-reference-preview")
@@ -633,7 +730,8 @@ async def dubbed_media(project_id: str, lang: str, request: Request):
     matches = list(folder.glob(f"*_{lang}*ai-dubbed.mp4"))
     if not matches:
         raise HTTPException(404, "Dubbed video is not ready")
-    return FileResponse(matches[0], media_type="video/mp4")
+    playable = browser_dubbed_video_path(matches[0])
+    return media_response(playable, request)
 
 
 @app.get("/api/projects/{project_id}/estimate")

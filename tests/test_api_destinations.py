@@ -4,6 +4,8 @@ import tempfile
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
 from backend import db
 from backend import app as app_module
 
@@ -68,7 +70,9 @@ def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypa
         result = _resolve(app_module.upload_video(project["id"], upload))
         assert conversions == []
         assert Path(project_row := app_module.project_row(project["id"])["video_path"]).read_bytes() == b"original hevc bytes"
-        response = _resolve(app_module.project_video(project["id"]))
+        response = _resolve(app_module.project_video(project["id"], app_module.Request({
+            "type": "http", "method": "GET", "path": "/", "headers": [],
+        })))
 
         assert result["filename"] == "source.mov"
         assert (browser_copy.parent / "source.mov").read_bytes() == b"original hevc bytes"
@@ -76,6 +80,57 @@ def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypa
         assert response.media_type == "video/mp4"
         assert "attachment" not in response.headers.get("content-disposition", "")
         assert conversions == [Path(project_row)]
+
+
+def _make_media_project(data_root):
+    project = _resolve(app_module.create_project(app_module.ProjectCreate(
+        name="Media route test", source_lang="en-IN", target_langs=["hi-IN"],
+    )))
+    source_dir = data_root / "uploads" / project["id"]
+    source_dir.mkdir(parents=True)
+    source = source_dir / "source.mp4"
+    source.write_bytes(b"source-video")
+    with db.connect() as connection:
+        connection.execute("UPDATE projects SET video_path=? WHERE id=?", (str(source), project["id"]))
+    export_dir = data_root / "exports" / project["id"]
+    export_dir.mkdir(parents=True)
+    dubbed = export_dir / "sample_hi-IN_ai-dubbed.mp4"
+    dubbed.write_bytes(b"dubbed-video")
+    return project["id"], source, dubbed
+
+
+def test_project_media_range_request_returns_partial_content_and_headers(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, source, dubbed = _make_media_project(data_root)
+        monkeypatch.setattr(app_module, "browser_video_path", lambda path: path)
+        monkeypatch.setattr(app_module, "browser_dubbed_video_path", lambda path: path)
+        response = TestClient(app_module.app).get(
+            f"/api/projects/{project_id}/video", headers={"Range": "bytes=2-5"},
+        )
+
+        assert response.status_code == 206
+        assert response.headers["content-range"] == f"bytes 2-5/{source.stat().st_size}"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert response.headers["content-type"] == "video/mp4"
+        assert response.content == b"urce"
+
+
+def test_project_video_and_dubbed_media_without_range_return_full_content(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, source, dubbed = _make_media_project(data_root)
+        monkeypatch.setattr(app_module, "browser_video_path", lambda path: path)
+        monkeypatch.setattr(app_module, "browser_dubbed_video_path", lambda path: path)
+        client = TestClient(app_module.app)
+
+        source_response = client.get(f"/api/projects/{project_id}/video")
+        dubbed_response = client.get(f"/api/projects/{project_id}/media?lang=hi-IN")
+
+        for response in (source_response, dubbed_response):
+            assert response.status_code == 200
+            assert response.headers["content-type"] == "video/mp4"
+            assert response.headers["accept-ranges"] == "bytes"
+        assert source_response.content == source.read_bytes()
+        assert dubbed_response.content == dubbed.read_bytes()
 
 
 def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypatch):
