@@ -7,12 +7,18 @@ type Project = { id: string; name: string; source_lang: string; target_langs: st
 type Clip = { id: string; idx: number; start_s: number; end_s: number; src_text: string; source_raw?: string; stt_review?: any; translation?: string; draft_translation?: string; status?: string; reasons?: string[]; attempts?: any[]; human_edited?: number; audio_url?: string };
 type Term = {id:string;term:string;type:string;treatment:string;locked:boolean;targets:Record<string,string>;note?:string;projectName?:string;projectId?:string;last_used?:string};
 type Report = { project: Project; lang: string; data: any };
-const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+// VITE_API_BASE_URL is an origin (or an origin ending in /api). Keep the
+// prefix in one place so media URLs and JSON requests use the same routes.
+const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '').replace(/\/api$/i, '');
 const API = `${API_ORIGIN}/api`;
 const ACCESS_TOKEN_KEY = 'anek.access_token';
 const accessToken = () => sessionStorage.getItem(ACCESS_TOKEN_KEY) || '';
+function apiPath(path: string) {
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return normalized === '/api' ? '' : normalized.startsWith('/api/') ? normalized.slice(4) : normalized;
+}
 function apiUrl(path: string) {
-  const url = new URL(path, API_ORIGIN || window.location.origin);
+  const url = new URL(`${API}${apiPath(path)}`, API_ORIGIN || window.location.origin);
   const token = accessToken();
   if (token) url.searchParams.set('token', token);
   return url.toString();
@@ -21,7 +27,7 @@ async function apiFetch(path: string, init?: RequestInit) {
   const headers = new Headers(init?.headers);
   const token = accessToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
-  const response = await fetch(`${API}${path}`, { ...init, headers });
+  const response = await fetch(`${API}${apiPath(path)}`, { ...init, headers });
   if (response.status === 401 && token) window.dispatchEvent(new Event('anek-auth-expired'));
   return response;
 }
