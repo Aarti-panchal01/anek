@@ -189,10 +189,32 @@ class GlobalTermRequest(BaseModel):
     targets: dict[str, str] = Field(default_factory=dict)
     locked: bool = False
     note: str = ""
+    rule_type: str = "standard"
+    heard_variants: list[str] = Field(default_factory=list)
+    spoken_forms: dict[str, str] = Field(default_factory=dict)
 
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def term_row_payload(row) -> dict:
+    item = dict(row)
+    item["locked"] = bool(item.get("locked"))
+    item["targets"] = json.loads(item.pop("targets_json", "{}") or "{}")
+    item["heard_variants"] = json.loads(item.pop("heard_variants_json", "[]") or "[]")
+    item["spoken_forms"] = json.loads(item.pop("spoken_forms_json", "{}") or "{}")
+    return item
+
+
+def persist_generated_dub(connection, clip_id: str, lang: str, clip: dict) -> None:
+    connection.execute(
+        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json,audio_path,duration_s) VALUES(?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=CASE WHEN dubs.human_edited=1 THEN dubs.translation ELSE excluded.translation END,draft_translation=CASE WHEN dubs.human_edited=1 THEN dubs.draft_translation ELSE excluded.draft_translation END,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,audio_path=excluded.audio_path,duration_s=excluded.duration_s,updated_at=CURRENT_TIMESTAMP",
+        (new_id(), clip_id, lang, clip["translation"], clip["translation"], clip["status"],
+         json.dumps(clip["reasons"], ensure_ascii=False), json.dumps(clip.get("translation_synthesis_attempts", [])),
+         str(clip["audio_path"]), clip.get("final_audio_duration_s")),
+    )
 
 
 def project_row(project_id: str):
@@ -470,7 +492,7 @@ async def list_global_terms(q: str = "", treatment: str | None = None) -> dict:
         rows = connection.execute(
             f"SELECT * FROM global_terms{where} ORDER BY term COLLATE NOCASE", params
         ).fetchall()
-    return {"terms": [{**dict(row), "locked": bool(row["locked"]), "targets": json.loads(row["targets_json"])} for row in rows], "count": len(rows)}
+    return {"terms": [term_row_payload(row) for row in rows], "count": len(rows)}
 
 
 @app.post("/api/term-memory", status_code=201)
@@ -483,15 +505,15 @@ async def create_global_term(body: GlobalTermRequest) -> dict:
     with db.connect() as connection:
         try:
             connection.execute(
-                "INSERT INTO global_terms(id,term,type,treatment,locked,targets_json,note) VALUES(?,?,?,?,?,?,?)",
-                (term_id, term.term.strip(), term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), body.note),
+                "INSERT INTO global_terms(id,term,type,treatment,locked,targets_json,note,rule_type,heard_variants_json,spoken_forms_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (term_id, term.term.strip(), term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), body.note, term.rule_type, json.dumps(term.heard_variants, ensure_ascii=False), json.dumps(term.spoken_forms, ensure_ascii=False)),
             )
         except Exception as error:
             if "UNIQUE" in str(error).upper():
                 raise HTTPException(409, "This term and type are already in term memory") from error
             raise
         row = connection.execute("SELECT * FROM global_terms WHERE id=?", (term_id,)).fetchone()
-    return {**dict(row), "locked": bool(row["locked"]), "targets": json.loads(row["targets_json"])}
+    return term_row_payload(row)
 
 
 @app.put("/api/term-memory/{term_id}")
@@ -506,15 +528,15 @@ async def update_global_term(term_id: str, body: GlobalTermRequest) -> dict:
             raise HTTPException(404, "Term not found")
         try:
             connection.execute(
-                "UPDATE global_terms SET term=?,type=?,treatment=?,locked=?,targets_json=?,note=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (term.term.strip(), term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), body.note, term_id),
+                "UPDATE global_terms SET term=?,type=?,treatment=?,locked=?,targets_json=?,note=?,rule_type=?,heard_variants_json=?,spoken_forms_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (term.term.strip(), term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), body.note, term.rule_type, json.dumps(term.heard_variants, ensure_ascii=False), json.dumps(term.spoken_forms, ensure_ascii=False), term_id),
             )
         except Exception as error:
             if "UNIQUE" in str(error).upper():
                 raise HTTPException(409, "This term and type are already in term memory") from error
             raise
         row = connection.execute("SELECT * FROM global_terms WHERE id=?", (term_id,)).fetchone()
-    return {**dict(row), "locked": bool(row["locked"]), "targets": json.loads(row["targets_json"])}
+    return term_row_payload(row)
 
 
 @app.delete("/api/term-memory/{term_id}")
@@ -950,7 +972,7 @@ async def get_termsheet(project_id: str) -> dict:
     project_row(project_id)
     with db.connect() as connection:
         rows = connection.execute("SELECT * FROM terms WHERE project_id=?", (project_id,)).fetchall()
-    return {"terms": [{**dict(row), "locked": bool(row["locked"]), "targets": json.loads(row["targets_json"])} for row in rows], "idioms": []}
+    return {"terms": [term_row_payload(row) for row in rows], "idioms": []}
 
 
 @app.put("/api/projects/{project_id}/termsheet")
@@ -960,17 +982,17 @@ async def approve_terms(project_id: str, body: TermsUpdate) -> dict:
     with db.connect() as connection:
         connection.execute("DELETE FROM terms WHERE project_id=?", (project_id,))
         for term in sheet.terms:
-            term_id = new_id()
             connection.execute(
-                "INSERT INTO terms(id,project_id,term,type,treatment,locked,targets_json,source) VALUES(?,?,?,?,?,?,?,?)",
-                (term_id, project_id, term.term, term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), "approved"),
+                "INSERT INTO terms(id,project_id,term,type,treatment,locked,targets_json,source,rule_type,heard_variants_json,spoken_forms_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO NOTHING",
+                (new_id(), project_id, term.term, term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), "approved", term.rule_type, json.dumps(term.heard_variants, ensure_ascii=False), json.dumps(term.spoken_forms, ensure_ascii=False)),
             )
-            # Approved project terms become shared memory for future jobs.
-            connection.execute(
-                "INSERT INTO global_terms(id,term,type,treatment,locked,targets_json,note) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(term,type) DO UPDATE SET treatment=excluded.treatment,locked=excluded.locked,targets_json=excluded.targets_json,note=excluded.note,updated_at=CURRENT_TIMESTAMP",
-                (new_id(), term.term, term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), "Approved from project term sheet"),
-            )
+            if term.save_global:
+                connection.execute(
+                    "INSERT INTO global_terms(id,term,type,treatment,locked,targets_json,note,rule_type,heard_variants_json,spoken_forms_json) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(term,type) DO UPDATE SET treatment=excluded.treatment,locked=excluded.locked,targets_json=excluded.targets_json,note=excluded.note,rule_type=excluded.rule_type,heard_variants_json=excluded.heard_variants_json,spoken_forms_json=excluded.spoken_forms_json,updated_at=CURRENT_TIMESTAMP",
+                    (new_id(), term.term, term.type, term.treatment, int(term.locked), json.dumps(term.targets, ensure_ascii=False), "Saved from project term sheet", term.rule_type, json.dumps(term.heard_variants, ensure_ascii=False), json.dumps(term.spoken_forms, ensure_ascii=False)),
+                )
     return {"approved": True, "terms": len(sheet.terms)}
 
 
@@ -1046,15 +1068,17 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
         if clip is None:
             raise HTTPException(404, "Clip not found")
         term_rows = connection.execute("SELECT * FROM terms WHERE project_id=?", (clip["project_id"],)).fetchall()
-    sheet = TermSheet.model_validate({"terms": [{**dict(row), "targets": json.loads(row["targets_json"])} for row in term_rows]})
+    sheet = TermSheet.model_validate({"terms": [term_row_payload(row) for row in term_rows]})
     checks = run_checks(clip["src_text"], body.translation, lang, sheet, slot_seconds=clip["end_s"]-clip["start_s"])
     reasons = [f"{item['check']}: {item['detail']}" for item in checks]
     status = "red" if checks else "yellow"
     with db.connect() as connection:
+        existing = connection.execute("SELECT draft_translation,translation FROM dubs WHERE clip_id=? AND lang=?", (clip_id, lang)).fetchone()
+        draft_translation = (existing["draft_translation"] or existing["translation"]) if existing else body.translation
         connection.execute(
             "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,human_edited,audio_path,duration_s) VALUES(?,?,?,?,?,?,?,1,NULL,NULL) "
             "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,human_edited=1,audio_path=NULL,duration_s=NULL,updated_at=CURRENT_TIMESTAMP",
-            (new_id(), clip_id, lang, body.translation, body.translation, status, json.dumps(reasons, ensure_ascii=False)),
+            (new_id(), clip_id, lang, body.translation, draft_translation, status, json.dumps(reasons, ensure_ascii=False)),
         )
     return {"status": status, "reasons": reasons, "human_edited": True}
 
@@ -1070,14 +1094,16 @@ async def run_job(job_id: str) -> None:
     try:
         targeted_clip_index = None
         translation_override = None
+        preserve_translation = False
         if job["kind"] == "regenerate_clip":
             with db.connect() as connection:
                 clip = connection.execute("SELECT * FROM clips WHERE id=? AND project_id=?", (job["clip_id"], project["id"])).fetchone()
-                dub = connection.execute("SELECT translation FROM dubs WHERE clip_id=? AND lang=?", (job["clip_id"], job["lang"])).fetchone()
+                dub = connection.execute("SELECT translation,human_edited FROM dubs WHERE clip_id=? AND lang=?", (job["clip_id"], job["lang"])).fetchone()
             if clip is None or dub is None:
                 raise ValueError("The selected clip translation is no longer available for regeneration")
             targeted_clip_index = int(clip["idx"])
             translation_override = dub["translation"]
+            preserve_translation = bool(dub["human_edited"])
         targets = ([job["lang"]] if job["kind"] in {"regenerate", "regenerate_clip"} and job["lang"] else json.loads(project["target_langs_json"]))
         completed = set()
         with db.connect() as connection:
@@ -1086,11 +1112,11 @@ async def run_job(job_id: str) -> None:
         embedding = json.loads(voice["embedding_json"]) if voice else None
         with db.connect() as connection:
             project_terms = [
-                {**dict(row), "targets": json.loads(row["targets_json"])}
+                term_row_payload(row)
                 for row in connection.execute("SELECT * FROM terms WHERE project_id=?", (project["id"],)).fetchall()
             ]
             global_terms = [
-                {**dict(row), "targets": json.loads(row["targets_json"])}
+                term_row_payload(row)
                 for row in connection.execute("SELECT * FROM global_terms").fetchall()
             ]
         seed_terms = project_terms + global_terms
@@ -1115,6 +1141,7 @@ async def run_job(job_id: str) -> None:
                 output_dir, settings, job["content_type"], job["translation_style"], embedding,
                 project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
                 only_clip_index=targeted_clip_index, translation_override=translation_override,
+                preserve_translation=preserve_translation,
             )
             for result_index, result in enumerate(results):
                 lang = result["language"]
@@ -1127,19 +1154,15 @@ async def run_job(job_id: str) -> None:
                         exists = connection.execute("SELECT id FROM terms WHERE project_id=? AND term=?", (project["id"], term["term"])).fetchone()
                         if not exists:
                             connection.execute(
-                                "INSERT INTO terms(id,project_id,term,type,treatment,locked,targets_json,source) VALUES(?,?,?,?,?,?,?,?)",
-                                (new_id(), project["id"], term["term"], term["type"], term["treatment"], int(term["locked"]), json.dumps(term["targets"], ensure_ascii=False), "brain"),
+                                "INSERT INTO terms(id,project_id,term,type,treatment,locked,targets_json,source,rule_type,heard_variants_json,spoken_forms_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (new_id(), project["id"], term["term"], term["type"], term["treatment"], int(term["locked"]), json.dumps(term["targets"], ensure_ascii=False), "brain", term.get("rule_type", "protected"), json.dumps(term.get("heard_variants", []), ensure_ascii=False), json.dumps(term.get("spoken_forms", {}), ensure_ascii=False)),
                             )
                     for clip in result["clips"]:
                         row = connection.execute("SELECT id FROM clips WHERE project_id=? AND idx=?", (project["id"], clip["clip"]-1)).fetchone()
                         clip_id = row["id"] if row else new_id()
                         if not row:
                             connection.execute("INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)", (clip_id, project["id"], clip["clip"]-1, clip["start_s"], clip["end_s"], clip["source_cleaned"]))
-                        connection.execute(
-                            "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json,audio_path,duration_s) VALUES(?,?,?,?,?,?,?,?,?,?) "
-                            "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,audio_path=excluded.audio_path,duration_s=excluded.duration_s,updated_at=CURRENT_TIMESTAMP",
-                            (new_id(), clip_id, lang, clip["translation"], clip["translation"], clip["status"], json.dumps(clip["reasons"], ensure_ascii=False), json.dumps(clip.get("translation_synthesis_attempts", [])), str(clip["audio_path"]), clip.get("final_audio_duration_s")),
-                        )
+                        persist_generated_dub(connection, clip_id, lang, clip)
         with db.connect() as connection:
             connection.execute("UPDATE jobs SET state='complete',stage='complete',done=total,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             connection.execute("UPDATE projects SET status='complete' WHERE id=?", (project["id"],))

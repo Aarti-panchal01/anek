@@ -24,6 +24,10 @@ class Term(BaseModel):
     targets: dict[str, str] = Field(default_factory=dict)
     locked: bool = False
     note: str = ""
+    rule_type: Literal["standard", "protected", "mishearing"] = "standard"
+    heard_variants: list[str] = Field(default_factory=list)
+    spoken_forms: dict[str, str] = Field(default_factory=dict)
+    save_global: bool = False
 
     @field_validator("type", mode="before")
     @classmethod
@@ -47,6 +51,52 @@ class Idiom(BaseModel):
 class TermSheet(BaseModel):
     terms: list[Term] = Field(default_factory=list)
     idioms: list[Idiom] = Field(default_factory=list)
+
+
+def apply_mishearing_maps(text: str, termsheet: TermSheet | dict | None) -> str:
+    """Replace heard variants with canonical terms before source translation."""
+    sheet = termsheet if isinstance(termsheet, TermSheet) else TermSheet.model_validate(termsheet or {})
+    for term in sheet.terms:
+        if term.rule_type != "mishearing":
+            continue
+        for variant in sorted(term.heard_variants, key=len, reverse=True):
+            if variant.strip():
+                text = re.sub(rf"(?<!\w){re.escape(variant.strip())}(?!\w)", term.term, text, flags=re.IGNORECASE)
+    return text
+
+
+def mask_protected_terms(text: str, termsheet: TermSheet | dict | None) -> tuple[str, dict[str, str]]:
+    """Mask protected terms with stable placeholders for translation."""
+    sheet = termsheet if isinstance(termsheet, TermSheet) else TermSheet.model_validate(termsheet or {})
+    mapping: dict[str, str] = {}
+    for index, term in enumerate(sheet.terms):
+        if term.rule_type != "protected" and not term.locked:
+            continue
+        placeholder = f"ANEKPROTECTEDTERM{index:04d}"
+        pattern = rf"(?<!\w){re.escape(term.term)}(?!\w)"
+        text, count = re.subn(pattern, placeholder, text, flags=re.IGNORECASE)
+        if count:
+            mapping[placeholder] = term.term
+    return text, mapping
+
+
+def restore_protected_terms(text: str, mapping: dict[str, str]) -> tuple[str, list[str]]:
+    missing = []
+    for placeholder, canonical in mapping.items():
+        if placeholder in text:
+            text = text.replace(placeholder, canonical)
+        elif canonical.casefold() not in text.casefold():
+            missing.append(canonical)
+    return text, missing
+
+
+def apply_spoken_forms(text: str, termsheet: TermSheet | dict | None, language: str) -> str:
+    sheet = termsheet if isinstance(termsheet, TermSheet) else TermSheet.model_validate(termsheet or {})
+    for term in sheet.terms:
+        spoken = term.spoken_forms.get(language)
+        if spoken:
+            text = re.sub(rf"(?<!\w){re.escape(term.term)}(?!\w)", spoken, text, flags=re.IGNORECASE)
+    return text
 
 
 def extract_termsheet(

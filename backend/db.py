@@ -44,7 +44,9 @@ def initialize() -> None:
     CREATE TABLE IF NOT EXISTS terms (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, term TEXT NOT NULL,
       type TEXT NOT NULL, treatment TEXT NOT NULL, locked INTEGER NOT NULL,
-      targets_json TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'brain'
+      targets_json TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'brain',
+      rule_type TEXT NOT NULL DEFAULT 'standard', heard_variants_json TEXT NOT NULL DEFAULT '[]',
+      spoken_forms_json TEXT NOT NULL DEFAULT '{}'
     );
     CREATE TABLE IF NOT EXISTS dubs (
       id TEXT PRIMARY KEY, clip_id TEXT NOT NULL, lang TEXT NOT NULL,
@@ -77,6 +79,8 @@ def initialize() -> None:
       id TEXT PRIMARY KEY, term TEXT NOT NULL, type TEXT NOT NULL,
       treatment TEXT NOT NULL, locked INTEGER NOT NULL DEFAULT 0,
       targets_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '',
+      rule_type TEXT NOT NULL DEFAULT 'standard', heard_variants_json TEXT NOT NULL DEFAULT '[]',
+      spoken_forms_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(term, type)
@@ -101,6 +105,15 @@ def initialize() -> None:
             db.execute("ALTER TABLE jobs ADD COLUMN voice_mode TEXT NOT NULL DEFAULT 'clone'")
         if "stock_voice" not in job_columns:
             db.execute("ALTER TABLE jobs ADD COLUMN stock_voice TEXT")
+        for table in ("terms", "global_terms"):
+            columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+            for name, definition in (
+                ("rule_type", "TEXT NOT NULL DEFAULT 'standard'"),
+                ("heard_variants_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("spoken_forms_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def json_value(value):

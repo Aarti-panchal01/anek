@@ -17,7 +17,10 @@ import httpx
 LOGGER = logging.getLogger(__name__)
 
 from backend.brain.checks import run_checks
-from backend.brain.termsheet import TermSheet, extract_termsheet
+from backend.brain.termsheet import (
+    TermSheet, apply_mishearing_maps, apply_spoken_forms, extract_termsheet,
+    mask_protected_terms, restore_protected_terms,
+)
 from backend.clients.gnani import LiveGnaniClient
 from backend.clients.llm import LiveLLMClient, create_translation_client, create_workflow_client
 from backend.config import LANGUAGES, Settings, get_settings
@@ -605,7 +608,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                      settings: Settings, content_type: str = "explainer", translation_style: str = "neutral",
                      speaker_embedding: dict | None = None, source_language: str = "auto",
                      seed_terms: list[dict] | None = None, stock_voice: str | None = None,
-                     only_clip_index: int | None = None, translation_override: str | None = None) -> list[dict]:
+                     only_clip_index: int | None = None, translation_override: str | None = None,
+                     preserve_translation: bool = False) -> list[dict]:
     if not video.is_file() or (not stock_voice and (reference is None or not reference.is_file())):
         raise FileNotFoundError("Video and cloned voice reference audio must exist")
     duration = duration_of(video)
@@ -691,6 +695,16 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         and re.search(rf"(?<!\w){re.escape(validated.term)}(?!\w)", full_raw_source, re.IGNORECASE)):
                     term_sheet.terms.append(validated)
                     known_terms.add(validated.term.casefold())
+            for seed in seed_terms or []:
+                try:
+                    validated = TermSheet.model_validate({"terms": [seed]}).terms[0]
+                except Exception:
+                    continue
+                if validated.rule_type in {"mishearing", "protected"} and not any(
+                    item.term.casefold() == validated.term.casefold() and item.rule_type == validated.rule_type
+                    for item in term_sheet.terms
+                ):
+                    term_sheet.terms.append(validated)
             keyterms = list(dict.fromkeys(
                 term.term for term in term_sheet.terms
                 if term.type in {"brand", "person", "place"} and term.term.strip()
@@ -737,6 +751,19 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             for row in source_chunks:
                 row["cleaned"], row["cleanup_changes"] = clean_source_detail(workflow_llm, row["raw"], term_sheet, source_lang, source_context)
                 cleaned_rows.append(row)
+        for seed in seed_terms or []:
+            try:
+                validated = TermSheet.model_validate({"terms": [seed]}).terms[0]
+            except Exception:
+                continue
+            if validated.rule_type in {"mishearing", "protected"} and not any(
+                item.term.casefold() == validated.term.casefold() and item.rule_type == validated.rule_type
+                for item in term_sheet.terms
+            ):
+                term_sheet.terms.append(validated)
+        for row in cleaned_rows:
+            row["raw"] = apply_mishearing_maps(row["raw"], term_sheet)
+            row["cleaned"] = apply_mishearing_maps(row["cleaned"], term_sheet)
         cleaned_rows = apply_speech_windows(cleaned_rows, source_silence_spans)
         reference_seconds = None
         if stock_voice:
@@ -750,14 +777,28 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             language_rows = []
             # Seeded from the measured raw-reference Hindi A/B line (88 chars / 4.894 s).
             measured_chars_per_second = 17.98 if target_lang == "hi-IN" else 12.0
-            full_source_paragraph = " ".join(row["cleaned"] for row in cleaned_rows)
+            translation_sheet_data = term_sheet.model_dump()
+            for term_index, term in enumerate(translation_sheet_data["terms"]):
+                if term.get("rule_type") == "protected" or term.get("locked"):
+                    placeholder = f"ANEKPROTECTEDTERM{term_index:04d}"
+                    term["term"] = placeholder
+                    term["targets"] = {language: placeholder for language in term.get("targets", {})}
+                    term["spoken_forms"] = {}
+                    term["locked"] = True
+            translation_sheet = TermSheet.model_validate(translation_sheet_data)
+            translation_rows, protected_maps = [], []
+            for source_row in cleaned_rows:
+                masked_source, mapping = mask_protected_terms(source_row["cleaned"], term_sheet)
+                translation_rows.append({**source_row, "cleaned": masked_source})
+                protected_maps.append(mapping)
+            full_source_paragraph = " ".join(row["cleaned"] for row in translation_rows)
             if only_clip_index is not None and translation_override:
                 paragraph_candidates = [[translation_override] for _ in cleaned_rows]
                 paragraph_selected_index, paragraph_selection_reason = 0, "Existing edited clip text retained for block regeneration."
                 selection_needs_review = False
             else:
                 paragraph_candidates = paragraph_translation_candidates(
-                    translator, cleaned_rows, source_lang, target_lang, term_sheet,
+                    translator, translation_rows, source_lang, target_lang, translation_sheet,
                     content_type, translation_style, measured_chars_per_second,
                 )
                 try:
@@ -784,18 +825,30 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 synthesis_history = []
                 sentence_audio = None
                 spoken_seconds = 0.0
-                candidates = [candidate[index] for candidate in paragraph_candidates]
+                restored_candidates = [
+                    restore_protected_terms(candidate[index], protected_maps[index])
+                    for candidate in paragraph_candidates
+                ]
+                candidates = [candidate[0] for candidate in restored_candidates]
                 selected_index = paragraph_selected_index
                 selection_reason = paragraph_selection_reason
                 selected = candidates[selected_index]
+                protected_missing = restored_candidates[selected_index][1]
+                if preserve_translation and translation_override:
+                    selected = translation_override
+                    protected_missing = [
+                        canonical for canonical in protected_maps[index].values()
+                        if canonical.casefold() not in selected.casefold()
+                    ]
                 timing_revision_rejected = False
                 shorter_retry_used = False
                 last_sentence_prefix = ""
                 for synthesis_attempt in range(3):
                     checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
                     last_sentence_prefix = f"{target_lang}_{index}_attempt_{synthesis_attempt + 1}"
+                    synthesis_text = apply_spoken_forms(selected, clip_terms, target_lang)
                     sentence_audio, spoken_seconds = synthesize_sentence_list(
-                        gnani, transcript_sentences(selected), embedding, work,
+                        gnani, transcript_sentences(synthesis_text), embedding, work,
                         last_sentence_prefix, target_lang, stock_voice,
                     )
                     synthesis_history.append({
@@ -806,7 +859,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         "instruction": retune_instruction,
                     })
                     ratio = spoken_seconds / slot
-                    if spoken_seconds > fit_limit_s and synthesis_attempt < 2:
+                    if spoken_seconds > fit_limit_s and synthesis_attempt < 2 and not preserve_translation:
                         duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
                         retune_instruction = "Paragraph-context retranslation after measured overrun."
                         try:
@@ -821,10 +874,13 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         if run_checks(row["cleaned"], revised, target_lang, clip_terms, max_chars=1000):
                             timing_revision_rejected = True
                             break
+                        if any(canonical.casefold() not in revised.casefold() for canonical in protected_maps[index].values()):
+                            timing_revision_rejected = True
+                            break
                         selected = revised
                         shorter_retry_used = True
                         continue
-                    if ratio < 0.75 and synthesis_attempt < 2:
+                    if ratio < 0.75 and synthesis_attempt < 2 and not preserve_translation:
                         duration_budget_chars = max(len(selected) + 1, int(duration_budget_chars * 1.18))
                         retune_instruction = "Paragraph-context retranslation after measured underrun."
                         try:
@@ -836,6 +892,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                             timing_revision_rejected = True
                             break
                         if run_checks(row["cleaned"], revised, target_lang, clip_terms, max_chars=1000):
+                            timing_revision_rejected = True
+                            break
+                        if any(canonical.casefold() not in revised.casefold() for canonical in protected_maps[index].values()):
                             timing_revision_rejected = True
                             break
                         selected = revised
@@ -925,6 +984,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 reasons = list(audio_flag["reasons"])
                 if translation_checks:
                     reasons.append("Translation checks flagged this clip; edit and review it before approval.")
+                if protected_missing:
+                    reasons.extend(f"Protected term missing from translated output: {term}." for term in protected_missing)
                 if selection_needs_review:
                     reasons.append("Automatic candidate selection was unavailable; review this translation before approval.")
                 if meaning_check_failed:
@@ -969,7 +1030,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     "selected_candidate_index": selected_index, "selection_reason": selection_reason,
                     "translation": selected, "back_translation": meaning.get("back_translation", ""),
                     "meaning_preserved": meaning.get("meaning_preserved"), "audio_transcript": transcript["transcript"],
-                    "status": status, "reasons": reasons, "time_stretched": stretched, "overrun_seconds": overrun_s,
+                    "status": "red" if protected_missing else status, "reasons": reasons, "time_stretched": stretched, "overrun_seconds": overrun_s,
                     "translated_character_count": len(selected),
                     "synthesized_duration_s": round(raw_synthesized_seconds, 3),
                     "final_audio_duration_s": round(final_audio_seconds, 3),
