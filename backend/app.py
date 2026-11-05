@@ -244,10 +244,10 @@ def browser_video_path(source: Path) -> Path:
              # Bound both dimensions. A width-only cap leaves portrait phone
              # footage (for example 1440x2560) almost full resolution and can
              # exhaust the small memory budget available to the preview worker.
-             "-vf", "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-             "-threads", "1", "-filter_threads", "1",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(temporary)],
+             "-vf", "fps=24,scale=w='min(720,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+             "-threads", "1", "-threads:v", "1", "-filter_threads", "1",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(temporary)],
             check=True, capture_output=True, timeout=120,
         )
         temporary.replace(browser_copy)

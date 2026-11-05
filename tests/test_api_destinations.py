@@ -104,8 +104,10 @@ def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypa
         assert result.read_bytes() == b"browser preview"
         ffmpeg_command, options = calls[-1]
         scale = ffmpeg_command[ffmpeg_command.index("-vf") + 1]
-        assert "min(1280,iw)" in scale and "min(1280,ih)" in scale
+        assert "min(720,iw)" in scale and "min(720,ih)" in scale
+        assert "fps=24" in scale
         assert "force_original_aspect_ratio=decrease" in scale
+        assert "-threads:v" in ffmpeg_command
         assert options["timeout"] == 120
 
 
