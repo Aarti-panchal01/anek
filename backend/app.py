@@ -990,21 +990,35 @@ async def run_job(job_id: str) -> None:
                 for row in connection.execute("SELECT * FROM global_terms").fetchall()
             ]
         seed_terms = project_terms + global_terms
-        for target_index, lang in enumerate(targets):
-            if job["kind"] not in {"regenerate", "regenerate_clip"} and lang in completed and list(output_dir.glob(f"*_{lang}*.json")):
-                continue
+        pending_targets = [
+            lang for lang in targets
+            if job["kind"] in {"regenerate", "regenerate_clip"}
+            or lang not in completed
+            or not list(output_dir.glob(f"*_{lang}*.json"))
+        ]
+        if pending_targets:
             with db.connect() as connection:
-                connection.execute("UPDATE jobs SET stage=?,done=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (f"processing {lang}", target_index, job_id))
+                connection.execute(
+                    "UPDATE jobs SET stage='transcribing and preparing clips',done=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (job_id,),
+                )
+            # One pass shares video decode, source transcription, cleanup, and
+            # segmentation across the selected languages. Previously each
+            # language repeated the expensive source-audio work.
             results = await asyncio.to_thread(
                 run_quality_pass,
-                Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, [lang],
+                Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, pending_targets,
                 output_dir, settings, job["content_type"], job["translation_style"], embedding,
                 project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
                 only_clip_index=targeted_clip_index, translation_override=translation_override,
             )
-            for result in results:
+            for result_index, result in enumerate(results):
                 lang = result["language"]
                 with db.connect() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET stage=?,done=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (f"saving {lang}", result_index, job_id),
+                    )
                     for term in result.get("term_sheet", {}).get("terms", []):
                         exists = connection.execute("SELECT id FROM terms WHERE project_id=? AND term=?", (project["id"], term["term"])).fetchone()
                         if not exists:
