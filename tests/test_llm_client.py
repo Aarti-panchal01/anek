@@ -46,7 +46,7 @@ def cache_path():
 
 
 def test_quota_response_rotates_key_and_success_is_cached(cache_path, monkeypatch, caplog):
-    client = LiveLLMClient(_settings(cache_path))
+    client = LiveLLMClient(_settings(cache_path), raise_on_quota=False)
     calls = []
 
     def post(url, headers, json, timeout):
@@ -71,6 +71,22 @@ def test_quota_response_rotates_key_and_success_is_cached(cache_path, monkeypatc
     second_client = LiveLLMClient(_settings(cache_path))
     assert second_client.chat_json(messages) == {"answer": "ok"}
     assert len(calls) == 2
+
+
+def test_quota_opens_model_circuit_instead_of_retrying_next_clip(cache_path, monkeypatch):
+    client = CircuitBreakerLLMClient(LiveLLMClient(_settings(cache_path)))
+    calls = []
+
+    def post(url, headers, json, timeout):
+        calls.append(headers["Authorization"])
+        return _response(429, {"error": {"code": "rate_limit_exceeded", "message": "quota"}})
+
+    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
+    with pytest.raises(RuntimeError, match="quota or rate-limit"):
+        client.chat_json([{"role": "user", "content": "quota test"}])
+    with pytest.raises(Exception, match="cooling down"):
+        client.chat_json([{"role": "user", "content": "quota test"}])
+    assert calls == ["Bearer key-one"]
 
 
 def test_gemini_is_last_translation_fallback_after_groq_fails(
@@ -303,6 +319,42 @@ def test_sarvam_translation_uses_mayura_for_target_text(monkeypatch):
     assert calls[0]["model"] == "mayura:v1"
     assert calls[0]["mode"] == "modern-colloquial"
     assert calls[0]["request_options"]["max_retries"] == 0
+
+
+def test_mocked_sarvam_failure_opens_model_circuit_for_five_minutes(monkeypatch):
+    from backend.clients.llm import ModelCircuitOpen, SarvamTranslationClient
+    import json
+
+    now = [1000.0]
+    calls = []
+    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: now[0])
+
+    class Completions:
+        def __call__(self, **_kwargs):
+            calls.append("call")
+            raise RuntimeError("mock provider outage")
+
+    client = SarvamTranslationClient.__new__(SarvamTranslationClient)
+    client.translation_model = "mayura:v1"
+    client.rewrite_model = f"mock-rewrite-{uuid.uuid4().hex}"
+    client.model = client.translation_model
+    client.models_used = []
+    client.client = type("Sarvam", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    messages = [
+        {"role": "system", "content": "Return a JSON object."},
+        {"role": "user", "content": json.dumps({"check": True})},
+    ]
+
+    with pytest.raises(RuntimeError, match="mock provider outage"):
+        client.chat_json(messages)
+    with pytest.raises(ModelCircuitOpen):
+        client.chat_json(messages)
+    assert calls == ["call"]
+
+    now[0] += 301
+    with pytest.raises(RuntimeError, match="mock provider outage"):
+        client.chat_json(messages)
+    assert calls == ["call", "call"]
 
 
 def test_sarvam_is_first_then_groq_then_gemini(monkeypatch):

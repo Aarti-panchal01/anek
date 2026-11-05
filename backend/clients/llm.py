@@ -151,7 +151,7 @@ class LiveLLMClient:
         settings: Settings,
         timeout: float = 60.0,
         *,
-        raise_on_quota: bool = False,
+        raise_on_quota: bool = True,
         fallback_on_quota: bool = False,
     ):
         configured_keys = [
@@ -518,4 +518,6 @@ def _create_gemini_client(settings: Settings, gemini_keys: str, model: str) -> L
     # Try every Gemini key once for this request. When the entire Gemini pool is
     # limited, bubble up to the provider-level fallback instead of sleeping in
     # this worker indefinitely. Groq remains the translation fallback.
-    return _with_circuit_breaker(LiveLLMClient(gemini_settings, fallback_on_quota=True))
+    return _with_circuit_breaker(
+        LiveLLMClient(gemini_settings, raise_on_quota=False, fallback_on_quota=True)
+    )

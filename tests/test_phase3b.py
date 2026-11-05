@@ -97,7 +97,7 @@ def test_stock_voice_report_does_not_claim_a_reference_upload():
     assert metadata["voice_mode"] == "stock"
     assert metadata["reference_audio_seconds"] is None
     assert "not applicable" in metadata["reference_preprocessing"]
-    assert metadata["voice_model"] == "Shivani"
+    assert "voice_model" not in metadata
 
 
 def test_mid_sentence_merge_does_not_cross_the_twelve_second_hard_cap():

@@ -92,7 +92,7 @@ def test_autocorrect_logs_failed_draft_then_accepts_corrected_text():
 def test_low_trust_audio_number_mismatch_is_yellow(language):
     status = audio_number_status("47 रुपये", "43 रुपये", language, ["mr-IN", "pa-IN"])
     assert status["status"] == "yellow"
-    assert "Verification low trust" in status["reasons"][0]
+    assert "Verification confidence is lower" in status["reasons"][0]
     combined = combine_audio_verification("47 रुपये", "43 रुपये", language, {"status": "green", "reasons": []}, ["mr-IN", "pa-IN"])
     assert combined["status"] == "yellow"
 
