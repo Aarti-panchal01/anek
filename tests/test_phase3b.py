@@ -7,6 +7,8 @@ import pytest
 
 from backend.config import LANGUAGES
 from backend.pipeline.phase3b import (
+    apply_speech_windows,
+    assert_timing_invariants,
     create_srt,
     merge_incomplete_chunks,
     revise_for_timing,
@@ -15,6 +17,7 @@ from backend.pipeline.phase3b import (
     targeted_silence_segments,
     transcript_sentences,
     trim_fixed_sentence_pauses,
+    timing_fit_limit,
     voice_report_metadata,
 )
 from backend.brain.termsheet import TermSheet
@@ -184,3 +187,32 @@ def test_over_slot_retry_budget_and_pause_trim_are_language_agnostic(target_lang
     )
     with wave.open(str(joined), "rb") as audio:
         assert audio.getnframes() == 40
+
+
+@pytest.mark.parametrize("target_lang", LANGUAGES)
+def test_timing_invariants_and_silent_gap_spill_for_every_language(target_lang):
+    rows = [
+        {"start": 0.0, "end": 5.0},
+        {"start": 5.0, "end": 10.0},
+    ]
+    windows = apply_speech_windows(rows, [(4.8, 5.2)])
+    assert windows[0]["end"] == pytest.approx(4.8)
+    assert windows[0]["spill_end_s"] == pytest.approx(5.2)
+    assert windows[1]["timeline_start_s"] == pytest.approx(5.2)
+    assert timing_fit_limit(4.0, 0.05) == pytest.approx(4.05)
+    assert timing_fit_limit(4.0, 0.30) == pytest.approx(4.10)
+
+    clips = [
+        {"start_s": windows[0]["start"], "end_s": windows[0]["end"],
+         "timeline_start_s": 0.0, "timeline_audio_duration_s": 5.1},
+        {"start_s": windows[1]["start"], "end_s": windows[1]["end"],
+         "timeline_start_s": windows[1]["timeline_start_s"], "timeline_audio_duration_s": 4.8},
+    ]
+    assert_timing_invariants(clips, video_duration=10.0, export_duration=10.04)
+
+    with pytest.raises(ValueError, match="overlaps"):
+        assert_timing_invariants([clips[0], {**clips[1], "start_s": 4.9, "timeline_start_s": 5.0}], 10.0)
+    with pytest.raises(ValueError, match="before its source slot"):
+        assert_timing_invariants([clips[0], {**clips[1], "timeline_start_s": 5.1}], 10.0)
+    with pytest.raises(ValueError, match="50 milliseconds"):
+        assert_timing_invariants(clips, video_duration=10.0, export_duration=10.06)

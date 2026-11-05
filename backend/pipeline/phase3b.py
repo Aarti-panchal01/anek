@@ -31,6 +31,9 @@ CONTENT_TONES = {
     "sports": "energetic live commentary; short spoken phrases",
     "business": "confident and approachable product or training explanation",
 }
+OVERRUN_TOLERANCE_S = 0.10
+MAX_ATEMPO_SPEEDUP = 1.15
+EXPORT_DURATION_TOLERANCE_S = 0.05
 
 
 def run_command(args: list[str], capture: bool = True) -> str:
@@ -45,7 +48,7 @@ def duration_of(path: Path) -> float:
     ]).strip())
 
 
-def silence_boundaries(audio_path: Path, duration: float) -> list[float]:
+def detected_silence_spans(audio_path: Path, duration: float) -> list[tuple[float, float]]:
     result = subprocess.run(
         ["ffmpeg", "-i", str(audio_path), "-af", "silencedetect=noise=-34dB:d=0.30", "-f", "null", "NUL"],
         capture_output=True,
@@ -54,8 +57,59 @@ def silence_boundaries(audio_path: Path, duration: float) -> list[float]:
     log = result.stderr
     starts = [float(value) for value in re.findall(r"silence_start: ([0-9.]+)", log)]
     ends = [float(value) for value in re.findall(r"silence_end: ([0-9.]+)", log)]
-    spans = list(zip(starts, ends))
-    return [max(0.0, min(duration, (start + end) / 2)) for start, end in spans]
+    if len(starts) > len(ends):
+        ends.append(duration)
+    return [
+        (max(0.0, start), min(duration, end))
+        for start, end in zip(starts, ends)
+        if end > start and start < duration
+    ]
+
+
+def silence_boundaries(audio_path: Path, duration: float) -> list[float]:
+    return [(start + end) / 2 for start, end in detected_silence_spans(audio_path, duration)]
+
+
+def apply_speech_windows(rows: list[dict], silence_spans: list[tuple[float, float]]) -> list[dict]:
+    """Move clip edges to the ends of detected pauses and retain safe spill windows."""
+    for row in rows:
+        row["timeline_start_s"] = float(row["start"])
+        row["spill_end_s"] = float(row["end"])
+    for index, row in enumerate(rows):
+        if index > 0:
+            boundary = float(row["start"])
+            prior_pause = next((span for span in silence_spans if span[0] <= boundary <= span[1]), None)
+            if prior_pause:
+                row["start"] = row["timeline_start_s"] = prior_pause[1]
+        if index + 1 < len(rows):
+            boundary = float(row["end"])
+            next_pause = next((span for span in silence_spans if span[0] <= boundary <= span[1]), None)
+            if next_pause:
+                row["end"] = next_pause[0]
+                row["spill_end_s"] = next_pause[1]
+    for row in rows:
+        if float(row["end"]) < float(row["start"]):
+            raise ValueError("Detected pause leaves no valid speech window for a clip")
+    return rows
+
+
+def assert_timing_invariants(
+    clips: list[dict], video_duration: float, export_duration: float | None = None,
+) -> None:
+    previous_end = 0.0
+    for clip in sorted(clips, key=lambda item: float(item.get("timeline_start_s", item["start_s"]))):
+        slot_start = float(clip["start_s"])
+        speech_start = float(clip.get("timeline_start_s", slot_start))
+        speech_duration = float(clip.get("timeline_audio_duration_s", clip.get("final_audio_duration_s", 0.0)))
+        if speech_start < slot_start - 1e-6:
+            raise ValueError("Dubbed speech starts before its source slot")
+        if speech_start < previous_end - 1e-6:
+            raise ValueError("Dubbed speech overlaps the preceding clip")
+        if speech_start + speech_duration > video_duration + 1e-6:
+            raise ValueError("Dubbed speech exceeds the video duration")
+        previous_end = speech_start + speech_duration
+    if export_duration is not None and abs(export_duration - video_duration) > EXPORT_DURATION_TOLERANCE_S:
+        raise ValueError("Dubbed export duration differs from source by more than 50 milliseconds")
 
 
 def extract_room_tone(audio_path: Path, work_dir: Path, duration: float) -> tuple[Path | None, dict | None]:
@@ -522,6 +576,11 @@ def shorter_timing_budget(current_budget: int, current_text: str) -> int:
     return max(1, min(current_budget - 1, len(current_text) - 1, int(current_budget * 0.84)))
 
 
+def timing_fit_limit(slot_s: float, silent_gap_s: float) -> float:
+    """Allow at most 100ms of overrun, bounded by a detected silent gap."""
+    return slot_s + min(OVERRUN_TOLERANCE_S, max(0.0, silent_gap_s))
+
+
 def trim_fixed_sentence_pauses(work_dir: Path, prefix: str, sentence_count: int, output: Path) -> Path:
     """Join synthesized sentence WAVs without the fixed inter-sentence pauses."""
     sentence_paths = [work_dir / f"{prefix}_sentence_{index:02d}.wav" for index in range(sentence_count)]
@@ -581,6 +640,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         source_wav = work / "source.wav"
         run_command(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(source_wav)])
         room_tone_path, room_tone_span = extract_room_tone(source_wav, work, duration)
+        source_silence_spans = detected_silence_spans(source_wav, duration)
         source_stt_model = settings.stt_model
         if source_stt_model not in {"prisma-v2.5", "prisma-v3.0"}:
             raise ValueError("STT_MODEL must be prisma-v2.5 or prisma-v3.0")
@@ -602,7 +662,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             term_sheet = TermSheet.model_validate(prior_report.get("term_sheet", {}))
             cleaned_rows = source_chunks
         else:
-            boundaries = silence_boundaries(source_wav, duration)
+            boundaries = [(start + end) / 2 for start, end in source_silence_spans]
             time_ranges = targeted_silence_segments(duration, boundaries, hard_max=8.0)
             source_chunks = []
             for index, (start, end) in enumerate(time_ranges):
@@ -677,6 +737,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             for row in source_chunks:
                 row["cleaned"], row["cleanup_changes"] = clean_source_detail(workflow_llm, row["raw"], term_sheet, source_lang, source_context)
                 cleaned_rows.append(row)
+        cleaned_rows = apply_speech_windows(cleaned_rows, source_silence_spans)
         reference_seconds = None
         if stock_voice:
             embedding = None
@@ -711,6 +772,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             for index, row in enumerate(cleaned_rows):
                 clip_index = only_clip_index if only_clip_index is not None else index
                 slot = row["end"] - row["start"]
+                spill_capacity_s = max(0.0, float(row.get("spill_end_s", row["end"])) - float(row["end"]))
+                fit_limit_s = timing_fit_limit(slot, spill_capacity_s)
                 clip_terms = TermSheet(
                     terms=[term for term in term_sheet.terms if term.term.casefold() in row["cleaned"].casefold()],
                     idioms=[idiom for idiom in term_sheet.idioms if idiom.phrase.casefold() in row["cleaned"].casefold()],
@@ -743,9 +806,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         "instruction": retune_instruction,
                     })
                     ratio = spoken_seconds / slot
-                    # Re-translate as soon as measured speech exceeds the slot;
-                    # waiting for 10% overrun leaves no room for the 8% speed cap.
-                    if ratio > 1.0 and synthesis_attempt < 2:
+                    if spoken_seconds > fit_limit_s and synthesis_attempt < 2:
                         duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
                         retune_instruction = "Paragraph-context retranslation after measured overrun."
                         try:
@@ -788,9 +849,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 raw_synthesized_seconds = spoken_seconds
                 sentence_silence_added_s = max(0, len(transcript_sentences(selected)) - 1) * 0.16
                 speed_factor_applied = 1.0
-                ratio = raw_synthesized_seconds / slot
-                if ratio > 1.0:
-                    speed_factor_applied = min(1.08, ratio)
+                ratio = raw_synthesized_seconds / max(slot, 1e-6)
+                if raw_synthesized_seconds > fit_limit_s:
+                    speed_factor_applied = min(MAX_ATEMPO_SPEEDUP, raw_synthesized_seconds / fit_limit_s)
                 elif ratio < 0.75 and ratio < 0.92:
                     speed_factor_applied = 0.92
                 if speed_factor_applied != 1.0:
@@ -803,11 +864,15 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 final_audio_seconds = duration_of(sentence_audio)
                 shorter_translation_recovered = (
                     shorter_retry_used
-                    and any(item["synthesized_duration_s"] > slot for item in synthesis_history[:-1])
-                    and spoken_seconds <= slot
+                    and any(item["synthesized_duration_s"] > fit_limit_s for item in synthesis_history[:-1])
+                    and spoken_seconds <= fit_limit_s
                 )
-                atempo_recovered = raw_synthesized_seconds > slot and final_audio_seconds <= slot
-                if final_audio_seconds > slot and len(transcript_sentences(selected)) > 1:
+                recovery_step = "shorter translation retry" if shorter_translation_recovered else None
+                atempo_recovered = raw_synthesized_seconds > fit_limit_s and final_audio_seconds <= fit_limit_s
+                if atempo_recovered:
+                    recovery_step = "speed-up"
+                if final_audio_seconds > fit_limit_s and len(transcript_sentences(selected)) > 1:
+                    before_pause_trim = final_audio_seconds
                     trimmed_path = work / f"{target_lang}_{index}_pauses_trimmed.wav"
                     trim_fixed_sentence_pauses(work, last_sentence_prefix, len(transcript_sentences(selected)), trimmed_path)
                     if speed_factor_applied != 1.0:
@@ -821,12 +886,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         sentence_audio = trimmed_path
                     final_audio_seconds = duration_of(sentence_audio)
                     sentence_silence_added_s = 0.0
-                    if final_audio_seconds <= slot:
-                        LOGGER.info("Timing recovery for %s clip %s: fixed-pause trim", target_lang, clip_index + 1)
-                if shorter_translation_recovered:
-                    LOGGER.info("Timing recovery for %s clip %s: shorter translation retry", target_lang, clip_index + 1)
-                if atempo_recovered:
-                    LOGGER.info("Timing recovery for %s clip %s: atempo (maximum 8%%)", target_lang, clip_index + 1)
+                    if before_pause_trim > fit_limit_s and final_audio_seconds <= fit_limit_s:
+                        recovery_step = "fixed-pause trim"
                 overrun_s = max(0.0, final_audio_seconds - slot)
                 remaining_pause_s = max(0.0, slot - final_audio_seconds)
                 stretched = speed_factor_applied != 1.0
@@ -837,14 +898,20 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 candidate_path = clip_audio_dir / f"clip_{clip_index + 1:03d}.wav"
                 shutil.copyfile(sentence_audio, candidate_path)
                 timeline_audio_path = sentence_audio
-                if overrun_s > 0:
-                    LOGGER.warning("Timing recovery for %s clip %s: still overlaps after shorter retry, atempo, and fixed-pause trim; withholding", target_lang, clip_index + 1)
+                spill_end_s = float(row.get("spill_end_s", row["end"]))
+                spill_used = overrun_s > 0 and float(row["timeline_start_s"]) + final_audio_seconds <= spill_end_s + 1e-6
+                if spill_used:
+                    recovery_step = "silent-gap spill"
+                withheld = float(row["timeline_start_s"]) + final_audio_seconds > spill_end_s + 1e-6
+                if withheld:
                     timeline_audio_path = work / f"{target_lang}_{index}_withheld.wav"
                     run_command([
                         "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
                         "anullsrc=r=16000:cl=mono", "-t", f"{slot:.6f}",
                         "-c:a", "pcm_s16le", str(timeline_audio_path),
                     ])
+                if recovery_step:
+                    LOGGER.info("Timing recovery for %s clip %s: %s", target_lang, clip_index + 1, recovery_step)
                 transcript = gnani.stt(sentence_audio.read_bytes(), target_lang, settings.verify_stt_model, format="transcribe")
                 audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
                 translation_checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
@@ -872,8 +939,10 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     reasons.extend(stt_review["comparison_errors"])
                 if any("cleanup rejected" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):
                     reasons.append("Source cleanup exceeded the clip span and was discarded; review the ASR transcript.")
-                if overrun_s:
-                    reasons.append(f"Speech exceeds its slot by {overrun_s:.2f}s after shorter translation, up to 8% speed-up, and fixed-pause trimming; this candidate was withheld from the dub track to prevent overlap. Edit or regenerate this clip.")
+                if spill_used:
+                    reasons.append("Dub speech extends into a detected silent gap before the next clip.")
+                if withheld:
+                    reasons.append(f"Dub speech still exceeds its safe slot by {overrun_s:.2f}s after shorter translation, up to 15% speed-up, fixed-pause trimming, and the available silent gap; it was withheld to prevent overlap.")
                 if timing_revision_rejected:
                     reasons.append("A timing rewrite failed deterministic meaning/term/number checks; the prior full translation was retained.")
                 if remaining_pause_s > 0.7:
@@ -887,9 +956,10 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 used_translation_models = list(dict.fromkeys(getattr(translator, "models_used", [])))
                 if settings.llm_model in used_translation_models:
                     reasons.append("A fallback translator was used, so back-translation is not an independent check.")
-                status = "red" if audio_flag["status"] == "red" or overrun_s > 0 or bool(translation_checks) or selection_needs_review or meaning_check_failed else "yellow" if reasons or stretched else "green"
+                status = "red" if audio_flag["status"] == "red" or withheld or bool(translation_checks) or selection_needs_review or meaning_check_failed else "yellow" if reasons or stretched else "green"
                 language_rows.append({
                     "clip": clip_index + 1, "start_s": row["start"], "end_s": row["end"],
+                    "timeline_start_s": row["timeline_start_s"],
                     "source_duration_s": round(slot, 3), "slot_s": round(slot, 3),
                     "timestamp_source": "source audio silence boundaries",
                     "cut_mid_sentence": bool(row.get("cut_mid_sentence", False)),
@@ -907,11 +977,13 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     "silence_added_s": round(sentence_silence_added_s, 3),
                     "remaining_pause_s": round(remaining_pause_s, 3),
                     "overflow_s": round(overrun_s, 3),
+                    "withheld": withheld,
                     "duration_budget_chars": duration_budget_chars,
                     "measured_chars_per_second": round(measured_chars_per_second, 3),
                     "translation_synthesis_attempts": synthesis_history,
                     "audio_path": candidate_path,
                     "timeline_audio_path": timeline_audio_path,
+                    "timeline_audio_duration_s": duration_of(timeline_audio_path),
                 })
             final_path = output_dir / f"{video.stem}_{target_lang}_phase3d_ai-dubbed.mp4"
             if only_clip_index is not None:
@@ -943,7 +1015,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 language_rows = merged_rows
             track_files = mux_outputs(video, language_rows, final_path, duration, work, settings, room_tone_path, source_wav, output_dir, target_lang)
             report = build_report(target_lang, [{key: val for key, val in row.items() if key not in {"audio_path", "timeline_audio_path"}} for row in language_rows], settings)
-            report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "retry_over_slot_ratio": 1.10, "retry_under_slot_ratio": 0.75, "max_speed_change": 0.08, "overflow_policy": "withhold overflowing candidate from timeline and mark red; never overlap the next segment", "sentence_pause_s": 0.16}})
+            report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "overrun_tolerance_s": OVERRUN_TOLERANCE_S, "retry_under_slot_ratio": 0.75, "max_speed_change": MAX_ATEMPO_SPEEDUP, "overflow_policy": "shorter translation, up to 15% speed-up, fixed-pause trim, then spill into detected silent gaps; withhold only if speech would overlap", "sentence_pause_s": 0.16}})
             report["term_sheet"] = term_sheet.model_dump()
             report_path = final_path.with_suffix(".json")
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1010,17 +1082,13 @@ def voice_report_metadata(stock_voice: str | None, reference_seconds: float | No
 def mux_outputs(video: Path, clips: list[dict], output: Path, duration: float, work: Path, settings: Settings,
                 room_tone_path: Path | None = None, source_wav: Path | None = None,
                 output_dir: Path | None = None, language: str = "unknown") -> dict[str, Path]:
-    previous_end = 0.0
+    validated_clips = []
     for clip in sorted(clips, key=lambda row: row["start_s"]):
-        start = float(clip["start_s"])
-        slot = float(clip["end_s"]) - start
+        start = float(clip.get("timeline_start_s", clip["start_s"]))
         clip_audio = Path(clip.get("timeline_audio_path", clip["audio_path"]))
         audio_duration = duration_of(clip_audio)
-        if start < previous_end - 1e-6:
-            raise ValueError("Dubbing segments overlap on the source timeline")
-        if audio_duration > slot + 0.02:
-            raise ValueError(f"Dubbing segment at {start:.3f}s exceeds its source slot; refusing to render overlapping speech")
-        previous_end = float(clip["end_s"])
+        validated_clips.append({**clip, "timeline_start_s": start, "timeline_audio_duration_s": audio_duration})
+    assert_timing_invariants(validated_clips, duration)
 
     output_dir = output_dir or output.parent
     source_track = output_dir / f"{output.stem}_source-track.wav"
@@ -1031,13 +1099,15 @@ def mux_outputs(video: Path, clips: list[dict], output: Path, duration: float, w
     labels = []
     for index, clip in enumerate(clips):
         inputs.extend(["-i", str(clip.get("timeline_audio_path", clip["audio_path"]))])
-        delay = int(clip["start_s"] * 1000)
+        delay = int(clip.get("timeline_start_s", clip["start_s"]) * 1000)
         graph.append(f"[{index}:a]adelay={delay}|{delay}[a{index}]")
         labels.append(f"[a{index}]")
     input_count = len(clips)
     dub_track = output_dir / f"{output.stem}_dubbed-track.wav"
     graph.append("".join(labels) + f"amix=inputs={input_count}:duration=longest:normalize=0,apad=whole_dur={duration},alimiter=limit=0.95:attack=5:release=100:level=false[dub]")
     run_command(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(graph), "-map", "[dub]", "-t", str(duration), str(dub_track)])
+    if abs(duration_of(dub_track) - duration) > EXPORT_DURATION_TOLERANCE_S:
+        raise RuntimeError("Final dub track duration differs from video by more than 50 milliseconds")
 
     background_track = output_dir / f"{output.stem}_background-track.wav"
     if room_tone_path is not None:
@@ -1046,9 +1116,11 @@ def mux_outputs(video: Path, clips: list[dict], output: Path, duration: float, w
         run_command(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", str(duration), "-c:a", "pcm_s16le", str(background_track)])
     audio = work / f"{output.stem}_limited.wav"
     run_command(["ffmpeg", "-y", "-v", "error", "-i", str(dub_track), "-i", str(background_track), "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95:attack=5:release=100:level=false[mix]", "-map", "[mix]", "-t", str(duration), str(audio)])
+    if abs(duration_of(audio) - duration) > EXPORT_DURATION_TOLERANCE_S:
+        raise RuntimeError("Mixed dub track duration differs from video by more than 50 milliseconds")
     run_command(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-metadata", "comment=AI dubbed", str(output)])
-    if abs(duration_of(output) - duration) > 0.1:
-        raise RuntimeError("Dubbed export duration differs from source by more than 0.1 seconds")
+    export_duration = duration_of(output)
+    assert_timing_invariants(validated_clips, duration, export_duration)
     return {"dubbed": dub_track, "source": source_track, "background": background_track}
 
 
