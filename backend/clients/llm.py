@@ -418,7 +418,17 @@ class SarvamTranslationClient:
             response_format={"type": "json_object"},
             request_options={"timeout_in_seconds": 60, "max_retries": 0},
         )
-        content = response.choices[0].message.content
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise ValueError("Sarvam chat completion returned no choices")
+        content = getattr(getattr(choices[0], "message", None), "content", None)
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+                for part in content
+            )
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Sarvam chat completion returned empty text")
         result = json.loads(content)
         if not isinstance(result, dict):
             raise ValueError("Sarvam returned a non-object JSON response")
@@ -447,7 +457,10 @@ class SarvamTranslationClient:
                         request_options={"timeout_in_seconds": 60, "max_retries": 0},
                     ),
                 )
-                translations.append(response.translated_text.strip())
+                translated_text = getattr(response, "translated_text", None)
+                if not isinstance(translated_text, str) or not translated_text.strip():
+                    raise ValueError("Sarvam translation returned empty text")
+                translations.append(translated_text.strip())
             # The existing pipeline validates and ranks three alternatives. The
             # language API returns one translation per call; keep its output as
             # the three identical deterministic candidates without extra calls.
