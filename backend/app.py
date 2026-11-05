@@ -1046,6 +1046,10 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
             "attempts": attempts,
             "source_raw": review_by_clip.get(int(row["idx"]), {}).get("source_raw"),
             "stt_review": review_by_clip.get(int(row["idx"]), {}).get("stt_review", {}),
+            "slot_s": review_by_clip.get(int(row["idx"]), {}).get("slot_s", float(row["end_s"]) - float(row["start_s"])),
+            "spoken_duration_s": review_by_clip.get(int(row["idx"]), {}).get("final_audio_duration_s"),
+            "duration_budget_chars": review_by_clip.get(int(row["idx"]), {}).get("duration_budget_chars"),
+            "withheld": bool(review_by_clip.get(int(row["idx"]), {}).get("withheld", False)),
         })
         item.pop("attempts_json", None)
         item.pop("reasons_json", None)
