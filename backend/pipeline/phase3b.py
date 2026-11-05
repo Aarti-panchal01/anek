@@ -675,7 +675,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         "instruction": retune_instruction,
                     })
                     ratio = spoken_seconds / slot
-                    if ratio > 1.10 and synthesis_attempt < 2:
+                    # Re-translate as soon as measured speech exceeds the slot;
+                    # waiting for 10% overrun leaves no room for the 8% speed cap.
+                    if ratio > 1.0 and synthesis_attempt < 2:
                         duration_budget_chars = max(48, min(len(selected) - 1, int(duration_budget_chars * 0.84)))
                         retune_instruction = "Paragraph-context retranslation after measured overrun."
                         try:
@@ -717,8 +719,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 sentence_silence_added_s = max(0, len(transcript_sentences(selected)) - 1) * 0.16
                 speed_factor_applied = 1.0
                 ratio = raw_synthesized_seconds / slot
-                if ratio > 1.10 and ratio > 1.08:
-                    speed_factor_applied = 1.08
+                if ratio > 1.0:
+                    speed_factor_applied = min(1.08, ratio)
                 elif ratio < 0.75 and ratio < 0.92:
                     speed_factor_applied = 0.92
                 if speed_factor_applied != 1.0:
