@@ -6,14 +6,15 @@
 - Task 1, LLM provider swap: `20eb6a5` (pushed). Backend suite passed; frontend build passed.
 - Task 2, Timing and sync, all ten languages: `aeddca0` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 - Task 3, Dubbed playback: `3c3b4c4` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
+- Task 4, Terms and edit persistence: `d063b83` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 
 ## Current task
 
-- Task 4: Terms and edit persistence.
+- Task 5: Attempt history.
 
 ## Next task
 
-- Task 5: Attempt history.
+- Task 6: Editor UX.
 
 ## Decisions
 
@@ -24,4 +25,5 @@
 - Quota circuits open immediately for primary providers; the Gemini key pool may rotate within the current request before its model circuit opens.
 - Task 2 uses detected source silence for safe speech windows; 100ms tolerance is accepted only when it fits within that silence, preserving the no-overlap invariant. Speed-up is capped at 15%, and export duration tolerance is 50ms.
 - Task 3 uses the project `/media` MP4 for the main Dubbed toggle; the side-by-side Dubbed player is unmuted by default. Withheld status is shown alongside its clip time range.
-- Current task: Task 4. Next task: Task 5, Attempt history.
+- Task 4 term rules default to project scope. The explicit “Save this rule to global term memory” option copies it to future projects. Protected spelling remains the canonical displayed term; language-specific spoken forms are used only for synthesis.
+- Current task: Task 5. Next task: Task 6, Editor UX.
