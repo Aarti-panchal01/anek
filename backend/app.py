@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import json
+import mimetypes
 import logging
 import math
 import mimetypes
@@ -239,18 +240,22 @@ def browser_video_path(source: Path) -> Path:
         return source
     temporary = source.parent / "browser.part.mp4"
     try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-             # Bound both dimensions. A width-only cap leaves portrait phone
-             # footage (for example 1440x2560) almost full resolution and can
-             # exhaust the small memory budget available to the preview worker.
-             "-vf", "fps=24,scale=w='min(720,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-             "-threads", "1", "-threads:v", "1", "-filter_threads", "1",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(temporary)],
-            check=True, capture_output=True, timeout=120,
-        )
-        temporary.replace(browser_copy)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+                 # Bound both dimensions. A width-only cap leaves portrait phone
+                 # footage (for example 1440x2560) almost full resolution and can
+                 # exhaust the small memory budget available to the preview worker.
+                 "-vf", "fps=24,scale=w='min(720,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                 "-threads", "1", "-threads:v", "1", "-filter_threads", "1",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(temporary)],
+                check=True, capture_output=True, timeout=120,
+            )
+            temporary.replace(browser_copy)
+        except Exception:
+            LOGGER.exception("Browser preview conversion failed; serving the original upload")
+            return source
     finally:
         temporary.unlink(missing_ok=True)
     return browser_copy
@@ -561,7 +566,7 @@ async def convert_browser_preview(request: Request, video: UploadFile = File(...
             raise HTTPException(413, f"Video exceeds the {settings.max_video_seconds}s limit")
         playable = browser_video_path(source)
         return FileResponse(
-            playable, media_type="video/mp4", content_disposition_type="inline",
+            playable, media_type=mimetypes.guess_type(playable.name)[0] or "application/octet-stream", content_disposition_type="inline",
             background=BackgroundTask(shutil.rmtree, folder, ignore_errors=True),
         )
     except HTTPException:
@@ -583,7 +588,10 @@ async def project_video(project_id: str):
     except Exception as error:
         LOGGER.exception("Project video preview conversion failed for project %s", project_id)
         raise HTTPException(422, "The uploaded video is saved, but this server could not prepare its preview. Try an H.264 MP4 export.") from error
-    return FileResponse(playable, media_type="video/mp4", content_disposition_type="inline")
+    return FileResponse(
+        playable, media_type=mimetypes.guess_type(playable.name)[0] or "application/octet-stream",
+        content_disposition_type="inline",
+    )
 
 
 @app.get("/api/projects/{project_id}/voice-reference-preview")

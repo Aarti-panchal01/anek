@@ -111,6 +111,21 @@ def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypa
         assert options["timeout"] == 120
 
 
+def test_browser_preview_returns_original_when_ffmpeg_conversion_fails(monkeypatch, tmp_path):
+    source = tmp_path / "source.mov"
+    source.write_bytes(b"original upload")
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: type(
+        "Completed", (), {"stdout": json.dumps({"streams": [
+            {"codec_type": "video", "codec_name": "hevc"},
+        ]})}
+    )() if args[0][0] == "ffprobe" else (_ for _ in ()).throw(
+        app_module.subprocess.CalledProcessError(-9, args[0])
+    ))
+
+    assert app_module.browser_video_path(source) == source
+    assert source.read_bytes() == b"original upload"
+
+
 def test_global_term_memory_crud_persists_and_validates(monkeypatch):
     with _sandbox(monkeypatch):
         created = _resolve(app_module.create_global_term(app_module.GlobalTermRequest(
