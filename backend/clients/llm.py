@@ -484,10 +484,13 @@ def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClie
 
 
 def create_workflow_client(primary: LLMClient, settings: Settings) -> LLMClient:
-    """Use the existing non-Sarvam workflow LLM for cleanup and QA, with Gemini fallback."""
+    """Use Sarvam chat for translation QA and keep configured providers as fallbacks."""
     primary = _with_circuit_breaker(primary)
     gemini = _create_gemini_fallback_chain(settings)
-    return FallbackLLMClient(primary, gemini) if gemini else primary
+    fallback: LLMClient = FallbackLLMClient(primary, gemini) if gemini else primary
+    if settings.sarvam_api_key:
+        return FallbackLLMClient(SarvamTranslationClient(settings), fallback)
+    return fallback
 
 
 def _create_gemini_fallback_chain(settings: Settings) -> LLMClient | None:

@@ -371,14 +371,26 @@ def paragraph_translation_candidates(
 
     result, validation_failures = validate(raw_candidates)
     if not result:
-        repaired = prompt_json(
-            client,
-            "Repair the translations so every timed source span passes the deterministic checks. Preserve the complete source meaning, agents, actions, objects, numbers, uncertainty, and speech act. Apply all locked terms exactly. Return exactly two candidate objects shaped as {translations:[...],review_notes:[...]}, aligned to the timed spans.",
-            {**payload, "candidate_failures": validation_failures, "previous_candidates": raw_candidates},
-        )
-        result, _ = validate(repaired.get("candidates", []))
+        try:
+            repaired = prompt_json(
+                client,
+                "Repair the translations so every timed source span passes the deterministic checks. Preserve the complete source meaning, agents, actions, objects, numbers, uncertainty, and speech act. Apply all locked terms exactly. Return exactly two candidate objects shaped as {translations:[...],review_notes:[...]}, aligned to the timed spans.",
+                {**payload, "candidate_failures": validation_failures, "previous_candidates": raw_candidates},
+            )
+            result, _ = validate(repaired.get("candidates", []))
+        except Exception as exc:
+            LOGGER.warning("Translation repair failed (%s); retaining original text for human review", type(exc).__name__)
     if not result:
-        raise ValueError("Paragraph translation returned no candidate that passed deterministic checks")
+        result = [
+            candidate["translations"]
+            for candidate in raw_candidates
+            if isinstance(candidate, dict)
+            and isinstance(candidate.get("translations"), list)
+            and len(candidate["translations"]) == len(rows)
+            and all(isinstance(text, str) and text.strip() for text in candidate["translations"])
+        ]
+    if not result:
+        raise ValueError("Translation provider returned no usable text for human review")
     return result[:3]
 
 
@@ -681,14 +693,21 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             if only_clip_index is not None and translation_override:
                 paragraph_candidates = [[translation_override] for _ in cleaned_rows]
                 paragraph_selected_index, paragraph_selection_reason = 0, "Existing edited clip text retained for block regeneration."
+                selection_needs_review = False
             else:
                 paragraph_candidates = paragraph_translation_candidates(
                     translator, cleaned_rows, source_lang, target_lang, term_sheet,
                     content_type, translation_style, measured_chars_per_second,
                 )
-                paragraph_selected_index, paragraph_selection_reason = select_paragraph_candidate(
-                    translator, full_source_paragraph, paragraph_candidates, target_lang,
-                )
+                try:
+                    paragraph_selected_index, paragraph_selection_reason = select_paragraph_candidate(
+                        translator, full_source_paragraph, paragraph_candidates, target_lang,
+                    )
+                    selection_needs_review = False
+                except Exception as exc:
+                    LOGGER.warning("Candidate selection failed (%s); first candidate needs human review", type(exc).__name__)
+                    paragraph_selected_index, paragraph_selection_reason = 0, "Automatic selection was unavailable; review this candidate manually."
+                    selection_needs_review = True
             for index, row in enumerate(cleaned_rows):
                 clip_index = only_clip_index if only_clip_index is not None else index
                 slot = row["end"] - row["start"]
@@ -711,8 +730,6 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 last_sentence_prefix = ""
                 for synthesis_attempt in range(3):
                     checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
-                    if checks:
-                        raise ValueError(f"Selected {target_lang} translation failed checks: {checks}")
                     last_sentence_prefix = f"{target_lang}_{index}_attempt_{synthesis_attempt + 1}"
                     sentence_audio, spoken_seconds = synthesize_sentence_list(
                         gnani, transcript_sentences(selected), embedding, work,
@@ -830,8 +847,21 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                 transcript = gnani.stt(sentence_audio.read_bytes(), target_lang, settings.verify_stt_model, format="transcribe")
                 audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
-                meaning = back_translate(workflow_llm, row["cleaned"], selected, source_lang, target_lang)
+                translation_checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
+                meaning_check_failed = False
+                try:
+                    meaning = back_translate(workflow_llm, row["cleaned"], selected, source_lang, target_lang)
+                except Exception as exc:
+                    LOGGER.warning("Back-translation QA failed (%s); clip needs human review", type(exc).__name__)
+                    meaning = {"back_translation": "", "meaning_preserved": None}
+                    meaning_check_failed = True
                 reasons = list(audio_flag["reasons"])
+                if translation_checks:
+                    reasons.append("Translation checks flagged this clip; edit and review it before approval.")
+                if selection_needs_review:
+                    reasons.append("Automatic candidate selection was unavailable; review this translation before approval.")
+                if meaning_check_failed:
+                    reasons.append("Automated meaning verification was unavailable; review this translation before approval.")
                 reasons.extend(meaning_check_reasons(meaning))
                 if any("uncertain source retained" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):
                     reasons.append("Uncertain source wording was kept as transcribed; review before publishing.")
@@ -857,7 +887,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 used_translation_models = list(dict.fromkeys(getattr(translator, "models_used", [])))
                 if settings.llm_model in used_translation_models:
                     reasons.append("A fallback translator was used, so back-translation is not an independent check.")
-                status = "red" if audio_flag["status"] == "red" or overrun_s > 0 else "yellow" if reasons or stretched else "green"
+                status = "red" if audio_flag["status"] == "red" or overrun_s > 0 or bool(translation_checks) or selection_needs_review or meaning_check_failed else "yellow" if reasons or stretched else "green"
                 language_rows.append({
                     "clip": clip_index + 1, "start_s": row["start"], "end_s": row["end"],
                     "source_duration_s": round(slot, 3), "slot_s": round(slot, 3),
