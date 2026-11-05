@@ -78,6 +78,37 @@ def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypa
         assert conversions == [Path(project_row)]
 
 
+def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        data_root.mkdir(parents=True, exist_ok=True)
+        source = data_root / "portrait.mov"
+        source.write_bytes(b"video")
+        calls = []
+
+        class Completed:
+            stdout = json.dumps({"streams": [
+                {"codec_type": "video", "codec_name": "hevc"},
+                {"codec_type": "audio", "codec_name": "aac"},
+            ]})
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[0] == "ffmpeg":
+                Path(command[-1]).write_bytes(b"browser preview")
+            return Completed()
+
+        monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+        result = app_module.browser_video_path(source)
+
+        assert result.read_bytes() == b"browser preview"
+        ffmpeg_command, options = calls[-1]
+        scale = ffmpeg_command[ffmpeg_command.index("-vf") + 1]
+        assert "min(1280,iw)" in scale and "min(1280,ih)" in scale
+        assert "force_original_aspect_ratio=decrease" in scale
+        assert options["timeout"] == 120
+
+
 def test_global_term_memory_crud_persists_and_validates(monkeypatch):
     with _sandbox(monkeypatch):
         created = _resolve(app_module.create_global_term(app_module.GlobalTermRequest(
