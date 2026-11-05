@@ -8,10 +8,11 @@
 - Task 3, Dubbed playback: `3c3b4c4` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 - Task 4, Terms and edit persistence: `d063b83` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 - Task 5, Attempt history: `585d67f` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
+- Task 6, Editor UX: `96d5902` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 
 ## Current task
 
-- Task 6: Editor UX.
+- All six requested tasks are complete.
 
 ## Next task
 
@@ -28,4 +29,5 @@
 - Task 3 uses the project `/media` MP4 for the main Dubbed toggle; the side-by-side Dubbed player is unmuted by default. Withheld status is shown alongside its clip time range.
 - Task 4 term rules default to project scope. The explicit “Save this rule to global term memory” option copies it to future projects. Protected spelling remains the canonical displayed term; language-specific spoken forms are used only for synthesis.
 - Task 5 stores attempt WAVs under the project's export directory and serves them through a clip-scoped endpoint. The first take has no previous audio; subsequent retries carry both versions.
-- Current task: Task 6. Next task: final verification and environment inventory.
+- Task 6 keeps attempts collapsed by default. Clicking a clip plays its timed range from the mixed dub, and the single-player mode is the default.
+- Current task: final verification and environment inventory.
