@@ -634,7 +634,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         v25 = gnani.stt(v25_path.read_bytes(), row["lang"], "prisma-v2.5", format="verbatim")["transcript"]
                         variants["prisma_v2_5"] = v25
                     except httpx.HTTPStatusError as exc:
-                        comparison_errors.append(f"Prisma v2.5 comparison unavailable: HTTP {exc.response.status_code}")
+                        comparison_errors.append(f"Speech recognition comparison unavailable: HTTP {exc.response.status_code}")
                 if source_stt_model == "prisma-v3.0" and keyterms:
                     keyed_chunk = work / f"source_keyterms_{index:02d}.wav"
                     run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(row["start"]), "-t", str(row["end"]-row["start"]), "-ac", "1", "-ar", "16000", str(keyed_chunk)])
@@ -643,7 +643,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                                            keyterms=keyterms, format=source_format)["transcript"]
                         variants["prisma_v3_keyterms"] = hinted
                     except httpx.HTTPStatusError as exc:
-                        comparison_errors.append(f"Prisma v3.0 keyterms comparison unavailable: HTTP {exc.response.status_code}")
+                        comparison_errors.append(f"Speech recognition comparison unavailable: HTTP {exc.response.status_code}")
                 plain = row["raw"]
                 disagreement_records = []
                 for variant_name, variant_text in variants.items():
@@ -837,7 +837,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     reasons.append("Uncertain source wording was kept as transcribed; review before publishing.")
                 stt_review = row.get("stt_review", {})
                 if stt_review.get("disagreements"):
-                    reasons.append("Prisma transcript variants disagree (v3.0 vs v2.5 and/or keyterms); review the alternatives.")
+                    reasons.append("Speech recognition transcript variants disagree; review the alternatives.")
                 if stt_review.get("comparison_errors"):
                     reasons.extend(stt_review["comparison_errors"])
                 if any("cleanup rejected" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):
@@ -849,19 +849,19 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 if remaining_pause_s > 0.7:
                     reasons.append(f"Dub ends {remaining_pause_s:.2f}s before the next source anchor; source room tone remains underneath.")
                 if row.get("cut_mid_sentence"):
-                    reasons.append("Prisma found no completed sentence boundary within 8 seconds; this span ends at the hard duration cap.")
+                    reasons.append("No completed sentence boundary was detected within 8 seconds; this span ends at the hard duration cap.")
                 if slot > 8.0:
                     reasons.append(f"A complete sentence span required {slot:.2f}s, above the 8s hard maximum.")
                 if room_tone_path is None:
                     reasons.append("No silent source stretch was detected; room tone was not mixed.")
                 used_translation_models = list(dict.fromkeys(getattr(translator, "models_used", [])))
                 if settings.llm_model in used_translation_models:
-                    reasons.append("Groq fallback translated this job, so Groq back-translation is not an independent check.")
+                    reasons.append("A fallback translator was used, so back-translation is not an independent check.")
                 status = "red" if audio_flag["status"] == "red" or overrun_s > 0 else "yellow" if reasons or stretched else "green"
                 language_rows.append({
                     "clip": clip_index + 1, "start_s": row["start"], "end_s": row["end"],
                     "source_duration_s": round(slot, 3), "slot_s": round(slot, 3),
-                    "timestamp_source": "source audio silence boundaries; Prisma REST provides no word timestamps",
+                    "timestamp_source": "source audio silence boundaries",
                     "cut_mid_sentence": bool(row.get("cut_mid_sentence", False)),
                     "source_raw": row["raw"], "source_cleaned": row["cleaned"],
                     "source_cleanup_changes": row["cleanup_changes"], "candidates": candidates,
@@ -871,7 +871,6 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     "meaning_preserved": meaning.get("meaning_preserved"), "audio_transcript": transcript["transcript"],
                     "status": status, "reasons": reasons, "time_stretched": stretched, "overrun_seconds": overrun_s,
                     "translated_character_count": len(selected),
-                    "translation_models_used": used_translation_models or [settings.llm_2_model if settings.llm_2_api_key else settings.llm_model],
                     "synthesized_duration_s": round(raw_synthesized_seconds, 3),
                     "final_audio_duration_s": round(final_audio_seconds, 3),
                     "speed_factor_applied": speed_factor_applied,
@@ -914,8 +913,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 language_rows = merged_rows
             track_files = mux_outputs(video, language_rows, final_path, duration, work, settings, room_tone_path, source_wav, output_dir, target_lang)
             report = build_report(target_lang, [{key: val for key, val in row.items() if key not in {"audio_path", "timeline_audio_path"}} for row in language_rows], settings)
-            used_translation_models = list(dict.fromkeys(getattr(translator, "models_used", [])))
-            report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "retry_over_slot_ratio": 1.10, "retry_under_slot_ratio": 0.75, "max_speed_change": 0.08, "overflow_policy": "withhold overflowing candidate from timeline and mark red; never overlap the next segment", "sentence_pause_s": 0.16}, "models": {"stt": source_stt_model, "voice": stock_voice or "vachana-vc-v1", "translation": used_translation_models or [settings.llm_2_model if settings.llm_2_api_key else settings.llm_model], "translation_checker": settings.llm_model, "checker_independent": bool(settings.llm_2_api_key) and settings.llm_model not in used_translation_models, "translation_fallback": settings.llm_model if settings.llm_model in used_translation_models else None}})
+            report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "retry_over_slot_ratio": 1.10, "retry_under_slot_ratio": 0.75, "max_speed_change": 0.08, "overflow_policy": "withhold overflowing candidate from timeline and mark red; never overlap the next segment", "sentence_pause_s": 0.16}})
             report["term_sheet"] = term_sheet.model_dump()
             report_path = final_path.with_suffix(".json")
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -970,14 +968,12 @@ def voice_report_metadata(stock_voice: str | None, reference_seconds: float | No
         return {
             "voice_mode": "stock",
             "reference_audio_seconds": None,
-            "reference_preprocessing": "not applicable; Gnani Timbre stock voice selected",
-            "voice_model": stock_voice,
+            "reference_preprocessing": "not applicable; stock voice selected",
         }
     return {
         "voice_mode": "clone",
         "reference_audio_seconds": reference_seconds,
         "reference_preprocessing": "none; raw reference uploaded for embedding",
-        "voice_model": "vachana-vc-v1",
     }
 
 

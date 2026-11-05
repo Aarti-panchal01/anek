@@ -16,7 +16,7 @@ def audio_number_status(
         return {
             "status": "yellow",
             "reasons": [
-                "Verification low trust: Prisma disagreed on numbers; listen to the dubbed audio."
+                "Verification confidence is lower for numbers in this language; listen to the dubbed audio."
             ],
         }
     return {

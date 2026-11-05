@@ -9,7 +9,7 @@ def build_report(language: str, clips: list[dict], settings: Settings) -> dict:
         "language": language,
         "verification": "low trust" if low_trust else "standard",
         "verification_note": (
-            "Prisma number mismatches are yellow for Marathi and Punjabi; listen to the audio."
+            "Number mismatches are flagged for review in Marathi and Punjabi; listen to the audio."
             if low_trust
             else None
         ),

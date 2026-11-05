@@ -408,7 +408,6 @@ async def get_config() -> dict:
         "app_name": settings.app_name,
         "languages": {code: LANGUAGES[code] for code in settings.enabled_langs if code in LANGUAGES},
         "max_video_seconds": settings.max_video_seconds,
-        "llm_model": settings.llm_2_model if (settings.llm_2_api_keys or settings.llm_2_api_key) else settings.llm_model,
         "daily_credit_limit": settings.gnani_daily_limit,
         "used_daily_credits": int(used),
         "remaining_daily_credits": max(0, settings.gnani_daily_limit - int(used)),
@@ -427,7 +426,6 @@ async def read_settings() -> dict:
         "max_credits_per_job": settings.max_credits_per_job,
         "max_video_seconds": settings.max_video_seconds,
         "numeral_style": settings.numeral_style,
-        "translation_model": config["llm_model"],
         "settings_source": "server environment",
         "editable": False,
     }

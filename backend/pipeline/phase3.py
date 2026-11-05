@@ -194,7 +194,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
         srt_path.write_text(create_srt(results), encoding="utf-8")
         clean_results = [{key: value for key, value in row.items() if key != "audio_path"} for row in results]
         report = build_report("hi-IN", clean_results, settings)
-        report.update({"source_language": source_lang, "models": {"stt": settings.stt_model, "voice": "vachana-vc-v1", "translation": settings.llm_2_model if (settings.llm_2_api_keys or settings.llm_2_api_key) else settings.llm_model, "translation_checker": settings.llm_model, "checker_independent": bool(settings.llm_2_api_keys or settings.llm_2_api_key)}, "export_label": "AI dubbed"})
+        report.update({"source_language": source_lang, "export_label": "AI dubbed"})
         report_path = output_path.with_suffix(".json")
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         if abs(probe_duration(output_path) - duration) > 0.1:
