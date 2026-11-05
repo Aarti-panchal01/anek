@@ -1,8 +1,22 @@
 import io
+import json
 import struct
 import wave
 
-from backend.pipeline.phase3b import create_srt, merge_incomplete_chunks, silence_chunks, targeted_silence_segments, transcript_sentences, voice_report_metadata
+import pytest
+
+from backend.config import LANGUAGES
+from backend.pipeline.phase3b import (
+    create_srt,
+    merge_incomplete_chunks,
+    revise_for_timing,
+    shorter_timing_budget,
+    silence_chunks,
+    targeted_silence_segments,
+    transcript_sentences,
+    trim_fixed_sentence_pauses,
+    voice_report_metadata,
+)
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
 from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons, synthesize_sentence_list
@@ -137,3 +151,36 @@ def test_meaning_check_flags_statement_to_instruction_and_agency_changes():
     assert "The statement became a command." in reasons
     assert any("Speech act changed" in item for item in reasons)
     assert any("Who performs the action" in item for item in reasons)
+
+
+@pytest.mark.parametrize("target_lang", LANGUAGES)
+def test_over_slot_retry_budget_and_pause_trim_are_language_agnostic(target_lang, tmp_path):
+    current = "A longer translated sentence."
+    reduced_budget = shorter_timing_budget(30, current)
+    assert reduced_budget < 30
+
+    class Translator:
+        def chat_json(self, messages):
+            self.payload = json.loads(messages[1]["content"])
+            return {"translation": "A concise translation."}
+
+    translator = Translator()
+    revised = revise_for_timing(
+        translator, "Full paragraph.", "Source sentence.", current,
+        target_lang, 2.0, 12.0, "shorter", target_character_budget=reduced_budget,
+    )
+    assert revised == "A concise translation."
+    assert translator.payload["target_character_budget"] == reduced_budget
+    assert translator.payload["target_language"] == target_lang
+
+    for index in range(2):
+        with wave.open(str(tmp_path / f"{target_lang}_sentence_{index:02d}.wav"), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(100)
+            audio.writeframes(b"\x01\x00" * 20)
+    joined = trim_fixed_sentence_pauses(
+        tmp_path, target_lang, 2, tmp_path / f"{target_lang}_trimmed.wav"
+    )
+    with wave.open(str(joined), "rb") as audio:
+        assert audio.getnframes() == 40

@@ -5,6 +5,7 @@ import difflib
 import json
 import re
 import shutil
+import logging
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,8 @@ import wave
 from pathlib import Path
 
 import httpx
+
+LOGGER = logging.getLogger(__name__)
 
 from backend.brain.checks import run_checks
 from backend.brain.termsheet import TermSheet, extract_termsheet
@@ -382,7 +385,8 @@ def select_paragraph_candidate(client, source: str, candidates: list[list[str]],
 
 
 def revise_for_timing(client, paragraph: str, source: str, current: str, target_lang: str,
-                      slot_s: float, chars_per_second: float, mode: str) -> str:
+                      slot_s: float, chars_per_second: float, mode: str,
+                      target_character_budget: int | None = None) -> str:
     instruction = (
         "Make this target-language segment more concise while preserving every meaning and nuance. Do not omit facts, "
         "change agents or actions, or alter speech act."
@@ -394,7 +398,10 @@ def revise_for_timing(client, paragraph: str, source: str, current: str, target_
         instruction + " The full paragraph is context; rewrite only the named segment. Use natural spoken target-language text and no untranslated English clause. Return JSON with translation.",
         {"full_source_paragraph": paragraph, "source_segment": source, "current_translation": current,
          "target_language": target_lang, "slot_seconds": round(slot_s, 3),
-         "target_character_budget": max(32, round(slot_s * chars_per_second)), "revision_mode": mode},
+         "target_character_budget": (
+             max(1, int(target_character_budget)) if target_character_budget is not None
+             else max(32, round(slot_s * chars_per_second))
+         ), "revision_mode": mode},
     )
     translated = result.get("translation")
     if not isinstance(translated, str) or not translated.strip():
@@ -480,6 +487,33 @@ def synthesize_sentence_list(client, sentences: list[str], embedding: dict | Non
         for frame_bytes in frames:
             joined.writeframesraw(frame_bytes)
     return output, duration_of(output)
+
+
+def shorter_timing_budget(current_budget: int, current_text: str) -> int:
+    """Return a strictly smaller, usable character budget for a timing retry."""
+    if current_budget <= 1:
+        return 1
+    return max(1, min(current_budget - 1, len(current_text) - 1, int(current_budget * 0.84)))
+
+
+def trim_fixed_sentence_pauses(work_dir: Path, prefix: str, sentence_count: int, output: Path) -> Path:
+    """Join synthesized sentence WAVs without the fixed inter-sentence pauses."""
+    sentence_paths = [work_dir / f"{prefix}_sentence_{index:02d}.wav" for index in range(sentence_count)]
+    with wave.open(str(sentence_paths[0]), "rb") as first:
+        params = first.getparams()
+        audio_frames = [first.readframes(first.getnframes())]
+    for sentence_path in sentence_paths[1:]:
+        with wave.open(str(sentence_path), "rb") as sentence:
+            signature = (sentence.getnchannels(), sentence.getsampwidth(), sentence.getframerate(), sentence.getcomptype())
+            expected = (params.nchannels, params.sampwidth, params.framerate, params.comptype)
+            if signature != expected:
+                raise ValueError("Synthesized sentence WAV formats do not match")
+            audio_frames.append(sentence.readframes(sentence.getnframes()))
+    with wave.open(str(output), "wb") as joined:
+        joined.setparams(params)
+        for frames in audio_frames:
+            joined.writeframesraw(frames)
+    return output
 
 
 def run_quality_pass(video: Path, reference: Path | None, targets: list[str], output_dir: Path,
@@ -659,13 +693,16 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 selection_reason = paragraph_selection_reason
                 selected = candidates[selected_index]
                 timing_revision_rejected = False
+                shorter_retry_used = False
+                last_sentence_prefix = ""
                 for synthesis_attempt in range(3):
                     checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
                     if checks:
                         raise ValueError(f"Selected {target_lang} translation failed checks: {checks}")
+                    last_sentence_prefix = f"{target_lang}_{index}_attempt_{synthesis_attempt + 1}"
                     sentence_audio, spoken_seconds = synthesize_sentence_list(
                         gnani, transcript_sentences(selected), embedding, work,
-                        f"{target_lang}_{index}_attempt_{synthesis_attempt + 1}", target_lang, stock_voice,
+                        last_sentence_prefix, target_lang, stock_voice,
                     )
                     synthesis_history.append({
                         "attempt": synthesis_attempt + 1,
@@ -678,12 +715,13 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     # Re-translate as soon as measured speech exceeds the slot;
                     # waiting for 10% overrun leaves no room for the 8% speed cap.
                     if ratio > 1.0 and synthesis_attempt < 2:
-                        duration_budget_chars = max(48, min(len(selected) - 1, int(duration_budget_chars * 0.84)))
+                        duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
                         retune_instruction = "Paragraph-context retranslation after measured overrun."
                         try:
                             revised = revise_for_timing(
                                 translator, full_source_paragraph, row["cleaned"], selected,
                                 target_lang, slot, measured_chars_per_second, "shorter",
+                                target_character_budget=duration_budget_chars,
                             )
                         except (ValueError, KeyError, TypeError):
                             timing_revision_rejected = True
@@ -692,6 +730,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                             timing_revision_rejected = True
                             break
                         selected = revised
+                        shorter_retry_used = True
                         continue
                     if ratio < 0.75 and synthesis_attempt < 2:
                         duration_budget_chars = max(len(selected) + 1, int(duration_budget_chars * 1.18))
@@ -731,6 +770,32 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                     sentence_audio = fit_path
                 final_audio_seconds = duration_of(sentence_audio)
+                shorter_translation_recovered = (
+                    shorter_retry_used
+                    and any(item["synthesized_duration_s"] > slot for item in synthesis_history[:-1])
+                    and spoken_seconds <= slot
+                )
+                atempo_recovered = raw_synthesized_seconds > slot and final_audio_seconds <= slot
+                if final_audio_seconds > slot and len(transcript_sentences(selected)) > 1:
+                    trimmed_path = work / f"{target_lang}_{index}_pauses_trimmed.wav"
+                    trim_fixed_sentence_pauses(work, last_sentence_prefix, len(transcript_sentences(selected)), trimmed_path)
+                    if speed_factor_applied != 1.0:
+                        trimmed_fit_path = work / f"{target_lang}_{index}_pauses_trimmed_fit.wav"
+                        run_command([
+                            "ffmpeg", "-y", "-v", "error", "-i", str(trimmed_path),
+                            "-filter:a", f"atempo={speed_factor_applied:.4f}", str(trimmed_fit_path),
+                        ])
+                        sentence_audio = trimmed_fit_path
+                    else:
+                        sentence_audio = trimmed_path
+                    final_audio_seconds = duration_of(sentence_audio)
+                    sentence_silence_added_s = 0.0
+                    if final_audio_seconds <= slot:
+                        LOGGER.info("Timing recovery for %s clip %s: fixed-pause trim", target_lang, clip_index + 1)
+                if shorter_translation_recovered:
+                    LOGGER.info("Timing recovery for %s clip %s: shorter translation retry", target_lang, clip_index + 1)
+                if atempo_recovered:
+                    LOGGER.info("Timing recovery for %s clip %s: atempo (maximum 8%%)", target_lang, clip_index + 1)
                 overrun_s = max(0.0, final_audio_seconds - slot)
                 remaining_pause_s = max(0.0, slot - final_audio_seconds)
                 stretched = speed_factor_applied != 1.0
@@ -742,6 +807,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 shutil.copyfile(sentence_audio, candidate_path)
                 timeline_audio_path = sentence_audio
                 if overrun_s > 0:
+                    LOGGER.warning("Timing recovery for %s clip %s: still overlaps after shorter retry, atempo, and fixed-pause trim; withholding", target_lang, clip_index + 1)
                     timeline_audio_path = work / f"{target_lang}_{index}_withheld.wav"
                     run_command([
                         "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
@@ -763,7 +829,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 if any("cleanup rejected" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):
                     reasons.append("Source cleanup exceeded the clip span and was discarded; review the ASR transcript.")
                 if overrun_s:
-                    reasons.append(f"Speech exceeds its slot by {overrun_s:.2f}s after up to 8% speed-up; this candidate was withheld from the dub track to prevent overlap. Edit or regenerate this clip.")
+                    reasons.append(f"Speech exceeds its slot by {overrun_s:.2f}s after shorter translation, up to 8% speed-up, and fixed-pause trimming; this candidate was withheld from the dub track to prevent overlap. Edit or regenerate this clip.")
                 if timing_revision_rejected:
                     reasons.append("A timing rewrite failed deterministic meaning/term/number checks; the prior full translation was retained.")
                 if remaining_pause_s > 0.7:
