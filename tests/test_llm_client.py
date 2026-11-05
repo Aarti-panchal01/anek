@@ -5,7 +5,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from backend.clients.llm import FallbackLLMClient, LiveLLMClient, create_translation_client, create_workflow_client
+from backend.clients.llm import (
+    CircuitBreakerLLMClient,
+    FallbackLLMClient,
+    LiveLLMClient,
+    create_translation_client,
+    create_workflow_client,
+)
 from backend.config import Settings
 
 
@@ -16,6 +22,7 @@ def _settings(cache_path, keys="key-one,key-two"):
         groq_api_keys=keys,
         llm_2_api_key="",
         llm_2_api_keys="",
+        sarvam_api_key="",
         llm_cache_path=str(cache_path),
     )
 
@@ -66,7 +73,7 @@ def test_quota_response_rotates_key_and_success_is_cached(cache_path, monkeypatc
     assert len(calls) == 2
 
 
-def test_translation_falls_back_to_groq_after_all_gemini_keys_are_limited(
+def test_gemini_is_last_translation_fallback_after_groq_fails(
     cache_path, monkeypatch, caplog
 ):
     settings = Settings(
@@ -77,6 +84,7 @@ def test_translation_falls_back_to_groq_after_all_gemini_keys_are_limited(
         llm_2_model="gemini-model",
         llm_2_api_keys="gemini-key-1,gemini-key-2",
         llm_2_fallback_models="gemini-backup",
+        sarvam_api_key="",
         llm_cache_path=str(cache_path),
     )
     gemini_calls = []
@@ -93,13 +101,14 @@ def test_translation_falls_back_to_groq_after_all_gemini_keys_are_limited(
         model = "groq-model"
 
         def chat_json(self, messages):
-            return {"provider": "groq"}
+            raise RuntimeError("Groq unavailable")
 
     monkeypatch.setattr("backend.clients.llm.httpx.post", post)
     caplog.set_level(logging.WARNING, logger="backend.clients.llm")
     client = create_translation_client(Groq(), settings)
 
-    assert client.chat_json([{"role": "user", "content": "translate this"}]) == {"provider": "groq"}
+    with pytest.raises(RuntimeError):
+        client.chat_json([{"role": "user", "content": "translate this"}])
     assert [auth for _, auth in gemini_calls] == ["Bearer gemini-key-1", "Bearer gemini-key-2"]
     assert all(url.startswith("https://gemini.example/") for url, _ in gemini_calls)
     assert "QuotaPoolExhausted" in caplog.text
@@ -195,6 +204,7 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
         llm_2_model="gemini-model",
         llm_2_api_keys="gemini-key-1,gemini-key-2",
         llm_2_fallback_models="gemini-backup-a,gemini-backup-b",
+        sarvam_api_key="",
         llm_cache_path=str(Path("data") / f"provider-fallback-{uuid.uuid4().hex}.sqlite3"),
     )
 
@@ -214,19 +224,122 @@ def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkey
 
     translation = create_translation_client(groq, settings)
     assert isinstance(translation, FallbackLLMClient)
-    assert isinstance(translation.primary, FallbackLLMClient)
-    assert translation.primary.primary.model == "gemini-model"
-    assert translation.primary.primary.fallback_on_quota is True
-    assert translation.primary.secondary.primary.model == "gemini-backup-a"
-    assert translation.primary.secondary.secondary.model == "gemini-backup-b"
-    assert translation.secondary is groq
+    assert isinstance(translation.primary, CircuitBreakerLLMClient)
+    assert translation.primary.client is groq
+    assert isinstance(translation.secondary, FallbackLLMClient)
+    assert translation.secondary.primary.model == "gemini-model"
+    assert translation.secondary.primary.fallback_on_quota is True
+    assert translation.secondary.secondary.primary.model == "gemini-backup-a"
+    assert translation.secondary.secondary.secondary.model == "gemini-backup-b"
 
     workflow = create_workflow_client(groq, settings)
     assert isinstance(workflow, FallbackLLMClient)
-    assert workflow.primary is groq
+    assert isinstance(workflow.primary, CircuitBreakerLLMClient)
+    assert workflow.primary.client is groq
     assert isinstance(workflow.secondary, FallbackLLMClient)
     assert workflow.secondary.primary.model == "gemini-model"
     assert workflow.chat_json([{"role": "user", "content": "check"}]) == {"provider": "gemini-model"}
+
+
+def test_failed_model_is_skipped_for_five_minutes(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: now[0])
+
+    class FailingProvider:
+        model = f"failing-{uuid.uuid4().hex}"
+        calls = 0
+
+        def chat_json(self, _messages):
+            self.calls += 1
+            raise RuntimeError("temporary provider failure")
+
+    class FallbackProvider:
+        model = f"fallback-{uuid.uuid4().hex}"
+
+        def chat_json(self, _messages):
+            return {"provider": self.model}
+
+    failing = FailingProvider()
+    wrapped = CircuitBreakerLLMClient(failing)
+    chain = FallbackLLMClient(wrapped, FallbackProvider())
+    messages = [{"role": "user", "content": "test"}]
+
+    first = chain.chat_json(messages)
+    second = chain.chat_json(messages)
+    assert first == second
+    assert failing.calls == 1
+
+    now[0] += 301
+    chain.chat_json(messages)
+    assert failing.calls == 2
+
+
+def test_sarvam_translation_uses_mayura_for_target_text(monkeypatch):
+    from backend.clients.llm import SarvamTranslationClient
+    import json
+
+    calls = []
+
+    class Text:
+        def translate(self, **kwargs):
+            calls.append(kwargs)
+            return type("Translation", (), {"translated_text": "નમસ્તે"})()
+
+    client = SarvamTranslationClient.__new__(SarvamTranslationClient)
+    client.translation_model = "mayura:v1"
+    client.rewrite_model = "sarvam-105b"
+    client.model = client.translation_model
+    client.models_used = []
+    client.client = type("Sarvam", (), {"text": Text()})()
+    result = client.chat_json([
+        {"role": "system", "content": "Translate the full source paragraph."},
+        {"role": "user", "content": json.dumps({
+            "source_language": "en-IN", "target_language": "gu-IN", "tone": "everyday spoken",
+            "timed_source_spans": [{"source_text": "Hello."}],
+        })},
+    ])
+
+    assert [candidate["translations"] for candidate in result["candidates"]] == [["નમસ્તે"]] * 3
+    assert calls[0]["model"] == "mayura:v1"
+    assert calls[0]["mode"] == "modern-colloquial"
+    assert calls[0]["request_options"]["max_retries"] == 0
+
+
+def test_sarvam_is_first_then_groq_then_gemini(monkeypatch):
+    from backend.clients.llm import SarvamTranslationClient
+
+    settings = _settings(Path("data") / f"sarvam-chain-{uuid.uuid4().hex}.sqlite3")
+    settings.sarvam_api_key = "sarvam-key"
+    settings.llm_2_api_key = "gemini-key"
+    settings.llm_2_model = "gemini-chain-test"
+    calls = []
+
+    class Sarvam:
+        model = "sarvam-chain-test"
+
+        def __init__(self, _settings):
+            pass
+
+        def chat_json(self, _messages):
+            calls.append("sarvam")
+            raise RuntimeError("Sarvam temporarily unavailable")
+
+    class Provider:
+        def __init__(self, provider_settings, **_kwargs):
+            self.model = provider_settings.llm_model
+
+        def chat_json(self, _messages):
+            calls.append(self.model)
+            if self.model == "test-model":
+                raise RuntimeError("Groq temporarily unavailable")
+            return {"provider": self.model}
+
+    monkeypatch.setattr("backend.clients.llm.SarvamTranslationClient", Sarvam)
+    monkeypatch.setattr("backend.clients.llm.LiveLLMClient", Provider)
+    client = create_translation_client(Provider(settings), settings)
+
+    assert client.chat_json([{"role": "user", "content": "translate"}]) == {"provider": "gemini-chain-test"}
+    assert calls == ["sarvam", "test-model", "gemini-chain-test"]
 
 
 def test_model_fallback_records_model_that_actually_answered(cache_path, monkeypatch):
@@ -241,7 +354,7 @@ def test_model_fallback_records_model_that_actually_answered(cache_path, monkeyp
             self.model = provider_settings.llm_model
 
         def chat_json(self, messages):
-            if self.model == "gemini-primary":
+            if self.model in {"gemini-primary", "test-model"}:
                 raise RuntimeError("temporary service error")
             return {"provider": self.model}
 

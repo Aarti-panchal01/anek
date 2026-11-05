@@ -345,26 +345,40 @@ def paragraph_translation_candidates(
         payload,
     )
     raw_candidates = response.get("candidates", [])
-    result: list[list[str]] = []
-    for candidate in raw_candidates if isinstance(raw_candidates, list) else []:
-        texts = candidate.get("translations") if isinstance(candidate, dict) else None
-        if not isinstance(texts, list) or len(texts) != len(rows) or not all(isinstance(text, str) and text.strip() for text in texts):
-            continue
-        valid = True
-        for row, text in zip(rows, texts):
-            terms_for_row = TermSheet(
-                terms=[term for term in terms.terms if term.term.casefold() in row["cleaned"].casefold()],
-                idioms=[idiom for idiom in terms.idioms if idiom.phrase.casefold() in row["cleaned"].casefold()],
-            )
-            failures = [failure for failure in run_checks(row["cleaned"], text, target_lang, terms_for_row, max_chars=1000)
-                        if failure["check"] not in {"too_many_characters", "over_slot"}]
-            if failures:
-                valid = False
-                break
-        if valid:
-            result.append([text.strip() for text in texts])
+    def validate(raw_items: object) -> tuple[list[list[str]], list[dict[str, str]]]:
+        result: list[list[str]] = []
+        failures: list[dict[str, str]] = []
+        for candidate in raw_items if isinstance(raw_items, list) else []:
+            texts = candidate.get("translations") if isinstance(candidate, dict) else None
+            if not isinstance(texts, list) or len(texts) != len(rows) or not all(isinstance(text, str) and text.strip() for text in texts):
+                failures.append({"check": "candidate_shape", "detail": "Expected one non-empty translation per timed source span."})
+                continue
+            candidate_failures = []
+            for row, text in zip(rows, texts):
+                terms_for_row = TermSheet(
+                    terms=[term for term in terms.terms if term.term.casefold() in row["cleaned"].casefold()],
+                    idioms=[idiom for idiom in terms.idioms if idiom.phrase.casefold() in row["cleaned"].casefold()],
+                )
+                candidate_failures.extend(
+                    failure for failure in run_checks(row["cleaned"], text, target_lang, terms_for_row, max_chars=1000)
+                    if failure["check"] not in {"too_many_characters", "over_slot"}
+                )
+            if candidate_failures:
+                failures.extend(candidate_failures)
+            else:
+                result.append([text.strip() for text in texts])
+        return result, failures
+
+    result, validation_failures = validate(raw_candidates)
     if not result:
-        raise ValueError("Gemini paragraph translation returned no candidate that passed deterministic checks")
+        repaired = prompt_json(
+            client,
+            "Repair the translations so every timed source span passes the deterministic checks. Preserve the complete source meaning, agents, actions, objects, numbers, uncertainty, and speech act. Apply all locked terms exactly. Return exactly two candidate objects shaped as {translations:[...],review_notes:[...]}, aligned to the timed spans.",
+            {**payload, "candidate_failures": validation_failures, "previous_candidates": raw_candidates},
+        )
+        result, _ = validate(repaired.get("candidates", []))
+    if not result:
+        raise ValueError("Paragraph translation returned no candidate that passed deterministic checks")
     return result[:3]
 
 

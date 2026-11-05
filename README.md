@@ -68,7 +68,9 @@ Set these Railway variables before deploying:
 - `ANEK_ACCESS_PASSWORD` to a strong private workspace password
 - `ANEK_AUTH_SECRET` to a separate random secret of at least 32 bytes
 - `CORS_ORIGINS` to the exact Vercel production origin
-- `GNANI_API_KEY`, `GROQ_API_KEYS`, and `LLM_2_API_KEYS` (or the corresponding configured provider variables)
+- `GNANI_API_KEY`, `SARVAM_API_KEY`, `GROQ_API_KEYS`, and `LLM_2_API_KEYS` (or the corresponding configured provider variables)
+
+Sarvam handles text translation and translation retries only. Speech recognition and speech synthesis continue to use Gnani. The default translation model is Mayura in modern-colloquial mode; translation rewrites use the supported Sarvam 105B chat model because Sarvam-30B is deprecated. `scripts/sarvam_smoke.py` makes one optional chat-completion check using `SARVAM_API_KEY` from the environment or `.env`.
 
 Set `VITE_API_BASE_URL` on Vercel to the Railway HTTPS origin, without a trailing slash. The UI asks for the workspace password; provider keys stay server-side. Browser media and event-stream URLs use a short-lived signed token in the query string, so keep Railway access logs disabled. Use only your own voice or a voice whose speaker explicitly consented.
 

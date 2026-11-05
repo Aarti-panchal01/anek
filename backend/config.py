@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     llm_2_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_2_model: str = "gemini-3.5-flash"
     llm_2_fallback_models: str = "gemini-3.6-flash,gemini-3.5-flash-lite"
+    sarvam_api_key: str = ""
+    sarvam_translation_model: str = "mayura:v1"
+    sarvam_rewrite_model: str = "sarvam-105b"
     llm_cache_path: str = ""
     numeral_style: str = "ascii"
     max_video_seconds: int = Field(default=120, le=120, gt=0)

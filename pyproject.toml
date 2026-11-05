@@ -10,6 +10,7 @@ dependencies = [
   "pydantic-settings>=2.2",
   "python-dotenv>=1.0",
   "rapidfuzz>=3.6",
+  "sarvamai>=0.1.43,<0.2",
   "uvicorn>=0.27",
 ]
 

@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from email.utils import parsedate_to_datetime
@@ -17,6 +18,7 @@ from backend.config import Settings
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_COOLDOWN_SECONDS = 60.0
+_MODEL_CIRCUIT_SECONDS = 300.0
 
 
 class LLMClient(Protocol):
@@ -25,6 +27,57 @@ class LLMClient(Protocol):
 
 class QuotaPoolExhausted(RuntimeError):
     """Raised after every key for a provider has been quota-limited."""
+
+
+class ModelCircuitOpen(RuntimeError):
+    """Raised without a request while a failed model is cooling down."""
+
+
+class CircuitBreakerLLMClient:
+    """Keep a failing provider model out of subsequent clip requests for five minutes."""
+
+    _open_until: dict[str, float] = {}
+    _lock = threading.Lock()
+
+    def __init__(self, client: LLMClient):
+        self.client = client
+        self.model = str(getattr(client, "model", type(client).__name__))
+        self.circuit_key = str(getattr(client, "circuit_key", self.model))
+
+    @property
+    def models_used(self):
+        return getattr(self.client, "models_used", [])
+
+    @property
+    def fallback_on_quota(self):
+        return getattr(self.client, "fallback_on_quota", False)
+
+    @classmethod
+    def is_open(cls, key: str) -> bool:
+        with cls._lock:
+            until = cls._open_until.get(key, 0.0)
+            if until <= time.monotonic():
+                cls._open_until.pop(key, None)
+                return False
+            return True
+
+    def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        if self.is_open(self.circuit_key):
+            raise ModelCircuitOpen(f"LLM model {self.model} is cooling down")
+        try:
+            result = self.client.chat_json(messages)
+        except Exception as exc:
+            with self._lock:
+                self._open_until[self.circuit_key] = time.monotonic() + _MODEL_CIRCUIT_SECONDS
+            LOGGER.warning("LLM model %s failed (%s); circuit opened for 300 seconds", self.model, type(exc).__name__)
+            raise
+        with self._lock:
+            self._open_until.pop(self.circuit_key, None)
+        return result
+
+
+def _with_circuit_breaker(client: LLMClient) -> CircuitBreakerLLMClient:
+    return client if isinstance(client, CircuitBreakerLLMClient) else CircuitBreakerLLMClient(client)
 
 
 def clear_response_cache(settings: Settings) -> None:
@@ -70,6 +123,9 @@ class FallbackLLMClient:
     def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         for client in (self.primary, self.secondary):
             model = str(getattr(client, "model", client.__class__.__name__))
+            if isinstance(client, CircuitBreakerLLMClient) and client.is_open(client.circuit_key):
+                LOGGER.info("Skipping LLM model %s while its five-minute circuit is open", model)
+                continue
             nested_models = getattr(client, "models_used", None)
             nested_count = len(nested_models) if nested_models is not None else 0
             try:
@@ -109,6 +165,7 @@ class LiveLLMClient:
             raise ValueError("LLM_BASE_URL, LLM_MODEL, and GROQ_API_KEYS (or LLM_API_KEY) are required")
         self.url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
         self.model = settings.llm_model
+        self.circuit_key = f"{self.url}|{self.model}"
         self.keys = configured_keys
         self.current_key_index = 0
         self.cooldowns: dict[int, float] = {}
@@ -321,17 +378,101 @@ def create_llm_client(mock: bool = False) -> LLMClient:
         return MockLLMClient()
     from backend.config import get_settings
 
-    return LiveLLMClient(get_settings())
+    return _with_circuit_breaker(LiveLLMClient(get_settings()))
+
+
+class SarvamTranslationClient:
+    """Use Sarvam text translation for target text and Sarvam chat for translation-only rewrites."""
+
+    def __init__(self, settings: Settings):
+        from sarvamai import SarvamAI
+
+        self.translation_model = settings.sarvam_translation_model
+        self.rewrite_model = settings.sarvam_rewrite_model
+        self.model = self.translation_model
+        self.models_used: list[str] = []
+        self.client = SarvamAI(api_subscription_key=settings.sarvam_api_key, timeout=60.0)
+
+    @staticmethod
+    def _with_model_circuit(model: str, operation):
+        key = f"sarvam|{model}"
+        if CircuitBreakerLLMClient.is_open(key):
+            raise ModelCircuitOpen(f"LLM model {model} is cooling down")
+        try:
+            result = operation()
+        except Exception as exc:
+            with CircuitBreakerLLMClient._lock:
+                CircuitBreakerLLMClient._open_until[key] = time.monotonic() + _MODEL_CIRCUIT_SECONDS
+            LOGGER.warning("LLM model %s failed (%s); circuit opened for 300 seconds", model, type(exc).__name__)
+            raise
+        with CircuitBreakerLLMClient._lock:
+            CircuitBreakerLLMClient._open_until.pop(key, None)
+        return result
+
+    def _chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        response = self.client.chat.completions(
+            model=self.rewrite_model,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=4096,
+            response_format={"type": "json_object"},
+            request_options={"timeout_in_seconds": 60, "max_retries": 0},
+        )
+        content = response.choices[0].message.content
+        result = json.loads(content)
+        if not isinstance(result, dict):
+            raise ValueError("Sarvam returned a non-object JSON response")
+        self.models_used.append(self.rewrite_model)
+        return result
+
+    def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        system = messages[0]["content"] if messages else ""
+        payload = json.loads(messages[-1]["content"]) if len(messages) > 1 else {}
+        spans = payload.get("timed_source_spans")
+        if "Translate the full source paragraph" in system and isinstance(spans, list):
+            tone = str(payload.get("tone", "")).casefold()
+            mode = "classic-colloquial" if "respectful" in tone else "modern-colloquial"
+            if self.translation_model == "sarvam-translate:v1":
+                mode = "formal"
+            translations = []
+            for span in spans:
+                response = self._with_model_circuit(
+                    self.translation_model,
+                    lambda span=span: self.client.text.translate(
+                        input=span["source_text"],
+                        source_language_code=payload.get("source_language") or "auto",
+                        target_language_code=payload["target_language"],
+                        model=self.translation_model,
+                        mode=mode,
+                        request_options={"timeout_in_seconds": 60, "max_retries": 0},
+                    ),
+                )
+                translations.append(response.translated_text.strip())
+            # The existing pipeline validates and ranks three alternatives. The
+            # language API returns one translation per call; keep its output as
+            # the three identical deterministic candidates without extra calls.
+            candidates = [
+                {"translations": translations, "review_notes": []}
+                for _ in range(3)
+            ]
+            self.models_used.append(self.translation_model)
+            return {"candidates": candidates}
+        return self._with_model_circuit(self.rewrite_model, lambda: self._chat_json(messages))
 
 
 def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClient:
-    """Prefer Gemini for translation and fall back to the configured Groq pool."""
+    """Use Sarvam translation first, Groq next, and Gemini as the final fallback."""
+    primary = _with_circuit_breaker(primary)
     gemini = _create_gemini_fallback_chain(settings)
-    return FallbackLLMClient(gemini, primary) if gemini else primary
+    fallback: LLMClient = FallbackLLMClient(primary, gemini) if gemini else primary
+    if settings.sarvam_api_key:
+        return FallbackLLMClient(SarvamTranslationClient(settings), fallback)
+    return fallback
 
 
 def create_workflow_client(primary: LLMClient, settings: Settings) -> LLMClient:
-    """Use Groq first for cleanup/checks, with Gemini as a provider fallback."""
+    """Use the existing non-Sarvam workflow LLM for cleanup and QA, with Gemini fallback."""
+    primary = _with_circuit_breaker(primary)
     gemini = _create_gemini_fallback_chain(settings)
     return FallbackLLMClient(primary, gemini) if gemini else primary
 
@@ -361,4 +502,4 @@ def _create_gemini_client(settings: Settings, gemini_keys: str, model: str) -> L
     # Try every Gemini key once for this request. When the entire Gemini pool is
     # limited, bubble up to the provider-level fallback instead of sleeping in
     # this worker indefinitely. Groq remains the translation fallback.
-    return LiveLLMClient(gemini_settings, fallback_on_quota=True)
+    return _with_circuit_breaker(LiveLLMClient(gemini_settings, fallback_on_quota=True))
