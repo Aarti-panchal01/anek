@@ -45,7 +45,7 @@ def test_settings_and_usage_are_derived_from_config_and_database(monkeypatch):
         assert usage["spent"] == 17
 
 
-def test_video_upload_keeps_original_and_review_serves_browser_copy(monkeypatch):
+def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Playable video", source_lang="en-IN", target_langs=["hi-IN"],
@@ -54,7 +54,8 @@ def test_video_upload_keeps_original_and_review_serves_browser_copy(monkeypatch)
         browser_copy.parent.mkdir(parents=True, exist_ok=True)
         browser_copy.write_bytes(b"h264 preview")
         monkeypatch.setattr(app_module, "probe_video", lambda path: (20.0, True))
-        monkeypatch.setattr(app_module, "browser_video_path", lambda path: browser_copy)
+        conversions = []
+        monkeypatch.setattr(app_module, "browser_video_path", lambda path: conversions.append(path) or browser_copy)
         class Upload:
             filename = "source.mov"
             blocks = [b"original hevc bytes", b""]
@@ -65,6 +66,8 @@ def test_video_upload_keeps_original_and_review_serves_browser_copy(monkeypatch)
         upload = Upload()
 
         result = _resolve(app_module.upload_video(project["id"], upload))
+        assert conversions == []
+        assert Path(project_row := app_module.project_row(project["id"])["video_path"]).read_bytes() == b"original hevc bytes"
         response = _resolve(app_module.project_video(project["id"]))
 
         assert result["filename"] == "source.mov"
@@ -72,6 +75,7 @@ def test_video_upload_keeps_original_and_review_serves_browser_copy(monkeypatch)
         assert Path(response.path) == browser_copy
         assert response.media_type == "video/mp4"
         assert "attachment" not in response.headers.get("content-disposition", "")
+        assert conversions == [Path(project_row)]
 
 
 def test_global_term_memory_crud_persists_and_validates(monkeypatch):

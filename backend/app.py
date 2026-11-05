@@ -241,8 +241,9 @@ def browser_video_path(source: Path) -> Path:
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(temporary)],
+             "-vf", "scale=w='min(1280,iw)':h=-2", "-threads", "1", "-filter_threads", "1",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(temporary)],
             check=True, capture_output=True,
         )
         temporary.replace(browser_copy)
@@ -524,12 +525,8 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if duration > settings.max_video_seconds:
         path.unlink(missing_ok=True)
         raise HTTPException(413, f"Video is {duration:.1f}s; maximum is {settings.max_video_seconds}s")
-    try:
-        browser_video_path(path)
-    except Exception as error:
-        path.unlink(missing_ok=True)
-        (folder / "browser.mp4").unlink(missing_ok=True)
-        raise HTTPException(400, f"Video preview conversion failed: {error}") from error
+    # Preview transcoding is lazy: upload should not fail if a constrained host
+    # cannot afford a second full video encode.
     with db.connect() as connection:
         connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='uploaded' WHERE id=?", (str(path), duration, project_id))
     return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id}
@@ -568,7 +565,8 @@ async def convert_browser_preview(request: Request, video: UploadFile = File(...
         raise
     except Exception as error:
         shutil.rmtree(folder, ignore_errors=True)
-        raise HTTPException(400, f"Video preview conversion failed: {error}") from error
+        LOGGER.exception("Browser preview conversion failed")
+        raise HTTPException(422, "This video could not be converted for preview on the server. The original upload is still usable; try a smaller MP4 if preview is required.") from error
 
 
 @app.get("/api/projects/{project_id}/video")
@@ -579,7 +577,8 @@ async def project_video(project_id: str):
     try:
         playable = browser_video_path(Path(project["video_path"]))
     except Exception as error:
-        raise HTTPException(415, f"Video preview conversion failed: {error}") from error
+        LOGGER.exception("Project video preview conversion failed for project %s", project_id)
+        raise HTTPException(422, "The uploaded video is saved, but this server could not prepare its preview. Try an H.264 MP4 export.") from error
     return FileResponse(playable, media_type="video/mp4", content_disposition_type="inline")
 
 
@@ -693,7 +692,11 @@ async def create_voice(
         source = Path(folder) / safe_upload_name(consent_audio.filename)
         consent_wav = Path(folder) / "consent.wav"
         source.write_bytes(consent_bytes)
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ac", "1", "-ar", "16000", str(consent_wav)], check=True, capture_output=True)
+        try:
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-threads", "1", "-i", str(source), "-ac", "1", "-ar", "16000", str(consent_wav)], check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as error:
+            LOGGER.exception("Consent recording conversion failed")
+            raise HTTPException(422, "We could not read the consent recording. Please allow microphone access and record the phrase again.") from error
         consent_bytes = consent_wav.read_bytes()
         reference_wav = Path(folder) / "reference.wav"
         if reference_audio:
@@ -706,31 +709,61 @@ async def create_voice(
             audio_map = ["-map", "0:a:0", "-vn"]
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-v", "error", "-i", reference_input, *audio_map,
+                ["ffmpeg", "-y", "-v", "error", "-threads", "1", "-i", reference_input, *audio_map,
                  "-t", "30", "-ac", "1", "-ar", "24000", str(reference_wav)],
                 check=True, capture_output=True,
             )
-        except subprocess.CalledProcessError as error:
+        except (subprocess.CalledProcessError, FileNotFoundError) as error:
+            LOGGER.exception("Voice reference extraction failed for project %s", project_id)
             raise HTTPException(422, "Could not extract a voice track from the source video. Check that it contains clear speech.") from error
-        reference_duration = float(subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(reference_wav)],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip())
+        try:
+            reference_duration = float(subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(reference_wav)],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip())
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as error:
+            LOGGER.exception("Voice reference duration probe failed for project %s", project_id)
+            raise HTTPException(422, "We could not inspect the extracted voice sample. Please try another video.") from error
         if reference_duration < 5:
             raise HTTPException(422, "The source video needs at least 5 seconds of audio for voice cloning")
         reference_bytes = reference_wav.read_bytes()
-    consent_client = create_gnani_client(settings.gnani_mock)
-    transcript = consent_client.stt(consent_bytes, "indic-auto", "prisma-v3.0")
-    match = ratio(phrase.casefold(), transcript.get("transcript", "").casefold())
+    try:
+        consent_client = create_gnani_client(settings.gnani_mock)
+        transcript = consent_client.stt(consent_bytes, "indic-auto", "prisma-v3.0")
+    except Exception as error:
+        LOGGER.exception("Gnani could not verify the consent recording")
+        raise HTTPException(502, "Gnani could not verify the consent recording right now. Please retry in a moment.") from error
+    # Gnani deployments may wrap transcript text under `data`; tolerate both
+    # documented response styles and fail as a provider error, never as a 500.
+    transcript_text = transcript if isinstance(transcript, str) else ""
+    if isinstance(transcript, dict):
+        candidate = transcript.get("transcript") or transcript.get("text")
+        if not candidate and isinstance(transcript.get("data"), dict):
+            candidate = transcript["data"].get("transcript") or transcript["data"].get("text")
+        if isinstance(candidate, str):
+            transcript_text = candidate
+    if not transcript_text.strip():
+        LOGGER.error("Gnani consent STT response did not contain transcript text")
+        raise HTTPException(502, "Gnani returned no transcript for the consent recording. Please retry the recording.")
+    match = ratio(phrase.casefold(), transcript_text.casefold())
     if match < settings.consent_match_threshold:
         raise HTTPException(422, f"Consent phrase did not match (similarity {match:.0f}%)")
-    reference_path.write_bytes(reference_bytes)
-    embedding = consent_client.make_embedding(reference_bytes)
-    with db.connect() as connection:
-        connection.execute(
-            "INSERT INTO voices(id,session_id,label,embedding_json,consent_phrase,consent_ok,reference_path) VALUES(?,?,?,?,?,1,?)",
-            (voice_id, session_id, label, json.dumps(embedding), phrase, str(reference_path)),
-        )
+    try:
+        embedding = consent_client.make_embedding(reference_bytes)
+    except Exception as error:
+        LOGGER.exception("Gnani voice embedding request failed")
+        raise HTTPException(502, "Gnani could not create the voice model right now. Your consent was verified; please retry in a moment.") from error
+    try:
+        reference_path.write_bytes(reference_bytes)
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO voices(id,session_id,label,embedding_json,consent_phrase,consent_ok,reference_path) VALUES(?,?,?,?,?,1,?)",
+                (voice_id, session_id, label, json.dumps(embedding), phrase, str(reference_path)),
+            )
+    except Exception as error:
+        reference_path.unlink(missing_ok=True)
+        LOGGER.exception("Could not save the verified voice model for project %s", project_id)
+        raise HTTPException(503, "Consent was verified, but the voice model could not be saved. Please retry.") from error
     consent_sessions.pop(session_id, None)
     return {"id": voice_id, "label": label, "consent_confirmed": True, "message": "Consent confirms a live recording; it does not prove identity."}
 
