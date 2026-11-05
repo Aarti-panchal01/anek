@@ -12,11 +12,11 @@
 
 ## Current task
 
-- All six requested tasks are complete.
+- Complete. Final backend suite (`python -m pytest tests -q`) and frontend production build passed.
 
 ## Next task
 
-- Final verification and deployment environment inventory.
+- None.
 
 ## Decisions
 
@@ -30,4 +30,4 @@
 - Task 4 term rules default to project scope. The explicit “Save this rule to global term memory” option copies it to future projects. Protected spelling remains the canonical displayed term; language-specific spoken forms are used only for synthesis.
 - Task 5 stores attempt WAVs under the project's export directory and serves them through a clip-scoped endpoint. The first take has no previous audio; subsequent retries carry both versions.
 - Task 6 keeps attempts collapsed by default. Clicking a clip plays its timed range from the mixed dub, and the single-player mode is the default.
-- Current task: final verification and environment inventory.
+- Current task: complete. Environment inventory was collected with variable names only.
