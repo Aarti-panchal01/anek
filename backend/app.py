@@ -1035,14 +1035,45 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         item = dict(row)
         audio_path = item.pop("audio_path", None)
         item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio" if audio_path and Path(audio_path).is_file() else None
+        attempts = json.loads(row["attempts_json"] or "[]")
+        for index, attempt in enumerate(attempts):
+            old_key = attempt.pop("old_audio_key", None)
+            new_key = attempt.pop("new_audio_key", None)
+            attempt["old_audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/attempts/{index}/previous" if old_key else None
+            attempt["new_audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/attempts/{index}/updated" if new_key else None
         item.update({
             "reasons": json.loads(row["reasons_json"] or "[]"),
-            "attempts": json.loads(row["attempts_json"] or "[]"),
+            "attempts": attempts,
             "source_raw": review_by_clip.get(int(row["idx"]), {}).get("source_raw"),
             "stt_review": review_by_clip.get(int(row["idx"]), {}).get("stt_review", {}),
         })
+        item.pop("attempts_json", None)
+        item.pop("reasons_json", None)
         result.append(item)
     return result
+
+
+@app.get("/api/clips/{clip_id}/dubs/{lang}/attempts/{attempt_index}/{take}")
+async def clip_attempt_audio(clip_id: str, lang: str, attempt_index: int, take: str):
+    if take not in {"previous", "updated"}:
+        raise HTTPException(404, "Attempt audio is not available")
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT d.attempts_json,c.project_id FROM dubs d JOIN clips c ON c.id=d.clip_id WHERE c.id=? AND d.lang=?",
+            (clip_id, lang),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "Attempt audio is not available")
+    try:
+        attempts = json.loads(row["attempts_json"] or "[]")
+        key = attempts[attempt_index].get("old_audio_key" if take == "previous" else "new_audio_key")
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        key = None
+    root = (DATA_ROOT / "exports" / row["project_id"]).resolve()
+    path = (root / key).resolve() if key else None
+    if not path or not path.is_file() or not path.is_relative_to(root):
+        raise HTTPException(404, "Attempt audio is not available")
+    return FileResponse(path, media_type="audio/wav", filename=path.name, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/clips/{clip_id}/dubs/{lang}/audio")

@@ -825,6 +825,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 synthesis_history = []
                 sentence_audio = None
                 spoken_seconds = 0.0
+                attempt_audio_dir = output_dir / "clips" / target_lang / "attempts"
+                attempt_audio_dir.mkdir(parents=True, exist_ok=True)
                 restored_candidates = [
                     restore_protected_terms(candidate[index], protected_maps[index])
                     for candidate in paragraph_candidates
@@ -851,8 +853,19 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         gnani, transcript_sentences(synthesis_text), embedding, work,
                         last_sentence_prefix, target_lang, stock_voice,
                     )
+                    attempt_audio = attempt_audio_dir / f"clip_{clip_index + 1:03d}_attempt_{synthesis_attempt + 1:02d}.wav"
+                    shutil.copyfile(sentence_audio, attempt_audio)
+                    previous_attempt = synthesis_history[-1] if synthesis_history else None
                     synthesis_history.append({
                         "attempt": synthesis_attempt + 1,
+                        "trigger": retune_instruction,
+                        "old_text": previous_attempt["new_text"] if previous_attempt else None,
+                        "new_text": selected,
+                        "old_audio_key": previous_attempt["new_audio_key"] if previous_attempt else None,
+                        "new_audio_key": attempt_audio.relative_to(output_dir).as_posix(),
+                        "change": "Initial synthesized take" if previous_attempt is None else (
+                            "Translation and audio updated" if previous_attempt["new_text"] != selected else "Audio regenerated"
+                        ),
                         "translated_characters": len(selected),
                         "synthesized_duration_s": round(spoken_seconds, 3),
                         "duration_ratio_to_slot": round(spoken_seconds / slot, 3),
@@ -956,6 +969,21 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 clip_audio_dir.mkdir(parents=True, exist_ok=True)
                 candidate_path = clip_audio_dir / f"clip_{clip_index + 1:03d}.wav"
                 shutil.copyfile(sentence_audio, candidate_path)
+                if recovery_step in {"speed-up", "fixed-pause trim"}:
+                    previous_attempt = synthesis_history[-1] if synthesis_history else None
+                    synthesis_history.append({
+                        "attempt": len(synthesis_history) + 1,
+                        "trigger": recovery_step,
+                        "old_text": selected,
+                        "new_text": selected,
+                        "old_audio_key": previous_attempt.get("new_audio_key") if previous_attempt else None,
+                        "new_audio_key": candidate_path.relative_to(output_dir).as_posix(),
+                        "change": f"Applied {recovery_step} to the synthesized audio.",
+                        "translated_characters": len(selected),
+                        "synthesized_duration_s": round(final_audio_seconds, 3),
+                        "duration_ratio_to_slot": round(final_audio_seconds / slot, 3),
+                        "instruction": recovery_step,
+                    })
                 timeline_audio_path = sentence_audio
                 spill_end_s = float(row.get("spill_end_s", row["end"]))
                 spill_used = overrun_s > 0 and float(row["timeline_start_s"]) + final_audio_seconds <= spill_end_s + 1e-6
