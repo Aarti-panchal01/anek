@@ -23,6 +23,7 @@ from backend.pipeline.phase3b import (
     timing_character_budget,
     should_reuse_completed_clip,
     prepare_language_retry_checkpoint,
+    source_rows_from_report,
     silence_chunks,
     targeted_silence_segments,
     transcript_sentences,
@@ -82,6 +83,29 @@ def test_language_retry_discards_partial_audio_but_preserves_transcript_and_save
     assert checkpoint["translations"]["hi-IN"]["0"] == "AHEAD ಎಂದು ನಾನು ಮಾಡಿದೆ"
     assert checkpoint["term_fixes"]["cleaned_rows"][0]["cleaned"] == "saved source"
     assert checkpoint["stt_cache"]["source"]["transcript"] == "saved source"
+
+
+def test_single_clip_redub_restores_full_source_index_map():
+    report = {
+        "source_language": "en-IN",
+        "clips": [
+            {"clip": 1, "start_s": 0.0, "end_s": 4.0, "timeline_start_s": 0.0,
+             "source_raw": "first", "source_cleaned": "first"},
+            {"clip": 2, "start_s": 4.0, "end_s": 8.0, "timeline_start_s": 4.1,
+             "source_raw": "second", "source_cleaned": "second"},
+            {"clip": 3, "start_s": 8.0, "end_s": 12.0, "timeline_start_s": 8.2,
+             "source_raw": "third edited", "source_cleaned": "third edited"},
+            {"clip": 4, "start_s": 12.0, "end_s": 16.0, "timeline_start_s": 12.0,
+             "source_raw": "fourth", "source_cleaned": "fourth"},
+        ],
+    }
+    rows = source_rows_from_report(report, "en-IN")
+
+    assert len(rows) == 4
+    assert rows[2]["raw"] == "third edited"
+    assert rows[2]["timeline_start_s"] == pytest.approx(8.2)
+    assert rows[0]["start"] == pytest.approx(0.0)
+    assert rows[0]["lang"] == "en-IN"
 
 
 def test_language_completion_invariant_preserves_short_final_clip_and_rejects_missing_translation():

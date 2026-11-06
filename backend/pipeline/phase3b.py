@@ -613,6 +613,28 @@ def prepare_language_retry_checkpoint(
             translations[str(index)] = str(translation)
 
 
+def source_rows_from_report(report: dict, source_language: str) -> list[dict]:
+    """Restore the complete source index map for one-clip regeneration."""
+    rows = []
+    for clip in report.get("clips", []):
+        start = float(clip["start_s"])
+        end = float(clip["end_s"])
+        raw = clip.get("source_raw") or clip.get("source_cleaned", "")
+        rows.append({
+            "start": start,
+            "end": end,
+            "timeline_start_s": float(clip.get("timeline_start_s", start)),
+            "spill_end_s": float(clip.get("spill_end_s", end)),
+            "raw": raw,
+            "lang": source_language,
+            "cleaned": clip.get("source_cleaned", raw),
+            "cleanup_changes": clip.get("source_cleanup_changes", []),
+            "stt_review": clip.get("stt_review", {}),
+            "cut_mid_sentence": clip.get("cut_mid_sentence", False),
+        })
+    return rows
+
+
 def select_candidate(client, source: str, candidates: list[str], target_lang: str, slot_s: float, cps: float) -> tuple[str, int, str]:
     time_limit_chars = max(1, int(slot_s * cps))
     response = prompt_json(
@@ -805,15 +827,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         resumed_term_fixes = checkpoint_state.get("term_fixes")
         if prior_clip is not None:
             source_lang = prior_report.get("source_language", source_language)
-            raw_source = prior_clip.get("source_raw") or prior_clip.get("source_cleaned", "")
-            source_chunks = [{
-                "start": float(prior_clip["start_s"]), "end": float(prior_clip["end_s"]),
-                "raw": raw_source, "lang": source_lang,
-                "cleaned": prior_clip.get("source_cleaned", raw_source),
-                "cleanup_changes": prior_clip.get("source_cleanup_changes", []),
-                "stt_review": prior_clip.get("stt_review", {}),
-                "cut_mid_sentence": prior_clip.get("cut_mid_sentence", False),
-            }]
+            source_chunks = source_rows_from_report(prior_report, source_lang)
+            if not source_chunks:
+                raise ValueError("Saved source clip map is incomplete; regenerate the full language first")
             term_sheet = TermSheet.model_validate(prior_report.get("term_sheet", {}))
             cleaned_rows = source_chunks
         elif resumed_term_fixes:
