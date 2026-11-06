@@ -109,3 +109,32 @@ def test_job_resume_reuses_transcript_and_completed_clip_checkpoint(monkeypatch)
             app_module._shutdown_requested.clear()
 
     asyncio.run(scenario())
+
+
+def test_job_with_zero_clips_is_failed_instead_of_completed(monkeypatch):
+    async def scenario():
+        with _sandbox(monkeypatch) as (_, data_root):
+            source = data_root / "uploads" / "empty" / "source.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"mock video")
+            project = _resolve(app_module.create_project(app_module.ProjectCreate(
+                name="empty output", source_lang="en-IN", target_langs=["hi-IN"],
+            )))
+            with db.connect() as connection:
+                connection.execute("UPDATE projects SET video_path=?,duration_s=20 WHERE id=?", (str(source), project["id"]))
+                connection.execute(
+                    "INSERT INTO jobs(id,project_id,kind,voice_mode,stock_voice,state,stage,total) VALUES(?,?,?,?,?,?,?,?)",
+                    ("empty-job", project["id"], "dub", "stock", "Shivani", "pending", "queued", 1),
+                )
+
+            monkeypatch.setattr(app_module, "run_quality_pass", lambda *args, **kwargs: [])
+            await app_module.run_job("empty-job")
+
+            with db.connect() as connection:
+                job = connection.execute("SELECT state,error FROM jobs WHERE id='empty-job'").fetchone()
+                project_state = connection.execute("SELECT status FROM projects WHERE id=?", (project["id"],)).fetchone()
+            assert job["state"] == "failed"
+            assert "without creating any clips" in job["error"]
+            assert project_state["status"] == "failed"
+
+    asyncio.run(scenario())

@@ -39,15 +39,17 @@
 ### Tasks done
 
 - Task 1: `571b987` (pushed). Backend suite and frontend build passed. `/media` now rebuilds from a saved dub track, falls back to the browser-ready original, then returns a structured 409. Logs include failed path, byte size, and ffprobe stderr. UI displays the reason with Retry. Zero-byte, truncated, and exhausted-fallback tests added.
+- Task 2: `5b7576a` (pushed). Backend suite and frontend build passed. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
+- Task 3: `1b309d2` (pushed). Backend suite and frontend build passed. Jobs persist transcription cache, term fixes, clips per language, and exports to SQLite plus an atomic checkpoint file. Startup marks running work interrupted, Resume queues it, and SIGTERM stops the runner at the next checkpoint. Added restart/resume test proving a saved transcript and clip take are reused.
+- Task 4: implementation complete and verified (backend suite passed; frontend build passed); commit/push in progress. Project listings expose the latest job stage/error; no-clip jobs fail explicitly, and the editor provides Processing, Interrupted/Resume, and Failed/Retry states instead of an empty Review.
 
 ### Current task
 
-- Task 2: `5b7576a` (pushed). Backend suite and frontend build passed. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
-- Task 3: implementation complete and verified (backend suite passed; frontend build passed); commit/push in progress. Jobs persist transcription cache, term fixes, clips per language, and exports to SQLite plus an atomic checkpoint file. Startup marks running work interrupted, Resume queues it, and SIGTERM stops the runner at the next checkpoint. Added restart/resume test proving a saved transcript and clip take are reused.
+- Commit and push Task 4.
 
 ### Next task
 
-- Task 4: project status states in the editor; never present zero clips as completed Review.
+- Task 5: log timing configuration and enabled provider names at startup; flag Railway overrides of code defaults without logging values.
 
 ### Decisions
 

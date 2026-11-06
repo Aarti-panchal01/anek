@@ -48,6 +48,25 @@ def test_settings_and_usage_are_derived_from_config_and_database(monkeypatch):
         assert usage["spent"] == 17
 
 
+def test_project_list_includes_latest_job_status_stage_and_error(monkeypatch):
+    with _sandbox(monkeypatch):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Job status", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO jobs(id,project_id,kind,state,stage,error) VALUES(?,?,?,?,?,?)",
+                ("job-status", project["id"], "dub", "failed", "transcribing", "ASR failed"),
+            )
+
+        listed = _resolve(app_module.list_projects())
+        result = next(item for item in listed if item["id"] == project["id"])
+
+        assert result["job_state"] == "failed"
+        assert result["job_stage"] == "transcribing"
+        assert result["job_error"] == "ASR failed"
+
+
 def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(

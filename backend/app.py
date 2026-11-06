@@ -598,7 +598,11 @@ async def usage_ledger(
 @app.get("/api/projects")
 async def list_projects() -> list[dict]:
     with db.connect() as connection:
-        rows = connection.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+        rows = connection.execute(
+            "SELECT p.*,j.state AS job_state,j.stage AS job_stage,j.error AS job_error "
+            "FROM projects p LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE project_id=p.id ORDER BY created_at DESC LIMIT 1) "
+            "ORDER BY p.created_at DESC"
+        ).fetchall()
     return [{**dict(row), "target_langs": json.loads(row["target_langs_json"])} for row in rows]
 
 
@@ -1283,6 +1287,9 @@ async def run_job(job_id: str) -> None:
                             connection.execute("INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)", (clip_id, project["id"], clip["clip"]-1, clip["start_s"], clip["end_s"], clip["source_cleaned"]))
                         persist_generated_dub(connection, clip_id, lang, clip)
         with db.connect() as connection:
+            clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project["id"],)).fetchone()[0]
+            if clip_count == 0:
+                raise ValueError("Processing finished without creating any clips.")
             connection.execute("UPDATE jobs SET state='complete',stage='complete',done=total,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             connection.execute("UPDATE projects SET status='complete' WHERE id=?", (project["id"],))
     except JobInterrupted as error:
@@ -1332,11 +1339,13 @@ async def resume_job(request: Request, project_id: str, background: BackgroundTa
     project_row(project_id)
     with db.connect() as connection:
         job = connection.execute(
-            "SELECT id FROM jobs WHERE project_id=? AND state='interrupted' ORDER BY created_at DESC LIMIT 1",
+            "SELECT j.id,j.state FROM jobs j WHERE j.project_id=? AND (j.state IN ('interrupted','failed') "
+            "OR (j.state='complete' AND (SELECT COUNT(*) FROM clips WHERE project_id=j.project_id)=0)) "
+            "ORDER BY j.created_at DESC LIMIT 1",
             (project_id,),
         ).fetchone()
         if job is None:
-            raise HTTPException(409, "There is no interrupted job to resume")
+            raise HTTPException(409, "There is no interrupted or failed job to resume")
         connection.execute("UPDATE jobs SET state='pending',stage='queued',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job["id"],))
         connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
     background.add_task(schedule_job, job["id"])
