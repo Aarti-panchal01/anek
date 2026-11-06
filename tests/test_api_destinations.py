@@ -1,7 +1,6 @@
 import json
-import sqlite3
 import tempfile
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -793,7 +792,7 @@ def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypa
         assert tuple(dub_row) == ("अनुवाद सुरक्षित", None)
 
 
-def test_delete_all_user_data_clears_files_database_and_llm_cache(monkeypatch):
+def test_delete_all_user_data_clears_files_and_database(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Disposable privacy test", source_lang="en-IN", target_langs=["hi-IN"],
@@ -803,19 +802,9 @@ def test_delete_all_user_data_clears_files_database_and_llm_cache(monkeypatch):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("disposable test data", encoding="utf-8")
 
-        cache_path = data_root / "llm_response_cache.sqlite3"
-        with closing(sqlite3.connect(cache_path)) as connection, connection:
-            connection.execute("CREATE TABLE llm_responses (cache_key TEXT PRIMARY KEY, response_json TEXT NOT NULL, created_at REAL NOT NULL)")
-            connection.execute("INSERT INTO llm_responses VALUES(?,?,?)", ("key", '{"translation":"private test phrase"}', 1.0))
-        monkeypatch.setattr(app_module, "settings", app_module.settings.model_copy(update={
-            "anek_data_dir": str(data_root), "llm_cache_path": str(cache_path),
-        }))
-
         result = _resolve(app_module.delete_all_user_data())
 
-        assert result == {"deleted": True, "llm_response_cache_cleared": True}
+        assert result == {"deleted": True}
         assert all(not (data_root / folder).exists() for folder in ("uploads", "exports", "voices"))
         with db.connect() as connection:
             assert connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0] == 0
-        with closing(sqlite3.connect(cache_path)) as connection:
-            assert connection.execute("SELECT COUNT(*) FROM llm_responses").fetchone()[0] == 0

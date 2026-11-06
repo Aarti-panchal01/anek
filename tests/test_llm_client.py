@@ -1,418 +1,122 @@
-import logging
-import uuid
-from pathlib import Path
+import json
 
-import httpx
 import pytest
 
 from backend.clients.llm import (
-    CircuitBreakerLLMClient,
-    FallbackLLMClient,
-    LiveLLMClient,
-    create_translation_client,
-    create_workflow_client,
+    BadInputError,
+    ProviderError,
+    RateLimitedError,
+    SarvamTranslationClient,
+    SharedSarvamLimiter,
+    UnsupportedLanguageError,
+    _provider_call,
 )
-from backend.config import Settings
 
 
-def _settings(cache_path, keys="key-one,key-two"):
-    return Settings(
-        llm_base_url="https://example.invalid/v1",
-        llm_model="test-model",
-        groq_api_keys=keys,
-        llm_2_api_key="",
-        llm_2_api_keys="",
-        sarvam_api_key="",
-        llm_cache_path=str(cache_path),
-    )
+@pytest.fixture(autouse=True)
+def reset_provider_breaker():
+    SharedSarvamLimiter._unavailable_until = 0.0
+    SharedSarvamLimiter._starts.clear()
+    yield
+    SharedSarvamLimiter._unavailable_until = 0.0
 
 
-def _response(status, body, headers=None):
-    return httpx.Response(
-        status,
-        json=body,
-        headers=headers,
-        request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
-    )
+def _client():
+    client = SarvamTranslationClient.__new__(SarvamTranslationClient)
+    client.translation_model = "mayura:v1"
+    client.rewrite_model = "sarvam-105b-conversations"
+    client.model = client.translation_model
+    client.models_used = []
+    return client
 
 
-@pytest.fixture
-def cache_path():
-    directory = Path("data")
-    directory.mkdir(exist_ok=True)
-    path = directory / f"test-llm-cache-{uuid.uuid4().hex}.sqlite3"
-    yield path
-    path.unlink(missing_ok=True)
-
-
-def test_quota_response_rotates_key_and_success_is_cached(cache_path, monkeypatch, caplog):
-    client = LiveLLMClient(_settings(cache_path), raise_on_quota=False)
-    calls = []
-
-    def post(url, headers, json, timeout):
-        calls.append(headers["Authorization"])
-        if len(calls) == 1:
-            return _response(
-                429,
-                {"error": {"type": "tokens", "code": "rate_limit_exceeded", "message": "quota"}},
-                {"Retry-After": "0"},
-            )
-        return _response(200, {"choices": [{"message": {"content": '{"answer":"ok"}'}}]})
-
-    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
-    caplog.set_level(logging.INFO, logger="backend.clients.llm")
-    messages = [{"role": "user", "content": "same request"}]
-
-    assert client.chat_json(messages) == {"answer": "ok"}
-    assert calls == ["Bearer key-one", "Bearer key-two"]
-    assert "key index 2 answered" in caplog.text
-    assert "key-one" not in caplog.text and "key-two" not in caplog.text
-
-    second_client = LiveLLMClient(_settings(cache_path))
-    assert second_client.chat_json(messages) == {"answer": "ok"}
-    assert len(calls) == 2
-
-
-def test_quota_opens_model_circuit_instead_of_retrying_next_clip(cache_path, monkeypatch):
-    client = CircuitBreakerLLMClient(LiveLLMClient(_settings(cache_path)))
-    calls = []
-
-    def post(url, headers, json, timeout):
-        calls.append(headers["Authorization"])
-        return _response(429, {"error": {"code": "rate_limit_exceeded", "message": "quota"}})
-
-    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
-    with pytest.raises(RuntimeError, match="quota or rate-limit"):
-        client.chat_json([{"role": "user", "content": "quota test"}])
-    with pytest.raises(Exception, match="cooling down"):
-        client.chat_json([{"role": "user", "content": "quota test"}])
-    assert calls == ["Bearer key-one"]
-
-
-def test_gemini_is_last_translation_fallback_after_groq_fails(
-    cache_path, monkeypatch, caplog
-):
-    settings = Settings(
-        llm_base_url="https://groq.example/v1",
-        llm_model="groq-model",
-        groq_api_keys="groq-key",
-        llm_2_base_url="https://gemini.example/v1",
-        llm_2_model="gemini-model",
-        llm_2_api_keys="gemini-key-1,gemini-key-2",
-        llm_2_fallback_models="gemini-backup",
-        sarvam_api_key="",
-        llm_cache_path=str(cache_path),
-    )
-    gemini_calls = []
-
-    def post(url, headers, json, timeout):
-        gemini_calls.append((url, headers["Authorization"]))
-        return _response(
-            429,
-            {"error": {"code": "rate_limit_exceeded", "message": "quota exceeded"}},
-            {"Retry-After": "60"},
-        )
-
-    class Groq:
-        model = "groq-model"
-
-        def chat_json(self, messages):
-            raise RuntimeError("Groq unavailable")
-
-    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
-    caplog.set_level(logging.WARNING, logger="backend.clients.llm")
-    client = create_translation_client(Groq(), settings)
-
-    with pytest.raises(RuntimeError):
-        client.chat_json([{"role": "user", "content": "translate this"}])
-    assert [auth for _, auth in gemini_calls] == ["Bearer gemini-key-1", "Bearer gemini-key-2"]
-    assert all(url.startswith("https://gemini.example/") for url, _ in gemini_calls)
-    assert "QuotaPoolExhausted" in caplog.text
-    assert "gemini-key-1" not in caplog.text and "gemini-key-2" not in caplog.text
-
-
-def test_all_six_cooling_down_waits_for_the_shortest(cache_path, monkeypatch):
-    client = LiveLLMClient(_settings(cache_path, ",".join(f"key-{i}" for i in range(6))))
-    now = [10.0]
-    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: now[0])
-    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda delay: now.__setitem__(0, now[0] + delay))
-    client.cooldowns = {index: 30.0 + index for index in range(6)}
-
-    assert client._available_key_index() == 0
-    assert now[0] == 30.0
-
-
-def test_invalid_key_is_skipped_without_logging_secret(monkeypatch, caplog):
-    cache_path = Path("data") / f"test-llm-cache-{uuid.uuid4().hex}.sqlite3"
-    client = LiveLLMClient(_settings(cache_path))
-    calls = []
-
-    def post(url, headers, json, timeout):
-        calls.append(headers["Authorization"])
-        if len(calls) == 1:
-            return _response(401, {"error": {"code": "invalid_api_key", "message": "Invalid API Key"}})
-        return _response(200, {"choices": [{"message": {"content": '{"answer":"ok"}'}}]})
-
-    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
-    caplog.set_level(logging.ERROR, logger="backend.clients.llm")
-    assert client.chat_json([{"role": "user", "content": "invalid key test"}]) == {"answer": "ok"}
-    assert calls == ["Bearer key-one", "Bearer key-two"]
-    assert "key index 1" in caplog.text
-    assert "key-one" not in caplog.text and "key-two" not in caplog.text
-    client.cache_path.unlink(missing_ok=True)
-
-
-def test_transient_service_error_retries_same_key(cache_path, monkeypatch, caplog):
-    client = LiveLLMClient(_settings(cache_path))
-    calls = []
-
-    def post(url, headers, json, timeout):
-        calls.append(headers["Authorization"])
-        if len(calls) == 1:
-            return _response(503, {"error": {"message": "temporarily unavailable"}})
-        return _response(200, {"choices": [{"message": {"content": '{"answer":"ok"}'}}]})
-
-    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
-    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda delay: None)
-    caplog.set_level(logging.WARNING, logger="backend.clients.llm")
-
-    assert client.chat_json([{"role": "user", "content": "transient retry"}]) == {"answer": "ok"}
-    assert calls == ["Bearer key-one", "Bearer key-one"]
-    assert "same key" in caplog.text
-    assert "key-one" not in caplog.text and "key-two" not in caplog.text
-
-
-def test_persistent_service_error_raises_after_one_retry_and_falls_back(cache_path, monkeypatch):
-    primary = LiveLLMClient(_settings(cache_path, keys="gemini-key"))
-    secondary = LiveLLMClient(_settings(cache_path, keys="groq-key"))
-    calls = []
-
-    def post(url, headers, json, timeout):
-        calls.append(headers["Authorization"])
-        if headers["Authorization"] == "Bearer gemini-key":
-            return _response(503, {"error": {"message": "provider unavailable"}})
-        return _response(200, {"choices": [{"message": {"content": '{"answer":"fallback"}'}}]})
-
-    monkeypatch.setattr("backend.clients.llm.httpx.post", post)
-    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda delay: None)
-    result = FallbackLLMClient(primary, secondary).chat_json([{"role": "user", "content": "fallback after outage"}])
-
-    assert result == {"answer": "fallback"}
-    assert calls == ["Bearer gemini-key", "Bearer gemini-key", "Bearer groq-key"]
-
-
-def test_retry_delay_parses_groq_retry_time_and_quota_error():
-    response = _response(
-        429,
-        {"error": {"type": "tokens", "code": "rate_limit_exceeded", "message": "Please try again in 3m13.5s."}},
-    )
-    assert LiveLLMClient._retry_delay(response) == 193.5
-    quota = _response(402, {"error": {"code": "insufficient_quota", "message": "quota exceeded"}})
-    assert LiveLLMClient._is_quota_error(quota)
-
-
-def test_provider_fallback_order_for_translation_and_other_workflow_calls(monkeypatch):
-    settings = Settings(
-        llm_base_url="https://groq.example/v1",
-        llm_model="groq-model",
-        groq_api_keys="groq-key",
-        llm_2_base_url="https://gemini.example/v1",
-        llm_2_model="gemini-model",
-        llm_2_api_keys="gemini-key-1,gemini-key-2",
-        llm_2_fallback_models="gemini-backup-a,gemini-backup-b",
-        sarvam_api_key="",
-        llm_cache_path=str(Path("data") / f"provider-fallback-{uuid.uuid4().hex}.sqlite3"),
-    )
-
-    class Provider:
-        def __init__(self, provider_settings, **kwargs):
-            self.model = provider_settings.llm_model
-            self.keys = provider_settings.groq_api_keys
-            self.fallback_on_quota = kwargs.get("fallback_on_quota", False)
-
-        def chat_json(self, messages):
-            if self.model == "groq-model":
-                raise RuntimeError("organization restricted")
-            return {"provider": self.model}
-
-    monkeypatch.setattr("backend.clients.llm.LiveLLMClient", Provider)
-    groq = Provider(settings)
-
-    translation = create_translation_client(groq, settings)
-    assert isinstance(translation, FallbackLLMClient)
-    assert isinstance(translation.primary, CircuitBreakerLLMClient)
-    assert translation.primary.client is groq
-    assert isinstance(translation.secondary, FallbackLLMClient)
-    assert translation.secondary.primary.model == "gemini-model"
-    assert translation.secondary.primary.fallback_on_quota is True
-    assert translation.secondary.secondary.primary.model == "gemini-backup-a"
-    assert translation.secondary.secondary.secondary.model == "gemini-backup-b"
-
-    workflow = create_workflow_client(groq, settings)
-    assert isinstance(workflow, FallbackLLMClient)
-    assert isinstance(workflow.primary, CircuitBreakerLLMClient)
-    assert workflow.primary.client is groq
-    assert isinstance(workflow.secondary, FallbackLLMClient)
-    assert workflow.secondary.primary.model == "gemini-model"
-    assert workflow.chat_json([{"role": "user", "content": "check"}]) == {"provider": "gemini-model"}
-
-
-def test_failed_model_is_skipped_for_five_minutes(monkeypatch):
-    now = [1000.0]
-    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: now[0])
-
-    class FailingProvider:
-        model = f"failing-{uuid.uuid4().hex}"
-        calls = 0
-
-        def chat_json(self, _messages):
-            self.calls += 1
-            raise RuntimeError("temporary provider failure")
-
-    class FallbackProvider:
-        model = f"fallback-{uuid.uuid4().hex}"
-
-        def chat_json(self, _messages):
-            return {"provider": self.model}
-
-    failing = FailingProvider()
-    wrapped = CircuitBreakerLLMClient(failing)
-    chain = FallbackLLMClient(wrapped, FallbackProvider())
-    messages = [{"role": "user", "content": "test"}]
-
-    first = chain.chat_json(messages)
-    second = chain.chat_json(messages)
-    assert first == second
-    assert failing.calls == 1
-
-    now[0] += 301
-    chain.chat_json(messages)
-    assert failing.calls == 2
-
-
-def test_sarvam_translation_uses_mayura_for_target_text(monkeypatch):
-    from backend.clients.llm import SarvamTranslationClient
-    import json
-
+def test_sarvam_translation_uses_mayura_and_returns_three_candidate_sets(monkeypatch):
     calls = []
 
     class Text:
         def translate(self, **kwargs):
             calls.append(kwargs)
-            return type("Translation", (), {"translated_text": "નમસ્તે"})()
+            return type("Translation", (), {"translated_text": "ನಮಸ್ಕಾರ"})()
 
-    client = SarvamTranslationClient.__new__(SarvamTranslationClient)
-    client.translation_model = "mayura:v1"
-    client.rewrite_model = "sarvam-105b"
-    client.model = client.translation_model
-    client.models_used = []
+    client = _client()
     client.client = type("Sarvam", (), {"text": Text()})()
-    result = client.chat_json([
-        {"role": "system", "content": "Translate the full source paragraph."},
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    response = client.chat_json([
+        {"role": "system", "content": "Translate the full source paragraph"},
         {"role": "user", "content": json.dumps({
-            "source_language": "en-IN", "target_language": "gu-IN", "tone": "everyday spoken",
-            "timed_source_spans": [{"source_text": "Hello."}],
+            "source_language": "en-IN", "target_language": "kn-IN",
+            "timed_source_spans": [{"source_text": "Hello"}, {"source_text": "World"}],
         })},
     ])
-
-    assert [candidate["translations"] for candidate in result["candidates"]] == [["નમસ્તે"]] * 3
+    assert len(calls) == 2
     assert calls[0]["model"] == "mayura:v1"
-    assert calls[0]["mode"] == "modern-colloquial"
-    assert calls[0]["request_options"]["max_retries"] == 0
+    assert calls[0]["target_language_code"] == "kn-IN"
+    assert len(response["candidates"]) == 3
+    assert all(len(candidate["translations"]) == 2 for candidate in response["candidates"])
 
 
-def test_mocked_sarvam_failure_opens_model_circuit_for_five_minutes(monkeypatch):
-    from backend.clients.llm import ModelCircuitOpen, SarvamTranslationClient
-    import json
-
-    now = [1000.0]
-    calls = []
-    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: now[0])
-
-    class Completions:
-        def __call__(self, **_kwargs):
-            calls.append("call")
-            raise RuntimeError("mock provider outage")
-
-    client = SarvamTranslationClient.__new__(SarvamTranslationClient)
-    client.translation_model = "mayura:v1"
-    client.rewrite_model = f"mock-rewrite-{uuid.uuid4().hex}"
-    client.model = client.translation_model
-    client.models_used = []
-    client.client = type("Sarvam", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+def test_sarvam_rejects_unsupported_language_before_request():
+    client = _client()
+    client.client = type("Sarvam", (), {})()
     messages = [
-        {"role": "system", "content": "Return a JSON object."},
-        {"role": "user", "content": json.dumps({"check": True})},
+        {"role": "system", "content": "Translate the full source paragraph"},
+        {"role": "user", "content": json.dumps({"target_language": "xx-XX", "timed_source_spans": []})},
     ]
-
-    with pytest.raises(RuntimeError, match="mock provider outage"):
+    with pytest.raises(UnsupportedLanguageError):
         client.chat_json(messages)
-    with pytest.raises(ModelCircuitOpen):
-        client.chat_json(messages)
-    assert calls == ["call"]
-
-    now[0] += 301
-    with pytest.raises(RuntimeError, match="mock provider outage"):
-        client.chat_json(messages)
-    assert calls == ["call", "call"]
 
 
-def test_sarvam_is_first_then_groq_then_gemini(monkeypatch):
-    from backend.clients.llm import SarvamTranslationClient
+def test_shared_provider_retry_classifies_rate_limit_and_recovers(monkeypatch):
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda _: None)
+    monkeypatch.setattr("backend.clients.llm.random.uniform", lambda *_: 0)
 
-    settings = _settings(Path("data") / f"sarvam-chain-{uuid.uuid4().hex}.sqlite3")
-    settings.sarvam_api_key = "sarvam-key"
-    settings.llm_2_api_key = "gemini-key"
-    settings.llm_2_model = "gemini-chain-test"
+    class TooManyRequests(Exception):
+        status_code = 429
+
+    attempts = 0
+
+    def request():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise TooManyRequests()
+        return "ok"
+
+    assert _provider_call(request) == "ok"
+    assert attempts == 3
+
+
+@pytest.mark.parametrize(("status", "error"), [(429, RateLimitedError), (503, ProviderError), (400, BadInputError)])
+def test_provider_errors_have_clear_classes_and_no_secret_text(monkeypatch, status, error):
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr("backend.clients.llm.time.sleep", lambda _: None)
+
+    class HttpError(Exception):
+        status_code = status
+
+    with pytest.raises(error):
+        _provider_call(lambda: (_ for _ in ()).throw(HttpError("private provider response")))
+
+
+def test_mocked_failing_provider_opens_five_minute_circuit(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: now[0])
     calls = []
 
-    class Sarvam:
-        model = "sarvam-chain-test"
+    class ProviderUnavailable(Exception):
+        status_code = 503
 
-        def __init__(self, _settings):
-            pass
+    def failing_provider():
+        calls.append(1)
+        raise ProviderUnavailable()
 
-        def chat_json(self, _messages):
-            calls.append("sarvam")
-            raise RuntimeError("Sarvam temporarily unavailable")
-
-    class Provider:
-        def __init__(self, provider_settings, **_kwargs):
-            self.model = provider_settings.llm_model
-
-        def chat_json(self, _messages):
-            calls.append(self.model)
-            if self.model == "test-model":
-                raise RuntimeError("Groq temporarily unavailable")
-            return {"provider": self.model}
-
-    monkeypatch.setattr("backend.clients.llm.SarvamTranslationClient", Sarvam)
-    monkeypatch.setattr("backend.clients.llm.LiveLLMClient", Provider)
-    client = create_translation_client(Provider(settings), settings)
-
-    assert client.chat_json([{"role": "user", "content": "translate"}]) == {"provider": "gemini-chain-test"}
-    assert calls == ["sarvam", "test-model", "gemini-chain-test"]
-
-
-def test_model_fallback_records_model_that_actually_answered(cache_path, monkeypatch):
-    settings = _settings(cache_path, keys="groq-key")
-    settings.llm_2_api_key = "gemini-key"
-    settings.llm_2_api_keys = ""
-    settings.llm_2_model = "gemini-primary"
-    settings.llm_2_fallback_models = "gemini-backup"
-
-    class Provider:
-        def __init__(self, provider_settings, **kwargs):
-            self.model = provider_settings.llm_model
-
-        def chat_json(self, messages):
-            if self.model in {"gemini-primary", "test-model"}:
-                raise RuntimeError("temporary service error")
-            return {"provider": self.model}
-
-    monkeypatch.setattr("backend.clients.llm.LiveLLMClient", Provider)
-    from backend.clients.llm import create_translation_client
-
-    client = create_translation_client(Provider(settings), settings)
-    assert client.chat_json([{"role": "user", "content": "translation"}]) == {"provider": "gemini-backup"}
-    assert client.models_used == ["gemini-backup"]
+    with pytest.raises(ProviderError):
+        _provider_call(failing_provider, attempts=1)
+    with pytest.raises(ProviderError, match="circuit is open"):
+        _provider_call(failing_provider, attempts=1)
+    assert calls == [1]
+    now[0] += 301
+    with pytest.raises(ProviderError):
+        _provider_call(failing_provider, attempts=1)
+    assert calls == [1, 1]

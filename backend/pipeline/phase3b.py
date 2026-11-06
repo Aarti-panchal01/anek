@@ -14,7 +14,6 @@ import wave
 from pathlib import Path
 from collections.abc import Callable
 
-import httpx
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ from backend.brain.termsheet import (
     mask_protected_terms, restore_protected_terms,
 )
 from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import LiveLLMClient, MockLLMClient, create_translation_client, create_workflow_client
+from backend.clients.llm import SarvamTranslationClient, MockLLMClient, SarvamSpeechClient, create_translation_client, create_workflow_client
 from backend.config import LANGUAGES, Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -118,6 +117,19 @@ def assert_timing_invariants(
         previous_end = speech_start + speech_duration
     if export_duration is not None and abs(export_duration - video_duration) > EXPORT_DURATION_TOLERANCE_S:
         raise ValueError("Dubbed export duration differs from source by more than 50 milliseconds")
+
+
+def assert_language_complete(clips: list[dict], source_clip_count: int, video_duration: float) -> None:
+    if len(clips) != source_clip_count:
+        raise ValueError(f"Language clip count {len(clips)} does not match source clip count {source_clip_count}")
+    if any(not str(clip.get("translation", "")).strip() for clip in clips):
+        raise ValueError("Every source clip must have a saved translation before review")
+    chronological = sorted(clips, key=lambda clip: float(clip["start_s"]))
+    if not chronological or abs(float(chronological[0]["start_s"])) > 0.5:
+        raise ValueError("Language clips do not cover the start of the source video")
+    if abs(float(chronological[-1]["end_s"]) - video_duration) > 0.5:
+        raise ValueError("Language clips do not cover the end of the source video")
+    assert_timing_invariants(clips, video_duration)
 
 
 def extract_room_tone(audio_path: Path, work_dir: Path, duration: float) -> tuple[Path | None, dict | None]:
@@ -265,7 +277,7 @@ def create_srt(clips: list[dict]) -> str:
     return "\n\n".join(cues) + "\n"
 
 
-def prompt_json(client: LiveLLMClient, system: str, payload: dict) -> dict:
+def prompt_json(client: SarvamTranslationClient | MockLLMClient, system: str, payload: dict) -> dict:
     return client.chat_json([
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -673,6 +685,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             raise ValueError("Regeneration clip index is outside the saved segment map")
         prior_clip = prior_rows[only_clip_index]
     gnani = LiveGnaniClient(settings)
+    sarvam_stt = SarvamSpeechClient(settings)
     checkpoint_state = resume_state if resume_state is not None else {}
 
     def checkpoint(stage: str) -> None:
@@ -690,11 +703,11 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         cache_key = json.dumps([digest, language, model, options], sort_keys=True, ensure_ascii=False)
         if cache_key not in stt_cache:
             check_continue()
-            stt_cache[cache_key] = gnani.stt(audio, language, model, **options)
+            stt_cache[cache_key] = sarvam_stt.stt(audio, language_code=language, **options)
             checkpoint("transcript")
         return stt_cache[cache_key]
 
-    llm = MockLLMClient() if settings.llm_mock else LiveLLMClient(settings)
+    llm = MockLLMClient() if settings.llm_mock else SarvamTranslationClient(settings)
     workflow_llm = create_workflow_client(llm, settings)
     translator = create_translation_client(llm, settings)
     all_outputs = []
@@ -709,13 +722,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         run_command(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(source_wav)])
         room_tone_path, room_tone_span = extract_room_tone(source_wav, work, duration)
         source_silence_spans = detected_silence_spans(source_wav, duration)
-        source_stt_model = settings.stt_model
-        if source_stt_model not in {"prisma-v2.5", "prisma-v3.0"}:
-            raise ValueError("STT_MODEL must be prisma-v2.5 or prisma-v3.0")
-        if source_language == "auto" and source_stt_model != "prisma-v3.0":
-            raise ValueError("Automatic source-language detection requires STT_MODEL=prisma-v3.0")
-        stt_language = "indic-auto" if source_language == "auto" else source_language
-        source_format = "codemix" if source_stt_model == "prisma-v3.0" else "verbatim"
+        source_stt_model = "saaras:v3"
+        stt_language = "unknown" if source_language == "auto" else source_language
+        source_format = "transcribe"
         resumed_term_fixes = checkpoint_state.get("term_fixes")
         if prior_clip is not None:
             source_lang = prior_report.get("source_language", source_language)
@@ -776,46 +785,11 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     for item in term_sheet.terms
                 ):
                     term_sheet.terms.append(validated)
-            keyterms = list(dict.fromkeys(
-                term.term for term in term_sheet.terms
-                if term.type in {"brand", "person", "place"} and term.term.strip()
-            ))[:200]
-            plain_variant = "prisma_v3_plain" if source_stt_model == "prisma-v3.0" else "prisma_v2_5_plain"
             for index, row in enumerate(source_chunks):
-                variants = {plain_variant: row["raw"]}
-                comparison_errors = []
-                if source_stt_model == "prisma-v3.0" and row.get("lang") in LANGUAGES:
-                    v25_path = work / f"source_v25_{index:02d}.wav"
-                    run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(row["start"]), "-t", str(row["end"]-row["start"]), "-ac", "1", "-ar", "16000", str(v25_path)])
-                    try:
-                        v25 = cached_stt(v25_path.read_bytes(), row["lang"], "prisma-v2.5", format="verbatim")["transcript"]
-                        variants["prisma_v2_5"] = v25
-                    except httpx.HTTPStatusError as exc:
-                        comparison_errors.append(f"Speech recognition comparison unavailable: HTTP {exc.response.status_code}")
-                if source_stt_model == "prisma-v3.0" and keyterms:
-                    keyed_chunk = work / f"source_keyterms_{index:02d}.wav"
-                    run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(row["start"]), "-t", str(row["end"]-row["start"]), "-ac", "1", "-ar", "16000", str(keyed_chunk)])
-                    try:
-                        hinted = cached_stt(keyed_chunk.read_bytes(), stt_language, source_stt_model,
-                                           keyterms=keyterms, format=source_format)["transcript"]
-                        variants["prisma_v3_keyterms"] = hinted
-                    except httpx.HTTPStatusError as exc:
-                        comparison_errors.append(f"Speech recognition comparison unavailable: HTTP {exc.response.status_code}")
-                plain = row["raw"]
-                disagreement_records = []
-                for variant_name, variant_text in variants.items():
-                    if variant_name != plain_variant and plain.strip().casefold() != variant_text.strip().casefold():
-                        disagreement_records.append({
-                            "variant": variant_name,
-                            "word_differences": transcript_word_differences(plain, variant_text),
-                            "alternative_transcript": variant_text,
-                        })
                 row["stt_review"] = {
-                    "selected_transcript": plain_variant,
-                    "variants": variants,
-                    "keyterms_used": keyterms if "prisma_v3_keyterms" in variants else [],
-                    "disagreements": disagreement_records,
-                    "comparison_errors": comparison_errors,
+                    "selected_transcript": "saaras_v3",
+                    "variants": {"saaras_v3": row["raw"]},
+                    "disagreements": [],
                 }
             cleaned_rows = []
             source_context = " ".join(row["raw"] for row in source_chunks)
@@ -948,6 +922,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 selected = restore_protected_terms(translated_by_index[index], protected_maps[index])[0]
                 protected_missing = restore_protected_terms(translated_by_index[index], protected_maps[index])[1]
                 selection_reason = paragraph_selection_reason
+                selected_index = 0
+                candidates = [selected]
                 if preserve_translation and translation_override:
                     selected = translation_override
                     protected_missing = [
@@ -1132,7 +1108,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                 if recovery_step:
                     LOGGER.info("Timing recovery for %s clip %s: %s", target_lang, clip_index + 1, recovery_step)
-                transcript = cached_stt(sentence_audio.read_bytes(), target_lang, settings.verify_stt_model, format="transcribe")
+                transcript = cached_stt(sentence_audio.read_bytes(), target_lang, "saaras:v3", format="transcribe")
                 audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
                 translation_checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
                 meaning_check_failed = False
@@ -1155,10 +1131,6 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 if any("uncertain source retained" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):
                     reasons.append("Uncertain source wording was kept as transcribed; review before publishing.")
                 stt_review = row.get("stt_review", {})
-                if stt_review.get("disagreements"):
-                    reasons.append("Speech recognition transcript variants disagree; review the alternatives.")
-                if stt_review.get("comparison_errors"):
-                    reasons.extend(stt_review["comparison_errors"])
                 if any("cleanup rejected" in item.get("reason", "").casefold() for item in row["cleanup_changes"]):
                     reasons.append("Source cleanup exceeded the clip span and was discarded; review the ASR transcript.")
                 if spill_used:
@@ -1175,9 +1147,6 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     reasons.append(f"A complete sentence span required {slot:.2f}s, above the 8s hard maximum.")
                 if room_tone_path is None:
                     reasons.append("No silent source stretch was detected; room tone was not mixed.")
-                used_translation_models = list(dict.fromkeys(getattr(translator, "models_used", [])))
-                if settings.llm_model in used_translation_models:
-                    reasons.append("A fallback translator was used, so back-translation is not an independent check.")
                 status = "red" if audio_flag["status"] == "red" or withheld or bool(translation_checks) or selection_needs_review or meaning_check_failed else "yellow" if reasons or stretched else "green"
                 language_rows.append({
                     "clip": clip_index + 1, "start_s": row["start"], "end_s": row["end"],
@@ -1243,6 +1212,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         run_command(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", f"{slot:.6f}", "-c:a", "pcm_s16le", str(retained["timeline_audio_path"])])
                     merged_rows.append(retained)
                 language_rows = merged_rows
+            assert_language_complete(language_rows, len(cleaned_rows), duration)
             track_files = mux_outputs(video, language_rows, final_path, duration, work, settings, room_tone_path, source_wav, output_dir, target_lang)
             report = build_report(target_lang, [{key: val for key, val in row.items() if key not in {"audio_path", "timeline_audio_path"}} for row in language_rows], settings)
             report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "overrun_tolerance_s": OVERRUN_TOLERANCE_S, "retry_under_slot_ratio": 0.75, "max_speed_change": MAX_ATEMPO_SPEEDUP, "overflow_policy": "shorter translation, up to 15% speed-up, fixed-pause trim, then spill into detected silent gaps; withhold only if speech would overlap", "sentence_pause_s": 0.16}})

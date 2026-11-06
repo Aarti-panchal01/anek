@@ -42,7 +42,6 @@ from backend.atomic_files import (
 )
 from backend.brain.checks import run_checks
 from backend.clients.gnani import create_gnani_client
-from backend.clients.llm import clear_response_cache
 from backend.brain.termsheet import TermSheet
 from backend.config import LANGUAGES, get_settings
 from backend.pipeline.phase3b import MAX_ATEMPO_SPEEDUP, OVERRUN_TOLERANCE_S, run_quality_pass
@@ -132,16 +131,9 @@ def log_runtime_configuration(config=settings, environment: dict[str, str] | Non
     elif config.gnani_api_key:
         providers.append("Gnani")
     if config.llm_mock:
-        providers.append("LLM (mock)")
-    else:
-        if config.sarvam_api_key:
-            providers.append("Sarvam")
-        if config.groq_api_keys:
-            providers.append("Groq")
-        elif config.llm_api_key:
-            providers.append("Primary LLM")
-        if config.llm_2_api_keys or config.llm_2_api_key:
-            providers.append("Gemini")
+        providers.append("Sarvam (mock)")
+    elif config.sarvam_api_key:
+        providers.append("Sarvam")
     LOGGER.info("Enabled providers: %s", ", ".join(providers) if providers else "none")
     overrides = [name for name in ("FIT_TOLERANCE", "MAX_STRETCH") if name in env]
     railway = any(name in env for name in ("RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "RAILWAY_SERVICE_ID"))
@@ -897,10 +889,32 @@ async def project_summary(project_id: str) -> dict:
             "SELECT id,kind,lang,state,stage,done,total,error,created_at,updated_at "
             "FROM jobs WHERE project_id=? ORDER BY created_at DESC", (project_id,)
         ).fetchall()
+        checkpoint_row = connection.execute(
+            "SELECT checkpoint_json FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)
+        ).fetchone()
+        language_counts = connection.execute(
+            "SELECT d.lang,COUNT(*) AS total,SUM(CASE WHEN TRIM(d.translation)<>'' THEN 1 ELSE 0 END) AS translated "
+            "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id WHERE c.project_id=? GROUP BY d.lang", (project_id,),
+        ).fetchall()
+    checkpoint = json.loads(checkpoint_row["checkpoint_json"] or "{}") if checkpoint_row else {}
+    expected = len((checkpoint.get("term_fixes") or {}).get("cleaned_rows") or [])
+    language_status = {}
+    counts_by_language = {row["lang"]: row for row in language_counts if row["lang"]}
+    for lang in json.loads(project["target_langs_json"]):
+        row = counts_by_language.get(lang)
+        count = int(row["total"] or 0) if row else 0
+        translated = int(row["translated"] or 0) if row else 0
+        complete = bool((expected or clip_count) and count == (expected or clip_count) and translated == count)
+        reason = (checkpoint.get("language_errors") or {}).get(lang)
+        language_status[lang] = {
+            "status": "complete" if complete else "failed" if reason and project["status"] == "failed" else "processing" if project["status"] == "processing" else "pending",
+            "completed_clips": translated, "total_clips": expected or clip_count, "error": reason,
+        }
     return {
         "project": {**project, "target_langs": json.loads(project["target_langs_json"])},
         "clips": {"total": int(clip_count), "dub_rows": int(counts["total"] or 0),
                   **{key: int(counts[key] or 0) for key in ("green", "yellow", "red")}},
+        "language_status": language_status,
         "jobs": [dict(row) for row in jobs],
     }
 
@@ -1765,10 +1779,21 @@ async def run_job(job_id: str) -> None:
             # Missing translations are regenerated from the saved source clip below.
             translation_override = dub["translation"] if dub else None
             preserve_translation = bool(dub and dub["human_edited"])
-        targets = ([job["lang"]] if job["kind"] in {"regenerate", "regenerate_clip"} and job["lang"] else json.loads(project["target_langs_json"]))
+        targets = ([job["lang"]] if job["kind"] in {"regenerate", "regenerate_clip", "retry_language"} and job["lang"] else json.loads(project["target_langs_json"]))
         completed = set()
         with db.connect() as connection:
-            completed = {row["lang"] for row in connection.execute("SELECT DISTINCT lang FROM dubs WHERE clip_id IN (SELECT id FROM clips WHERE project_id=?)", (project["id"],)).fetchall()}
+            saved_clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project["id"],)).fetchone()[0]
+            checkpoint_clip_count = len((checkpoint_state.get("term_fixes") or {}).get("cleaned_rows") or [])
+            expected_clip_count = checkpoint_clip_count or saved_clip_count
+            if expected_clip_count:
+                complete_rows = connection.execute(
+                    "SELECT d.lang,COUNT(*) AS total,SUM(CASE WHEN TRIM(d.translation)<>'' THEN 1 ELSE 0 END) AS translated "
+                    "FROM dubs d JOIN clips c ON c.id=d.clip_id WHERE c.project_id=? GROUP BY d.lang",
+                    (project["id"],),
+                ).fetchall()
+                completed = {row["lang"] for row in complete_rows
+                             if int(row["total"] or 0) == expected_clip_count
+                             and int(row["translated"] or 0) == expected_clip_count}
         output_dir = DATA_ROOT / "exports" / project["id"]
         embedding = json.loads(voice["embedding_json"]) if voice else None
         with db.connect() as connection:
@@ -1793,18 +1818,31 @@ async def run_job(job_id: str) -> None:
                     "UPDATE jobs SET stage='transcribing and preparing clips',done=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (job_id,),
                 )
-            # One pass shares video decode, source transcription, cleanup, and
-            # segmentation across the selected languages. Previously each
-            # language repeated the expensive source-audio work.
-            results = await asyncio.to_thread(
-                run_quality_pass,
-                Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, pending_targets,
-                output_dir, settings, job["content_type"], job["translation_style"], embedding,
-                project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
-                only_clip_index=targeted_clip_index, translation_override=translation_override,
-                preserve_translation=preserve_translation, resume_state=checkpoint_state,
-                checkpoint_callback=save_checkpoint, continue_check=check_continue,
-            )
+            # Run languages independently: a provider failure in one language
+            # must not discard a completed language. Transcript checkpoints are shared.
+            results = []
+            language_errors = checkpoint_state.setdefault("language_errors", {})
+            for target_lang in pending_targets:
+                checkpoint_state["current_language"] = target_lang
+                try:
+                    language_results = await asyncio.to_thread(
+                        run_quality_pass,
+                        Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, [target_lang],
+                        output_dir, settings, job["content_type"], job["translation_style"], embedding,
+                        project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
+                        only_clip_index=targeted_clip_index, translation_override=translation_override,
+                        preserve_translation=preserve_translation, resume_state=checkpoint_state,
+                        checkpoint_callback=save_checkpoint, continue_check=check_continue,
+                    )
+                    results.extend(language_results)
+                    language_errors.pop(target_lang, None)
+                except JobInterrupted:
+                    raise
+                except Exception as exc:
+                    language_errors[target_lang] = str(exc)[:500]
+                    checkpoint_state["current_language"] = target_lang
+                    save_checkpoint("language_failed", checkpoint_state)
+                    LOGGER.exception("Language %s failed for project %s", target_lang, project["id"])
             for result_index, result in enumerate(results):
                 lang = result["language"]
                 with db.connect() as connection:
@@ -1829,6 +1867,20 @@ async def run_job(job_id: str) -> None:
             clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project["id"],)).fetchone()[0]
             if clip_count == 0:
                 raise ValueError("Processing finished without creating any clips.")
+            source_count = len((checkpoint_state.get("term_fixes") or {}).get("cleaned_rows") or [])
+            selected_languages = json.loads(project["target_langs_json"])
+            for target_lang in selected_languages:
+                rows = connection.execute(
+                    "SELECT c.idx,d.translation FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? "
+                    "WHERE c.project_id=? ORDER BY c.idx", (target_lang, project["id"]),
+                ).fetchall()
+                expected = source_count or clip_count
+                missing = [row["idx"] + 1 for row in rows if not str(row["translation"] or "").strip()]
+                if len(rows) != expected or missing:
+                    failed_clip = missing[0] if missing else min(len(rows) + 1, expected)
+                    detail = checkpoint_state.get("language_errors", {}).get(target_lang, "translation is missing")
+                    language_name = LANGUAGES.get(target_lang, target_lang)
+                    raise ValueError(f"{language_name} failed on clip {failed_clip}: {detail}")
             connection.execute("UPDATE jobs SET state='complete',stage='complete',done=total,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             connection.execute("UPDATE projects SET status='complete' WHERE id=?", (project["id"],))
     except JobInterrupted as error:
@@ -1890,6 +1942,22 @@ async def resume_job(request: Request, project_id: str, background: BackgroundTa
         connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
     background.add_task(schedule_job, job["id"])
     return {"job_id": job["id"], "state": "pending"}
+
+
+@app.post("/api/projects/{project_id}/retry-language/{lang}", status_code=202)
+async def retry_language(request: Request, project_id: str, lang: str, background: BackgroundTasks) -> dict:
+    enforce_ip_limit(request, "jobs")
+    project = project_row(project_id)
+    if lang not in json.loads(project["target_langs_json"]):
+        raise HTTPException(422, "Language is not a target of this project")
+    with db.connect() as connection:
+        job = connection.execute("SELECT id,state FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
+        if job is None or job["state"] == "running":
+            raise HTTPException(409, "No retryable job is available for this language")
+        connection.execute("UPDATE jobs SET kind='retry_language',lang=?,state='pending',stage='queued',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (lang, job["id"]))
+        connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
+    background.add_task(schedule_job, job["id"])
+    return {"job_id": job["id"], "state": "pending", "lang": lang}
 
 
 @app.get("/api/projects/{project_id}/events")
@@ -2380,7 +2448,6 @@ async def delete_project(project_id: str) -> dict:
 @app.delete("/api/data")
 async def delete_all_user_data() -> dict:
     """Remove local uploads, generated exports, voice references, cached responses and database rows."""
-    clear_response_cache(settings)
     for folder in ("uploads", "exports", "voices"):
         shutil.rmtree(DATA_ROOT / folder, ignore_errors=True)
     with db.connect() as connection:
@@ -2388,7 +2455,7 @@ async def delete_all_user_data() -> dict:
             connection.execute(f"DELETE FROM {table}")
     consent_sessions.clear()
     _rate_events.clear()
-    return {"deleted": True, "llm_response_cache_cleared": True}
+    return {"deleted": True}
 
 
 @app.get("/studio", include_in_schema=False)

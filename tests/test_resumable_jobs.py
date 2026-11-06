@@ -53,6 +53,29 @@ def test_running_job_is_marked_interrupted_and_can_be_resumed(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_failed_language_can_be_retried_independently(monkeypatch):
+    async def scenario():
+        with _sandbox(monkeypatch) as (_, data_root):
+            source = data_root / "uploads" / "language-retry" / "source.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"mock video")
+            project = _resolve(app_module.create_project(app_module.ProjectCreate(
+                name="language retry", source_lang="en-IN", target_langs=["hi-IN", "kn-IN"],
+            )))
+            with db.connect() as connection:
+                connection.execute("UPDATE projects SET video_path=?,duration_s=20,status='failed' WHERE id=?", (str(source), project["id"]))
+                connection.execute("INSERT INTO jobs(id,project_id,kind,lang,state,stage) VALUES(?,?,?,?,?,?)",
+                                   ("language-retry-job", project["id"], "dub", None, "failed", "failed"))
+            tasks = BackgroundTasks()
+            queued = await app_module.retry_language(_request(), project["id"], "kn-IN", tasks)
+            assert queued["lang"] == "kn-IN"
+            assert len(tasks.tasks) == 1
+            with db.connect() as connection:
+                row = connection.execute("SELECT kind,lang,state FROM jobs WHERE id='language-retry-job'").fetchone()
+            assert tuple(row) == ("retry_language", "kn-IN", "pending")
+    asyncio.run(scenario())
+
+
 def test_job_resume_reuses_transcript_and_completed_clip_checkpoint(monkeypatch):
     async def scenario():
         paid_transcriptions = 0

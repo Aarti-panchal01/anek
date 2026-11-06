@@ -13,7 +13,7 @@ from backend.brain.autocorrect import translate_with_autocorrect, combine_audio_
 from backend.brain.termsheet import extract_termsheet
 from backend.pipeline.phase3b import back_translate, meaning_check_reasons
 from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import LiveLLMClient, create_translation_client, create_workflow_client
+from backend.clients.llm import SarvamSpeechClient, SarvamTranslationClient, create_translation_client, create_workflow_client
 from backend.config import Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -83,7 +83,8 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
         )
         chunks = split_audio(source_audio, work_dir, duration)
         gnani = LiveGnaniClient(settings)
-        llm = LiveLLMClient(settings)
+        sarvam_stt = SarvamSpeechClient(settings)
+        llm = SarvamTranslationClient(settings)
         workflow_llm = create_workflow_client(llm, settings)
         translator = create_translation_client(llm, settings)
         ref_audio = reference_path.read_bytes()
@@ -95,7 +96,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
 
         transcripts = []
         for audio_path, start, end in chunks:
-            response = gnani.stt(audio_path.read_bytes(), "indic-auto", settings.stt_model, format="codemix")
+            response = sarvam_stt.stt(audio_path.read_bytes(), language_code="unknown", format="transcribe")
             transcripts.append(
                 {
                     "start_s": start,
@@ -137,9 +138,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
                     ]
                 )
                 speech_path = fitted_path
-            verification = gnani.stt(
-                speech_path.read_bytes(), "hi-IN", settings.verify_stt_model, format="transcribe"
-            )
+            verification = sarvam_stt.stt(speech_path.read_bytes(), "hi-IN", format="transcribe")
             audio_status = audio_number_status(
                 translated, verification["transcript"], "hi-IN", settings.low_trust_verify_langs
             )

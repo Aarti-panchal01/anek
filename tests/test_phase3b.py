@@ -8,6 +8,7 @@ import pytest
 from backend.config import LANGUAGES
 from backend.pipeline.phase3b import (
     apply_speech_windows,
+    assert_language_complete,
     assert_timing_invariants,
     build_neighbor_context,
     create_srt,
@@ -48,6 +49,20 @@ def test_neighbor_context_supports_merged_and_out_of_order_clip_rows():
         "Source: first\nTranslation: first done second",
         "Source: last short tail\nTranslation: last done first",
     ]
+
+
+def test_language_completion_invariant_preserves_short_final_clip_and_rejects_missing_translation():
+    clips = [
+        {"clip": 1, "start_s": 0.0, "end_s": 4.0, "timeline_start_s": 0.0,
+         "timeline_audio_duration_s": 3.8, "translation": "पहला वाक्य"},
+        {"clip": 2, "start_s": 4.0, "end_s": 9.7, "timeline_start_s": 4.0,
+         "timeline_audio_duration_s": 5.2, "translation": "ಅಂತಿಮ ಚಿಕ್ಕ ವಾಕ್ಯ"},
+    ]
+    assert_language_complete(clips, source_clip_count=2, video_duration=10.0)
+    with pytest.raises(ValueError, match="clip count"):
+        assert_language_complete(clips[:-1], source_clip_count=2, video_duration=10.0)
+    with pytest.raises(ValueError, match="saved translation"):
+        assert_language_complete([{**clips[0], "translation": ""}, clips[1]], 2, 10.0)
 
 
 def test_silence_chunks_prefer_detected_pause_boundaries_and_stay_below_hard_limit():
