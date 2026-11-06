@@ -34,3 +34,16 @@
 - Never delete voice files under `/data/voices` or the database file.
 - Automatic age-based project cleanup remains disabled. The only new setting is export retention, default 24 hours.
 - Earlier source-retention guidance is superseded: the verified compressed working copy is used for processing and export.
+
+## Round 6: source video and storage budget
+
+### Current task
+
+- Replaced upload-time 720p compression with source-preserving video handling. Compatible H.264 8-bit MP4 files remain unchanged at their original resolution. Only incompatible browser video is converted in one no-scale, single-threaded H.264 pass. A failed conversion retains the original, marks the preview limitation in the upload response, and does not fail upload. Export and rebuilt previews copy the video stream and replace audio; the export path uses faststart.
+- Raised the upload limit to 100 MB and set the storage budget to 350 MB, retaining the two-finished-project limit. Removed the 720p upload note and updated the README storage/video statements.
+- Added regression coverage for keeping compatible H.264 uploads unchanged, preserving originals after failed conversions, returning successful uploads despite conversion failure, and video-copy audio-replacement export muxing. Full backend suite (`python -m pytest tests -q`) and frontend build (`npm run build`) passed.
+
+### Decisions
+
+- Treat any nonzero rotation metadata as requiring compatibility conversion. Keep the uploaded audio stream when possible; the dubbed export replaces it with AAC speech audio.
+- Apply the 350 MB budget as a hard ceiling, capped by the actual filesystem size if that is smaller.

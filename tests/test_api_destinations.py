@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from backend import db
 from backend import app as app_module
+from backend.pipeline import phase3b
 
 
 @contextmanager
@@ -33,7 +34,7 @@ def _resolve(coroutine):
 
 def _roomy_disk(monkeypatch):
     monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
-        "Usage", (), {"total": 10**12, "used": 10**9, "free": 10**12 - 10**9},
+        "Usage", (), {"total": 10**12, "used": 10**6, "free": 10**12 - 10**6},
     )())
 
 
@@ -73,25 +74,20 @@ def test_project_list_includes_latest_job_status_stage_and_error(monkeypatch):
         assert result["job_error"] == "ASR failed"
 
 
-def test_video_upload_uses_verified_720p_copy_and_preview_conversion_is_deferred(monkeypatch):
+def test_video_upload_keeps_compatible_source_unchanged(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         _roomy_disk(monkeypatch)
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Playable video", source_lang="en-IN", target_langs=["hi-IN"],
         )))
-        browser_copy = data_root / "uploads" / project["id"] / "browser.mp4"
-        browser_copy.parent.mkdir(parents=True, exist_ok=True)
-        browser_copy.write_bytes(b"h264 preview")
+        source = data_root / "uploads" / project["id"] / "source.mp4"
         monkeypatch.setattr(app_module, "probe_video", lambda path: (20.0, True))
-        def make_working_copy(source, output):
-            output.write_bytes(b"verified 720p h264 aac")
-            return 20.0
-        monkeypatch.setattr(app_module, "create_720p_working_copy", make_working_copy)
+        monkeypatch.setattr(app_module, "_browser_transcode_reason", lambda path: None)
         conversions = []
-        monkeypatch.setattr(app_module, "browser_video_path", lambda path: conversions.append(path) or browser_copy)
+        monkeypatch.setattr(app_module, "create_browser_compatible_copy", lambda *args: conversions.append(args))
         class Upload:
-            filename = "source.mov"
-            blocks = [b"original hevc bytes", b""]
+            filename = "source.mp4"
+            blocks = [b"compatible h264 aac bytes", b""]
 
             async def read(self, size):
                 return self.blocks.pop(0)
@@ -99,38 +95,54 @@ def test_video_upload_uses_verified_720p_copy_and_preview_conversion_is_deferred
         upload = Upload()
 
         result = _resolve(app_module.upload_video(project["id"], upload))
+        project_row = Path(app_module.project_row(project["id"])["video_path"])
         assert conversions == []
-        assert Path(project_row := app_module.project_row(project["id"])["video_path"]).read_bytes() == b"verified 720p h264 aac"
-        response = _resolve(app_module.project_video(project["id"], app_module.Request({
-            "type": "http", "method": "GET", "path": "/", "headers": [],
-        })))
-
-        assert result["filename"] == "source.mov"
-        assert not (browser_copy.parent / "source.mov").exists()
+        assert project_row == source
+        assert project_row.read_bytes() == b"compatible h264 aac bytes"
+        assert list(source.parent.iterdir()) == [source]
+        assert result["filename"] == "source.mp4"
         assert result["evicted_projects"] == []
-        assert Path(project_row).name == "source-720p.mp4"
-        assert Path(response.path) == browser_copy
-        assert response.media_type == "video/mp4"
-        assert "attachment" not in response.headers.get("content-disposition", "")
-        assert conversions == [Path(project_row)]
+        assert result["preview_notice"] is None
 
 
-def test_original_upload_is_kept_when_working_copy_verification_fails(monkeypatch):
+def test_browser_detector_keeps_h264_mp4_without_video_conversion(monkeypatch, tmp_path):
+    source = tmp_path / "original.mp4"
+    source.write_bytes(b"h264 mp4")
+    calls = []
+    def probe(command, **kwargs):
+        calls.append(command)
+        return type("Completed", (), {"stdout": json.dumps({
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+            "streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
+                       {"codec_type": "audio", "codec_name": "aac"}],
+        })})()
+    monkeypatch.setattr(app_module.subprocess, "run", probe)
+    monkeypatch.setattr(app_module, "create_browser_compatible_copy", lambda *_: pytest.fail("compatible video was transcoded"))
+
+    assert app_module._browser_transcode_reason(source) is None
+    assert app_module.browser_video_path(source) == source
+    assert len(calls) == 2
+
+
+def test_upload_falls_back_to_original_when_browser_conversion_fails(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         _roomy_disk(monkeypatch)
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
-            name="Failed working copy", source_lang="en-IN", target_langs=["hi-IN"],
+            name="Failed browser conversion", source_lang="en-IN", target_langs=["hi-IN"],
         )))
         monkeypatch.setattr(app_module, "probe_video", lambda path: (20.0, True))
-        monkeypatch.setattr(app_module, "create_720p_working_copy", lambda *_: (_ for _ in ()).throw(RuntimeError("bad copy")))
-        class Upload:
-            filename = "source.mp4"
-            blocks = [b"original", b""]
-            async def read(self, size): return self.blocks.pop(0)
-        with pytest.raises(Exception, match="verified 720p"):
-            _resolve(app_module.upload_video(project["id"], Upload()))
-        assert (data_root / "uploads" / project["id"] / "source.mp4").read_bytes() == b"original"
-        assert app_module.project_row(project["id"])["status"] == "failed"
+        monkeypatch.setattr(app_module, "_browser_transcode_reason", lambda path: "HEVC video")
+        monkeypatch.setattr(app_module, "create_browser_compatible_copy", lambda *_: (_ for _ in ()).throw(RuntimeError("ffmpeg failed")))
+        response = TestClient(app_module.app, raise_server_exceptions=False).put(
+            f"/api/projects/{project['id']}/video",
+            files={"video": ("source.mov", b"original hevc bytes", "video/quicktime")},
+        )
+        assert response.status_code == 200
+        assert "preview may not play" in response.json()["preview_notice"]
+        original = data_root / "uploads" / project["id"] / "source.mov"
+        assert original.read_bytes() == b"original hevc bytes"
+        assert app_module.project_row(project["id"])["video_path"] == str(original)
+        assert app_module.project_row(project["id"])["status"] == "uploaded"
 
 
 def test_upload_storage_failure_returns_507_marks_job_and_cleans_partial(monkeypatch):
@@ -168,13 +180,13 @@ def test_upload_storage_failure_returns_507_marks_job_and_cleans_partial(monkeyp
         assert list(upload_folder.iterdir()) == []
 
 
-def test_upload_preflight_requires_six_times_file_size_before_writing(monkeypatch):
+def test_upload_preflight_reserves_space_for_original_and_optional_conversion(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Preflight", source_lang="en-IN", target_langs=["hi-IN"],
         )))
         monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
-            "Usage", (), {"total": 1000, "used": 900, "free": 65},
+            "Usage", (), {"total": 1000, "used": 900, "free": 31},
         )())
         response = TestClient(app_module.app, raise_server_exceptions=False).put(
             f"/api/projects/{project['id']}/video",
@@ -228,7 +240,8 @@ def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
         assert _resolve(app_module.storage_status()) == {
             "total_bytes": 1000, "used_bytes": 750, "free_bytes": 250,
             "used_percent": 75.0, "free_percent": 25.0,
-            "budget_bytes": 800, "budget_percent": 80.0, "export_retention_hours": 24,
+            "budget_bytes": 1000, "budget_percent": 100.0, "budget_used_percent": 75.0,
+            "export_retention_hours": 24,
         }
 
 
@@ -443,37 +456,47 @@ def test_dubbed_media_returns_clear_409_if_all_recovery_options_fail(monkeypatch
         assert "could not be rebuilt" in response.json()["reason"]
 
 
-def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypatch):
+def test_browser_preview_conversion_is_single_threaded_and_does_not_scale(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         data_root.mkdir(parents=True, exist_ok=True)
         source = data_root / "portrait.mov"
         source.write_bytes(b"video")
         calls = []
 
-        class Completed:
-            stdout = json.dumps({"streams": [
-                {"codec_type": "video", "codec_name": "hevc"},
-                {"codec_type": "audio", "codec_name": "aac"},
-            ]})
-
         def fake_run(command, **kwargs):
             calls.append((command, kwargs))
             if command[0] == "ffmpeg":
                 Path(command[-1]).write_bytes(b"browser preview")
-            return Completed()
+                return type("Completed", (), {"stdout": ""})()
+            if "ffprobe" in command[0]:
+                if "-show_entries" in command and command[command.index("-show_entries") + 1] == "stream=codec_type":
+                    payload = {"streams": [{"codec_type": "video"}]}
+                elif str(source) in command:
+                    payload = {"format": {"format_name": "mov,mp4"}, "streams": [
+                        {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p"},
+                        {"codec_type": "audio", "codec_name": "aac"},
+                    ]}
+                else:
+                    payload = {"format": {"format_name": "mov,mp4,m4a"}, "streams": [
+                        {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
+                        {"codec_type": "audio", "codec_name": "aac"},
+                    ]}
+                return type("Completed", (), {"stdout": json.dumps(payload)})()
+            raise AssertionError(command)
 
         monkeypatch.setattr(app_module.subprocess, "run", fake_run)
 
         result = app_module.browser_video_path(source)
 
         assert result.read_bytes() == b"browser preview"
-        ffmpeg_command, options = calls[-1]
-        scale = ffmpeg_command[ffmpeg_command.index("-vf") + 1]
-        assert "min(720,iw)" in scale and "min(720,ih)" in scale
-        assert "fps=24" in scale
-        assert "force_original_aspect_ratio=decrease" in scale
-        assert "-threads:v" in ffmpeg_command
-        assert options["timeout"] == 120
+        ffmpeg_command, options = next(call for call in calls if call[0][0] == "ffmpeg")
+        assert "-threads" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-threads") + 1] == "1"
+        assert "-threads:v" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-threads:v") + 1] == "1"
+        assert "-preset" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-preset") + 1] == "veryfast"
+        assert "-pix_fmt" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-pix_fmt") + 1] == "yuv420p"
+        assert "-movflags" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-movflags") + 1] == "+faststart"
+        assert "-vf" not in ffmpeg_command
+        assert options["timeout"] == 240
 
 
 def test_browser_preview_returns_original_when_ffmpeg_conversion_fails(monkeypatch, tmp_path):
@@ -489,6 +512,32 @@ def test_browser_preview_returns_original_when_ffmpeg_conversion_fails(monkeypat
 
     assert app_module.browser_video_path(source) == source
     assert source.read_bytes() == b"original upload"
+
+
+def test_final_export_mux_copies_video_and_moves_only_audio(monkeypatch, tmp_path):
+    source = tmp_path / "source.mp4"
+    clip_audio = tmp_path / "clip.wav"
+    mixed_work = tmp_path / "work"
+    output_dir = tmp_path / "exports"
+    source.write_bytes(b"source")
+    clip_audio.write_bytes(b"clip")
+    mixed_work.mkdir()
+    output_dir.mkdir()
+    commands = []
+    monkeypatch.setattr(phase3b, "duration_of", lambda _path: 1.0)
+    monkeypatch.setattr(phase3b, "assert_timing_invariants", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(phase3b, "run_command", lambda command: commands.append(command))
+
+    phase3b.mux_outputs(
+        source, [{"start_s": 0, "audio_path": str(clip_audio)}],
+        output_dir / "dub.mp4", 1.0, mixed_work, app_module.settings,
+        output_dir=output_dir,
+    )
+
+    export_command = commands[-1]
+    assert "-c:v" in export_command and export_command[export_command.index("-c:v") + 1] == "copy"
+    assert "-c:a" in export_command and export_command[export_command.index("-c:a") + 1] == "aac"
+    assert "-movflags" in export_command and export_command[export_command.index("-movflags") + 1] == "+faststart"
 
 
 def test_global_term_memory_crud_persists_and_validates(monkeypatch):

@@ -99,9 +99,9 @@ def log_runtime_configuration(config=settings, environment: dict[str, str] | Non
         LOGGER.info("Timing environment overrides code defaults: %s", ", ".join(overrides))
 app = FastAPI(title=settings.app_name)
 DATA_ROOT = Path(settings.anek_data_dir)
-MAX_UPLOAD_BYTES = 40 * 1024 * 1024
-UPLOAD_WORKING_COPY_MULTIPLIER = 6
-STORAGE_BUDGET_FRACTION = 0.80
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+UPLOAD_WORKING_COPY_MULTIPLIER = 2
+STORAGE_BUDGET_BYTES = 350 * 1024 * 1024
 MAX_FINISHED_PROJECTS = 2
 CONSENT_PHRASES = [
     "Today I am recording my voice for an AI dubbing test.",
@@ -207,30 +207,51 @@ def preflight_upload_space(size_bytes: int) -> None:
         raise StorageFullError()
 
 
-def create_720p_working_copy(source: Path, output: Path) -> float:
+def _browser_transcode_reason(source: Path) -> str | None:
+    """Return why a source needs a browser-compatible video transcode."""
+    metadata = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=format_name:stream=codec_type,codec_name,pix_fmt:stream_tags=rotate:stream_side_data=rotation",
+         "-of", "json", str(source)], check=True, capture_output=True, text=True,
+    )
+    payload = json.loads(metadata.stdout)
+    streams = payload.get("streams", [])
+    video = next((row for row in streams if row.get("codec_type") == "video"), None)
+    if not video:
+        return "missing video stream"
+    if source.suffix.lower() != ".mp4" or "mp4" not in (payload.get("format", {}).get("format_name") or "").split(","):
+        return "container is not browser-compatible MP4"
+    if video.get("codec_name") != "h264":
+        return f"video codec {video.get('codec_name') or 'unknown'} is not H.264"
+    pixel_format = video.get("pix_fmt") or ""
+    if pixel_format != "yuv420p":
+        return f"pixel format {pixel_format or 'unknown'} is not 8-bit 4:2:0"
+    rotation = video.get("tags", {}).get("rotate")
+    if rotation is None:
+        rotation = next((side.get("rotation") for side in video.get("side_data_list", [])
+                         if side.get("rotation") is not None), 0)
+    try:
+        rotated = float(rotation) % 360 != 0
+    except (TypeError, ValueError):
+        rotated = True
+    if rotated:
+        return f"video has rotation metadata ({rotation})"
+    return None
+
+
+def create_browser_compatible_copy(source: Path, output: Path) -> None:
+    """Transcode only incompatible video, without scaling, in a single low-memory pass."""
     run_atomic_command(
         ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-         "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-         "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
-         "-preset", "ultrafast", "-b:v", "900k", "-maxrate", "1000k", "-bufsize", "1800k",
-         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(output)],
-        check=True, capture_output=True, timeout=180,
+         "-threads", "1", "-threads:v", "1", "-c:v", "libx264", "-preset", "veryfast",
+         "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(output)],
+        check=True, capture_output=True, timeout=240,
     )
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt", "-of", "json", str(output)],
-        check=True, capture_output=True, text=True,
-    )
-    streams = json.loads(result.stdout).get("streams", [])
-    video = next((row for row in streams if row.get("codec_type") == "video"), None)
-    audio = next((row for row in streams if row.get("codec_type") == "audio"), None)
-    valid = bool(video and video.get("codec_name") == "h264" and video.get("pix_fmt") == "yuv420p"
-                 and int(video.get("width", 0)) <= 1280 and int(video.get("height", 0)) <= 720
-                 and (audio is None or audio.get("codec_name") == "aac"))
-    duration, has_video = probe_video(output)
-    if not valid or not has_video or duration <= 0:
+    _validate_media_file(output)
+    reason = _browser_transcode_reason(output)
+    if reason:
         output.unlink(missing_ok=True)
-        raise RuntimeError("The compressed working copy failed media verification")
-    return duration
+        raise RuntimeError(f"Transcoded video did not pass browser compatibility checks: {reason}")
 
 
 def _delete_project_data(project_id: str) -> dict:
@@ -260,7 +281,7 @@ def ensure_storage_room(project_id: str, upload_size: int) -> list[dict[str, str
     evicted: list[dict[str, str]] = []
     while True:
         disk = shutil.disk_usage(DATA_ROOT)
-        budget = int(disk.total * STORAGE_BUDGET_FRACTION)
+        budget = min(disk.total, STORAGE_BUDGET_BYTES)
         with db.connect() as connection:
             finished = connection.execute(
                 "SELECT id,name FROM projects WHERE status='complete' AND id<>? ORDER BY created_at ASC,id ASC",
@@ -549,30 +570,22 @@ def probe_video(path: Path) -> tuple[float, bool]:
 
 
 def browser_video_path(source: Path) -> Path:
-    """Return an H.264/AAC MP4 browser copy, preserving the uploaded original."""
+    """Return the source when playable; otherwise make one browser-compatible copy."""
     browser_copy = source.parent / "browser.mp4"
     if browser_copy.is_file() and browser_copy.stat().st_mtime_ns >= source.stat().st_mtime_ns:
         return browser_copy
-    metadata = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json", str(source)],
-        check=True, capture_output=True, text=True,
-    )
-    streams = json.loads(metadata.stdout).get("streams", [])
-    video_codec = next((item.get("codec_name") for item in streams if item.get("codec_type") == "video"), None)
-    audio_codec = next((item.get("codec_name") for item in streams if item.get("codec_type") == "audio"), None)
-    is_mp4 = source.suffix.lower() == ".mp4"
-    if is_mp4 and video_codec == "h264" and audio_codec in {None, "aac"} and mp4_has_faststart(source):
+    try:
+        reason = _browser_transcode_reason(source)
+    except Exception as error:
+        LOGGER.warning("Could not inspect upload for browser playback path=%s error=%s; serving original", source, error)
+        return source
+    if reason is None:
         return source
     try:
-        run_atomic_command(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-             "-vf", "fps=24,scale=w='min(720,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-             "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
-             "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k",
-             "-movflags", "+faststart", str(browser_copy)], check=True, capture_output=True, timeout=120,
-        )
+        LOGGER.info("Creating browser-compatible source copy path=%s reason=%s", source, reason)
+        create_browser_compatible_copy(source, browser_copy)
     except Exception:
-        LOGGER.exception("Browser preview conversion failed; serving the original upload")
+        LOGGER.exception("Browser preview conversion failed path=%s; serving original upload", source)
         return source
     return browser_copy
 
@@ -610,26 +623,21 @@ def mp4_has_faststart(path: Path) -> bool:
 
 
 def browser_dubbed_video_path(source: Path) -> Path:
-    """Return a seekable H.264/AAC faststart MP4 copy when the export needs one."""
+    """Return playable dubbed media, remuxing or transcoding only when required."""
     browser_copy = source.with_name(f"{source.stem}.browser.mp4")
     if browser_copy.is_file() and browser_copy.stat().st_mtime_ns >= source.stat().st_mtime_ns:
         return browser_copy
-    metadata = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json", str(source)],
-        check=True, capture_output=True, text=True,
-    )
-    streams = json.loads(metadata.stdout).get("streams", [])
-    video_codec = next((row.get("codec_name") for row in streams if row.get("codec_type") == "video"), None)
-    audio_codec = next((row.get("codec_name") for row in streams if row.get("codec_type") == "audio"), None)
-    if video_codec == "h264" and audio_codec in {None, "aac"} and mp4_has_faststart(source):
+    reason = _browser_transcode_reason(source)
+    if reason is None and mp4_has_faststart(source):
         return source
-    run_atomic_command(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-         "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-         "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
-         "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
-         str(browser_copy)], check=True, capture_output=True, timeout=180,
-    )
+    if reason is None:
+        run_atomic_command(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+             "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", str(browser_copy)],
+            check=True, capture_output=True, timeout=180,
+        )
+    else:
+        create_browser_compatible_copy(source, browser_copy)
     return browser_copy
 
 
@@ -686,8 +694,9 @@ async def startup() -> None:
     free_pct = disk.free / disk.total if disk.total else 0
     LOGGER.info("Storage at startup total_bytes=%s used_bytes=%s free_bytes=%s free_percent=%.1f",
                 disk.total, disk.used, disk.free, free_pct * 100)
-    if free_pct < 0.20:
-        LOGGER.warning("Storage free space is below 20 percent")
+    budget = min(disk.total, STORAGE_BUDGET_BYTES)
+    if disk.used >= budget * 0.8:
+        LOGGER.warning("Storage is nearing the configured budget used_bytes=%s budget_bytes=%s", disk.used, budget)
     mark_invalid_media_for_regeneration(DATA_ROOT / "exports", LOGGER)
     removed = cleanup_orphaned_files(DATA_ROOT)
     if removed:
@@ -726,7 +735,7 @@ async def health() -> dict:
 async def storage_status() -> dict:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(DATA_ROOT)
-    budget = int(usage.total * STORAGE_BUDGET_FRACTION)
+    budget = min(usage.total, STORAGE_BUDGET_BYTES)
     return {
         "total_bytes": usage.total,
         "used_bytes": usage.used,
@@ -734,7 +743,8 @@ async def storage_status() -> dict:
         "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
         "free_percent": round(usage.free / usage.total * 100, 1) if usage.total else 0,
         "budget_bytes": budget,
-        "budget_percent": STORAGE_BUDGET_FRACTION * 100,
+        "budget_percent": round(budget / usage.total * 100, 1) if usage.total else 0,
+        "budget_used_percent": round(usage.used / budget * 100, 1) if budget else 0,
         "export_retention_hours": settings.export_retention_hours,
     }
 
@@ -1020,25 +1030,32 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if duration > settings.max_video_seconds:
         path.unlink(missing_ok=True)
         raise HTTPException(413, f"Video is {duration:.1f}s; maximum is {settings.max_video_seconds}s")
-    working_copy = folder / "source-720p.mp4"
+    preview_notice = None
+    stored_path = path
     try:
-        working_duration = create_720p_working_copy(path, working_copy)
-        if abs(working_duration - duration) > 0.1:
-            raise RuntimeError("The compressed working copy changed the source duration")
+        transcode_reason = _browser_transcode_reason(path)
     except Exception as error:
-        with db.connect() as connection:
-            connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='failed' WHERE id=?",
-                               (str(path), duration, project_id))
-        if is_storage_full(error):
-            raise StorageFullError(getattr(error, "message", "Server storage is full")) from error
-        raise HTTPException(422, "The server could not create a verified 720p working copy. The original upload is retained; delete the project to reclaim its space.") from error
-    # Keep the original untouched until FFmpeg and ffprobe have verified the working copy.
-    path.unlink()
-    path = working_copy
+        LOGGER.warning("Could not inspect uploaded video for browser playback path=%s error=%s; keeping original", path, error)
+        transcode_reason = None
+        preview_notice = "The video was uploaded and kept as-is. Its browser preview could not be checked; if it does not play, try exporting an H.264 MP4."
+    if transcode_reason:
+        converted = folder / "source-browser.mp4"
+        try:
+            create_browser_compatible_copy(path, converted)
+            converted_duration, converted_has_video = probe_video(converted)
+            if not converted_has_video or abs(converted_duration - duration) > 0.1:
+                raise RuntimeError("Converted video failed duration or stream verification")
+            path.unlink()
+            stored_path = converted
+        except Exception as error:
+            converted.unlink(missing_ok=True)
+            LOGGER.warning("Upload compatibility conversion failed path=%s reason=%s error=%s; keeping original",
+                           path, transcode_reason, error)
+            preview_notice = "The video was uploaded and kept in its original format, but its browser preview may not play. You can still continue dubbing."
     with db.connect() as connection:
-        connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='uploaded' WHERE id=?", (str(path), duration, project_id))
+        connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='uploaded' WHERE id=?", (str(stored_path), duration, project_id))
     return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id,
-            "evicted_projects": evicted_projects}
+            "evicted_projects": evicted_projects, "preview_notice": preview_notice}
 
 
 @app.post("/api/media/browser-preview")
@@ -2146,10 +2163,7 @@ def _rebuild_dubbed_preview(project_id: str, lang: str, source: Path, output_dir
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-i", str(playable_source), "-i", str(dubbed_track),
-             "-map", "0:v:0", "-map", "1:a:0", "-vf",
-             "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-             "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
-             "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", str(duration),
+             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-t", str(duration),
              "-movflags", "+faststart", str(temporary)],
             check=True, capture_output=True, timeout=240,
         )

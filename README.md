@@ -60,7 +60,7 @@ Demo video coming soon.
 
 ```mermaid
 flowchart TD
-    A[Upload video] --> B[Compress and verify 720p source]
+    A[Upload video] --> B[Keep source or verify browser-compatible copy]
     B --> C[Record consent and set up voice]
     C --> D[Transcribe source once]
     D --> E[Apply source term rules]
@@ -72,7 +72,7 @@ flowchart TD
     J --> K[Mix and export]
 ```
 
-1. Upload an MP4, MOV or WebM video, up to 40 MB and 120 seconds by default. The server creates and verifies a 720p working copy.
+1. Upload an MP4, MOV or WebM video, up to 100 MB and 120 seconds by default. Browser-compatible video is kept at its original resolution.
 2. Record speaker consent and configure the voice.
 3. Transcribe the source once and reuse it across selected languages.
 4. Apply mishearing and protected term rules before translation.
@@ -91,7 +91,7 @@ flowchart LR
     Jobs --> Checkpoints[(SQLite and checkpoint files)]
     Pipeline --> Terms[Term memory]
     Pipeline --> Media[FFmpeg and ffprobe]
-    Pipeline --> Storage[(Persistent volume and 80 percent budget)]
+    Pipeline --> Storage[(Persistent volume and 350 MB budget)]
     FastAPI --> Storage
     Pipeline --> Gnani[Gnani speech services]
     Pipeline --> Sarvam[Sarvam translation and QA]
@@ -106,7 +106,7 @@ flowchart LR
 
 **Providers.** Gnani provides speech recognition, synthesis and voice services. Sarvam is primary for translation and QA. The existing LLM chain is fallback. Failed or quota-limited models are skipped by a five-minute circuit breaker.
 
-**Storage.** SQLite stores project and job records. A persistent volume stores uploads, working sources, generated clips and exports. Writes use temporary files, fsync and atomic rename. Storage is budgeted to 80 percent of the volume.
+**Storage.** SQLite stores project and job records. A persistent volume stores uploads, generated clips and exports. Writes use temporary files, fsync and atomic rename. Storage is budgeted to 350 MB.
 
 ## Request flow
 
@@ -121,7 +121,7 @@ sequenceDiagram
     participant Media as FFmpeg
     User->>Web: Upload video and choose languages
     Web->>API: Create project and upload
-    API->>Media: Compress and verify working copy
+    API->>Media: Inspect source and convert only if browser-incompatible
     API->>Store: Save project and job state
     Web->>API: Start dubbing job
     API->>Speech: Transcribe source once
@@ -208,7 +208,7 @@ stateDiagram-v2
 - Generated files are written atomically and partial temporary files are cleaned up.
 - Invalid media falls back to a rebuilt dub preview, then the browser preview, then a structured unavailable response with a retry action.
 - Missing project files show a Files removed state with a delete action.
-- Storage has an 80 percent budget and keeps at most two finished projects. When necessary, the oldest finished project is evicted; active and interrupted projects are preserved.
+- Storage has a 350 MB budget and keeps at most two finished projects. When necessary, the oldest finished project is evicted; active and interrupted projects are preserved.
 - Temporary and zero-byte files are cleaned at startup. Export intermediates are removed after successful export, and exports expire after 24 hours by default.
 - Upload failures caused by full storage return a clear error instead of a partial file.
 
@@ -318,9 +318,8 @@ The build runs the API-prefix scan, TypeScript checks and Vite production build.
 
 ## Limitations
 
-- Uploaded videos are compressed to a 720p low-bitrate working copy for preview, processing and export. The original is removed after the working copy passes verification.
-- Uploads are limited to 40 MB and videos to 120 seconds by default.
-- Storage use is capped at 80 percent of the mounted volume, with at most two finished projects retained. The oldest finished project may be removed to make room.
+- Uploads are limited to 100 MB and videos to 120 seconds by default. H.264 8-bit MP4 video is kept at its original resolution. HEVC, 10-bit, rotated or unsupported-container video may need one browser-compatibility transcode; a failed preview conversion keeps the uploaded original and does not reject the upload.
+- Storage use is capped at 350 MB, with at most two finished projects retained. The oldest finished project may be removed to make room.
 - Exports expire after 24 hours by default. Download them before expiry.
 - Voice cloning quality depends on the reference recording. Speech recognition may still mishear uncommon names.
 - The current flow is designed for one speaker per video. Original background sound is replaced, not mixed under the dub.
@@ -331,7 +330,7 @@ The build runs the API-prefix scan, TypeScript checks and Vite production build.
 - [x] Timing recovery and overlap checks across ten languages.
 - [x] Project and global term rules with edit locks.
 - [x] Durable job checkpoints, resume and atomic file writes.
-- [x] Storage budgeting, verified working copies and export expiry.
+- [x] Storage budgeting, browser-compatible video handling and export expiry.
 - [x] Main player, clip editor, attempt history and API-prefix build check.
 - [ ] Improve voice cloning quality and add a reference audio quality check.
 - [ ] Record a demo video.
