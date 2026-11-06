@@ -549,6 +549,17 @@ def should_reuse_completed_clip(clip_index: int, only_clip_index: int | None) ->
     return only_clip_index is None or clip_index != only_clip_index
 
 
+def prepare_language_retry_checkpoint(
+    checkpoint_state: dict, target_lang: str, saved_translations: dict[int, str] | None = None,
+) -> None:
+    """Discard partial clip artifacts while retaining transcript and saved wording."""
+    checkpoint_state.setdefault("clips", {}).pop(target_lang, None)
+    translations = checkpoint_state.setdefault("translations", {}).setdefault(target_lang, {})
+    for index, translation in (saved_translations or {}).items():
+        if str(translation or "").strip():
+            translations[str(index)] = str(translation)
+
+
 def select_candidate(client, source: str, candidates: list[str], target_lang: str, slot_s: float, cps: float) -> tuple[str, int, str]:
     time_limit_chars = max(1, int(slot_s * cps))
     response = prompt_json(

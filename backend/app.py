@@ -44,7 +44,9 @@ from backend.brain.checks import run_checks
 from backend.clients.gnani import create_gnani_client
 from backend.brain.termsheet import TermSheet
 from backend.config import LANGUAGES, get_settings
-from backend.pipeline.phase3b import MAX_ATEMPO_SPEEDUP, OVERRUN_TOLERANCE_S, run_quality_pass
+from backend.pipeline.phase3b import (
+    MAX_ATEMPO_SPEEDUP, OVERRUN_TOLERANCE_S, prepare_language_retry_checkpoint, run_quality_pass,
+)
 
 settings = get_settings()
 LOGGER = logging.getLogger(__name__)
@@ -1882,6 +1884,20 @@ async def run_job(job_id: str) -> None:
             for target_lang in pending_targets:
                 checkpoint_state["current_language"] = target_lang
                 try:
+                    if job["kind"] == "retry_language":
+                        # A failed language can have a sparse or stale clip checkpoint.
+                        # Rebuild that language from the saved transcript and DB wording,
+                        # while keeping the other languages and paid transcription cache.
+                        with db.connect() as connection:
+                            saved_rows = connection.execute(
+                                "SELECT c.idx,d.translation FROM clips c JOIN dubs d ON d.clip_id=c.id "
+                                "WHERE c.project_id=? AND d.lang=? ORDER BY c.idx",
+                                (project["id"], target_lang),
+                            ).fetchall()
+                        prepare_language_retry_checkpoint(
+                            checkpoint_state, target_lang,
+                            {int(row["idx"]): row["translation"] for row in saved_rows},
+                        )
                     language_results = await asyncio.to_thread(
                         run_quality_pass,
                         Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, [target_lang],

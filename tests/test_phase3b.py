@@ -17,6 +17,7 @@ from backend.pipeline.phase3b import (
     revise_for_timing,
     shorter_timing_budget,
     should_reuse_completed_clip,
+    prepare_language_retry_checkpoint,
     silence_chunks,
     targeted_silence_segments,
     transcript_sentences,
@@ -56,6 +57,26 @@ def test_targeted_respeak_does_not_reuse_saved_clip_checkpoint_audio():
     assert should_reuse_completed_clip(0, None)
     assert should_reuse_completed_clip(0, 2)
     assert not should_reuse_completed_clip(2, 2)
+
+
+def test_language_retry_discards_partial_audio_but_preserves_transcript_and_saved_edits():
+    checkpoint = {
+        "stt_cache": {"source": {"transcript": "saved source"}},
+        "term_fixes": {"cleaned_rows": [{"cleaned": "saved source"}]},
+        "clips": {
+            "hi-IN": {"1": {"audio_key": "partial.wav"}},
+            "kn-IN": {"0": {"audio_key": "kannada.wav"}},
+        },
+        "translations": {"hi-IN": {"0": "old wording"}, "kn-IN": {"0": "ಕನ್ನಡ"}},
+    }
+
+    prepare_language_retry_checkpoint(checkpoint, "hi-IN", {0: "AHEAD ಎಂದು ನಾನು ಮಾಡಿದೆ"})
+
+    assert "hi-IN" not in checkpoint["clips"]
+    assert checkpoint["clips"]["kn-IN"]["0"]["audio_key"] == "kannada.wav"
+    assert checkpoint["translations"]["hi-IN"]["0"] == "AHEAD ಎಂದು ನಾನು ಮಾಡಿದೆ"
+    assert checkpoint["term_fixes"]["cleaned_rows"][0]["cleaned"] == "saved source"
+    assert checkpoint["stt_cache"]["source"]["transcript"] == "saved source"
 
 
 def test_language_completion_invariant_preserves_short_final_clip_and_rejects_missing_translation():
