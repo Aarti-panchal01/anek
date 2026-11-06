@@ -97,6 +97,8 @@ def log_runtime_configuration(config=settings, environment: dict[str, str] | Non
         LOGGER.info("Timing environment overrides code defaults: %s", ", ".join(overrides))
 app = FastAPI(title=settings.app_name)
 DATA_ROOT = Path(settings.anek_data_dir)
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+UPLOAD_WORKING_COPY_MULTIPLIER = 6
 CONSENT_PHRASES = [
     "Today I am recording my voice for an AI dubbing test.",
     "I consent to use this recording to create my own voice model.",
@@ -189,6 +191,80 @@ def _error_cors_headers(request: Request) -> dict[str, str]:
         except re.error:
             allowed = False
     return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if allowed else {}
+
+
+def preflight_upload_space(size_bytes: int) -> None:
+    if size_bytes > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(DATA_ROOT).free
+    required_bytes = size_bytes * UPLOAD_WORKING_COPY_MULTIPLIER
+    if free_bytes < required_bytes:
+        raise StorageFullError()
+
+
+def cleanup_orphaned_files(root: Path) -> list[Path]:
+    removed = []
+    database_path = db.DB_PATH.resolve()
+    if not root.exists():
+        return removed
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            resolved = path.resolve()
+            if resolved == database_path or path.relative_to(root).parts[0] == "voices":
+                continue
+            if path.name.endswith(".tmp") or path.stat().st_size == 0:
+                path.unlink(missing_ok=True)
+                removed.append(path)
+        except OSError:
+            LOGGER.warning("Could not clean incomplete storage file path=%s", path)
+    return removed
+
+
+def mark_missing_project_sources() -> list[str]:
+    missing = []
+    with db.connect() as connection:
+        rows = connection.execute("SELECT id,video_path FROM projects WHERE video_path IS NOT NULL AND status!='files_removed'").fetchall()
+        for row in rows:
+            if not Path(row["video_path"]).is_file():
+                connection.execute("UPDATE projects SET status='files_removed' WHERE id=?", (row["id"],))
+                missing.append(row["id"])
+    return missing
+
+
+def cleanup_project_intermediates(project_id: str) -> list[Path]:
+    with db.connect() as connection:
+        resumable = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE project_id=? AND state IN ('pending','running','interrupted')",
+            (project_id,),
+        ).fetchone()[0]
+        if resumable:
+            return []
+    removed = []
+    export_dir = DATA_ROOT / "exports" / project_id
+    clip_audio = export_dir / "clips"
+    if clip_audio.is_dir():
+        removed.extend(path for path in clip_audio.rglob("*") if path.is_file())
+        shutil.rmtree(clip_audio, ignore_errors=True)
+    work_dir = export_dir / ".anek-tmp"
+    if work_dir.is_dir():
+        removed.extend(path for path in work_dir.rglob("*") if path.is_file())
+        shutil.rmtree(work_dir, ignore_errors=True)
+    preview = DATA_ROOT / "uploads" / project_id / "browser.mp4"
+    if preview.is_file():
+        preview.unlink(missing_ok=True)
+        removed.append(preview)
+    if clip_audio.exists() or work_dir.exists():
+        LOGGER.warning("Some project intermediates could not be removed for %s", project_id)
+    if removed:
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE dubs SET audio_path=NULL WHERE clip_id IN (SELECT id FROM clips WHERE project_id=?)",
+                (project_id,),
+            )
+    return removed
 
 
 def enforce_ip_limit(request: Request, category: str) -> None:
@@ -472,7 +548,20 @@ async def startup() -> None:
     _shutdown_requested.clear()
     db.initialize()
     log_runtime_configuration()
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    disk = shutil.disk_usage(DATA_ROOT)
+    free_pct = disk.free / disk.total if disk.total else 0
+    LOGGER.info("Storage at startup total_bytes=%s used_bytes=%s free_bytes=%s free_percent=%.1f",
+                disk.total, disk.used, disk.free, free_pct * 100)
+    if free_pct < 0.20:
+        LOGGER.warning("Storage free space is below 20 percent")
     mark_invalid_media_for_regeneration(DATA_ROOT / "exports", LOGGER)
+    removed = cleanup_orphaned_files(DATA_ROOT)
+    if removed:
+        LOGGER.warning("Removed %s orphaned temporary or zero-byte files at startup", len(removed))
+    missing_projects = mark_missing_project_sources()
+    if missing_projects:
+        LOGGER.warning("Marked %s projects as files_removed because their source files are missing", len(missing_projects))
     with db.connect() as connection:
         interrupted = connection.execute("SELECT DISTINCT project_id FROM jobs WHERE state='running'").fetchall()
         connection.execute("UPDATE jobs SET state='interrupted', stage='interrupted', error='Worker stopped before completion; resume to continue.' WHERE state='running'")
@@ -493,6 +582,19 @@ async def shutdown() -> None:
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "app": settings.app_name, "auth_required": settings.require_access_auth}
+
+
+@app.get("/api/storage")
+async def storage_status() -> dict:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(DATA_ROOT)
+    return {
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
+        "free_percent": round(usage.free / usage.total * 100, 1) if usage.total else 0,
+    }
 
 
 @app.post("/api/auth/login")
@@ -523,6 +625,7 @@ async def get_config() -> dict:
         "app_name": settings.app_name,
         "languages": {code: LANGUAGES[code] for code in settings.enabled_langs if code in LANGUAGES},
         "max_video_seconds": settings.max_video_seconds,
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
         "daily_credit_limit": settings.gnani_daily_limit,
         "used_daily_credits": int(used),
         "remaining_daily_credits": max(0, settings.gnani_daily_limit - int(used)),
@@ -729,6 +832,9 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     suffix = Path(safe_upload_name(video.filename)).suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm"}:
         raise HTTPException(415, "Upload an MP4, MOV, or WebM video")
+    upload_size = getattr(video, "size", None)
+    if upload_size is not None:
+        preflight_upload_space(upload_size)
     folder = DATA_ROOT / "uploads" / project_id
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"source{suffix}"
@@ -738,8 +844,10 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
         with temporary.open("wb") as target:
             while block := await video.read(1024 * 1024):
                 size += len(block)
-                if size > 500 * 1024 * 1024:
-                    raise HTTPException(413, "Video exceeds the 500 MB upload cap")
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
+                if upload_size is None:
+                    preflight_upload_space(size)
                 target.write(block)
         commit_temporary(temporary, path)
     except HTTPException:
@@ -777,6 +885,9 @@ async def convert_browser_preview(request: Request, video: UploadFile = File(...
     suffix = Path(safe_upload_name(video.filename)).suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm"}:
         raise HTTPException(415, "Upload an MP4, MOV, or WebM video")
+    upload_size = getattr(video, "size", None)
+    if upload_size is not None:
+        preflight_upload_space(upload_size)
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(dir=DATA_ROOT, prefix="browser-preview-"))
     source = folder / f"source{suffix}"
@@ -785,8 +896,10 @@ async def convert_browser_preview(request: Request, video: UploadFile = File(...
         with source.open("wb") as target:
             while block := await video.read(1024 * 1024):
                 size += len(block)
-                if size > 500 * 1024 * 1024:
-                    raise HTTPException(413, "Video exceeds the 500 MB upload cap")
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
+                if upload_size is None:
+                    preflight_upload_space(size)
                 target.write(block)
         duration, has_video = probe_video(source)
         if not has_video:
@@ -1728,6 +1841,7 @@ async def export_project(request: Request, project_id: str, body: ExportRequest)
                                "formats": body.formats,
                                "unresolved_red_clips": result["unresolved_red_clips"],
                                "exported_with_unresolved_red": bool(result["unresolved_red_clips"])}
+    cleanup_project_intermediates(project_id)
     return result
 
 
@@ -1928,13 +2042,20 @@ async def delete_project(project_id: str) -> dict:
         upload_dir = (DATA_ROOT / "uploads" / project_id).resolve()
         if source.is_relative_to(upload_dir):
             source.unlink(missing_ok=True)
-    shutil.rmtree(DATA_ROOT / "uploads" / project_id, ignore_errors=True)
-    shutil.rmtree(DATA_ROOT / "exports" / project_id, ignore_errors=True)
+    data_root = DATA_ROOT.resolve()
+    for folder in (DATA_ROOT / "uploads" / project_id, DATA_ROOT / "exports" / project_id):
+        resolved = folder.resolve()
+        if resolved.is_relative_to(data_root) and resolved != data_root:
+            if resolved.is_dir():
+                shutil.rmtree(resolved)
+            if resolved.exists():
+                raise HTTPException(500, f"Could not remove all project files in {resolved.name}")
     with db.connect() as connection:
         connection.execute("DELETE FROM dubs WHERE clip_id IN (SELECT id FROM clips WHERE project_id=?)", (project_id,))
         connection.execute("DELETE FROM clips WHERE project_id=?", (project_id,))
         connection.execute("DELETE FROM terms WHERE project_id=?", (project_id,))
         connection.execute("DELETE FROM export_events WHERE project_id=?", (project_id,))
+        connection.execute("DELETE FROM credit_ledger WHERE project_id=?", (project_id,))
         connection.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
         connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
     return {"deleted": True}

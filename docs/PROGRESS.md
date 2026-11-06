@@ -102,17 +102,40 @@
 
 ### Tasks done
 
-- Task 1: pending commit. Atomic writes, uploads, and media/export command failures now normalize ENOSPC to a structured 507. The global JSON handler retains allowed CORS headers, upload temp files are removed, running project jobs are marked failed, and fetch errors shown in the UI are human-readable. Added disk-full atomic-write and upload/job/CORS cleanup tests. Backend suite and frontend build passed.
+- Task 1: `b0e6efc` (pushed). Atomic writes, uploads, and media/export command failures normalize ENOSPC to a structured 507. The global JSON handler retains allowed CORS headers, upload temp files are removed, running project jobs are marked failed, and fetch errors shown in the UI are human-readable. Added disk-full atomic-write and upload/job/CORS cleanup tests. Backend suite and frontend build passed.
+- Task 2: Part A pending commit. Uploads are rejected before writing when free space is below six times the uploaded size. The configured 500 MB cap is shown in the UI and oversized selections are blocked. Preflight tests cover low space and oversized files.
+- Task 3: Part A pending commit. Added `GET /api/storage`, Usage page used/free display and an 80% warning, plus startup storage logging and a warning below 20% free.
+- Task 4: Part A pending commit. Project deletion removes upload and export folders plus related database rows. Startup removes orphaned `.tmp` and zero-byte files while preserving voice files and the database, and flags missing source files as `files_removed`. The review screen explains the state and offers a confirmed delete action. Successful exports remove per-clip WAVs, temporary mixes, and duplicate browser previews when no resumable job exists. Tests cover deletion, cleanup, and preservation for interrupted jobs.
+- Part A checks passed: `python -m pytest tests -q`; `cd frontend && npm run build`.
 
 ### Current task
 
-- Task 2: preflight available disk space before accepting an upload and expose a maximum upload size.
+- Part A complete. Part B: small-volume storage budget, eviction, compressed working source, 24-hour export expiry, and measured disk use.
 
 ### Next task
 
-- Tasks 3 through 6, in order: storage visibility, cleanup, smaller working copies, and tests.
+- Part C: rewrite README and remove screenshot assets and tooling.
 
 ### Decisions
 
 - Keep generated exports based on the original source video; any compressed working copy is for preview and processing only.
 - Keep automatic age-based cleanup disabled unless the user explicitly configures it.
+
+## Round 5: finish storage, small volume, README
+
+### Tasks done
+
+- Round 4 Task 1 is complete at `b0e6efc`; Part A code and tests are complete, pending the Part A commit and push.
+
+### Current task
+
+- Part A: complete; checks passed. Verified `.gitignore` ignores `.env.local`, `.env.*`, `*.pem`, and `*.key`, with `.env.example` exempt. `git ls-files` reports only the intentionally exempt `.env.example` among those patterns. The two key-looking test literals in `tests/test_llm_client.py` are clearly fake fixtures; their values were masked.
+
+### Next task
+
+- Part B: enforce the Railway storage budget, use a verified 720p working source, expire exports, and measure disk usage. Part C: simplify the README and remove screenshot tooling.
+
+### Decisions
+
+- Follow the requested push cadence: after Part A, Part B, and Part C. Run the backend suite and frontend build before each push.
+- Do not rerun or repeat already completed Round 4 Task 1; keep the prior ignored-file and fake-fixture findings.

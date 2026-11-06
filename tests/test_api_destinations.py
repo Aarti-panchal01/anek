@@ -136,6 +136,139 @@ def test_upload_storage_failure_returns_507_marks_job_and_cleans_partial(monkeyp
         assert list(upload_folder.iterdir()) == []
 
 
+def test_upload_preflight_requires_six_times_file_size_before_writing(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Preflight", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 65})())
+        response = TestClient(app_module.app, raise_server_exceptions=False).put(
+            f"/api/projects/{project['id']}/video",
+            files={"video": ("source.mp4", b"0123456789abcdef", "video/mp4")},
+        )
+        assert response.status_code == 507
+        assert response.json()["error"] == "storage_full"
+        assert not (data_root / "uploads" / project["id"]).exists()
+
+
+def test_upload_preflight_rejects_files_over_the_configured_limit(monkeypatch):
+    with _sandbox(monkeypatch):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Too large", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 4)
+        response = TestClient(app_module.app, raise_server_exceptions=False).put(
+            f"/api/projects/{project['id']}/video",
+            files={"video": ("source.mp4", b"12345", "video/mp4")},
+        )
+        assert response.status_code == 413
+        assert "upload limit" in response.json()["detail"]
+
+
+def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
+    with _sandbox(monkeypatch):
+        monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
+            "Usage", (), {"total": 1000, "used": 750, "free": 250},
+        )())
+        assert _resolve(app_module.storage_status()) == {
+            "total_bytes": 1000, "used_bytes": 750, "free_bytes": 250,
+            "used_percent": 75.0, "free_percent": 25.0,
+        }
+
+
+def test_startup_cleanup_removes_orphans_but_preserves_voice_and_database(monkeypatch):
+    with _sandbox(monkeypatch) as (database, data_root):
+        data_root.mkdir(parents=True, exist_ok=True)
+        stale = data_root / "orphan.tmp"
+        empty = data_root / "empty.wav"
+        voice = data_root / "voices" / "keep.tmp"
+        stale.write_bytes(b"partial")
+        empty.write_bytes(b"")
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b"voice")
+        removed = app_module.cleanup_orphaned_files(data_root)
+        assert set(removed) == {stale, empty}
+        assert not stale.exists() and not empty.exists()
+        assert voice.read_bytes() == b"voice"
+        assert database.is_file()
+
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Missing source", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET video_path=? WHERE id=?", (str(data_root / "gone.mp4"), project["id"]))
+        assert app_module.mark_missing_project_sources() == [project["id"]]
+        assert app_module.project_row(project["id"])["status"] == "files_removed"
+
+
+def test_delete_project_removes_upload_exports_and_database_records(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Delete project", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        project_id = project["id"]
+        upload_dir = data_root / "uploads" / project_id
+        export_dir = data_root / "exports" / project_id
+        upload_dir.mkdir(parents=True)
+        export_dir.mkdir(parents=True)
+        source = upload_dir / "source.mp4"
+        source.write_bytes(b"source")
+        (upload_dir / "browser.mp4").write_bytes(b"preview")
+        (export_dir / "dub.mp4").write_bytes(b"export")
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET video_path=? WHERE id=?", (str(source), project_id))
+
+        assert _resolve(app_module.delete_project(project_id)) == {"deleted": True}
+        assert not upload_dir.exists() and not export_dir.exists()
+        with db.connect() as connection:
+            assert connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None
+
+
+def test_export_cleanup_removes_intermediates_but_keeps_source_final_and_resume_files(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Export cleanup", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        project_id = project["id"]
+        upload_dir = data_root / "uploads" / project_id
+        export_dir = data_root / "exports" / project_id
+        clip_audio = export_dir / "clips" / "hi-IN" / "clip_001.wav"
+        temp_mix = export_dir / ".anek-tmp" / "stage" / "mix.wav"
+        source = upload_dir / "source.mp4"
+        preview = upload_dir / "browser.mp4"
+        final = export_dir / "dub_hi-IN_ai-dubbed.mp4"
+        checkpoint = export_dir / ".job-checkpoint.json"
+        for path, content in ((source, b"source"), (preview, b"preview"), (clip_audio, b"clip"),
+                              (temp_mix, b"mix"), (final, b"final"), (checkpoint, b"resume")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET video_path=? WHERE id=?", (str(source), project_id))
+            connection.execute(
+                "INSERT INTO clips(id,project_id,idx,start_s,end_s) VALUES(?,?,?,?,?)",
+                ("cleanup-clip", project_id, 0, 0, 1),
+            )
+            connection.execute(
+                "INSERT INTO dubs(id,clip_id,lang,audio_path) VALUES(?,?,?,?)",
+                ("cleanup-dub", "cleanup-clip", "hi-IN", str(clip_audio)),
+            )
+            connection.execute(
+                "INSERT INTO jobs(id,project_id,kind,state,stage,total) VALUES(?,?,?,?,?,?)",
+                ("cleanup-job", project_id, "dub", "interrupted", "interrupted", 1),
+            )
+
+        assert app_module.cleanup_project_intermediates(project_id) == []
+        assert clip_audio.is_file() and temp_mix.is_file() and preview.is_file()
+        with db.connect() as connection:
+            connection.execute("UPDATE jobs SET state='complete' WHERE id='cleanup-job'")
+        removed = app_module.cleanup_project_intermediates(project_id)
+        assert clip_audio in removed and temp_mix in removed and preview in removed
+        assert source.is_file() and final.is_file() and checkpoint.is_file()
+        assert not clip_audio.exists() and not temp_mix.exists() and not preview.exists()
+        with db.connect() as connection:
+            assert connection.execute("SELECT audio_path FROM dubs WHERE id='cleanup-dub'").fetchone()[0] is None
+
+
 def _make_media_project(data_root):
     project = _resolve(app_module.create_project(app_module.ProjectCreate(
         name="Media route test", source_lang="en-IN", target_langs=["hi-IN"],
