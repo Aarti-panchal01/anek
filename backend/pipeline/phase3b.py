@@ -40,12 +40,21 @@ CONTENT_TONES = {
 OVERRUN_TOLERANCE_S = 0.10
 MAX_ATEMPO_SPEEDUP = 1.15
 EXPORT_DURATION_TOLERANCE_S = 0.05
+# Shared cold-start estimate. Later clips use the measured Gnani TTS rate for
+# that target-language voice, so no target language has a special-case rate.
+INITIAL_TARGET_CHARS_PER_SECOND = 12.0
+SENTENCE_ENDINGS = r".!?।॥。！？؟։"
 
 
 def run_command(args: list[str], capture: bool = True) -> str:
     runner = run_atomic_command if Path(args[0]).name.lower().startswith("ffmpeg") else subprocess.run
     result = runner(args, check=True, capture_output=capture, text=True)
     return result.stdout if capture else ""
+
+
+def timing_character_budget(slot_seconds: float, chars_per_second: float = INITIAL_TARGET_CHARS_PER_SECOND) -> int:
+    """Return a common starting text estimate; generated audio drives later fitting."""
+    return max(1, round(max(0.0, slot_seconds) * max(0.1, chars_per_second)))
 
 
 def duration_of(path: Path) -> float:
@@ -230,12 +239,12 @@ def merge_incomplete_chunks(chunks: list[dict], transcribe, max_seconds: float =
     for row in chunks:
         merged.append(row)
         while len(merged) > 1 and (
-            not re.search(r"[.!?।॥][\"'’”)]*$", merged[-2]["raw"].strip())
+            not re.search(rf"[{re.escape(SENTENCE_ENDINGS)}][\"'’”)]*$", merged[-2]["raw"].strip())
             or merged[-2]["end"] - merged[-2]["start"] < min_seconds
         ):
             left, right = merged[-2], merged[-1]
             if right["end"] - left["start"] > max_seconds:
-                if not re.search(r"[.!?।॥][\"'’”)]*$", left["raw"].strip()):
+                if not re.search(rf"[{re.escape(SENTENCE_ENDINGS)}][\"'’”)]*$", left["raw"].strip()):
                     left["cut_mid_sentence"] = True
                 break
             joined = transcribe(left["start"], right["end"])
@@ -248,7 +257,34 @@ def merge_incomplete_chunks(chunks: list[dict], transcribe, max_seconds: float =
 
 
 def transcript_sentences(text: str) -> list[str]:
-    return [part.strip() for part in re.split(r"(?<=[.!?।॥])\s+", text) if part.strip()]
+    # Split at Unicode sentence endings used across the configured Indic scripts,
+    # plus common international punctuation and explicit line boundaries.
+    # CJK full stops and question/exclamation marks do not require a following
+    # space; other scripts split at punctuation followed by whitespace.
+    return [part.strip() for part in re.split(
+        rf"(?<=[.!?।॥؟։])\s+|(?<=[。！？])\s*|[\r\n]+", text,
+    ) if part.strip()]
+
+
+def normalize_provider_transcript(response: dict | str) -> str:
+    """Accept Gnani STT's documented top-level and nested response shapes."""
+    if isinstance(response, str):
+        transcript = response
+    elif isinstance(response, dict):
+        transcript = response.get("transcript") or response.get("text")
+        if not transcript and isinstance(response.get("data"), dict):
+            transcript = response["data"].get("transcript") or response["data"].get("text")
+    else:
+        transcript = None
+    if not isinstance(transcript, str) or not transcript.strip():
+        raise ValueError("Speech provider returned no transcript text")
+    return transcript.strip()
+
+
+def transcribe_generated_speech(gnani, audio: bytes, language: str) -> dict:
+    """Use Gnani STT to check target-language audio produced by Gnani TTS."""
+    response = gnani.stt(audio, language, "prisma-v3.0")
+    return {"transcript": normalize_provider_transcript(response), "detected_language_code": language}
 
 
 def transcript_word_differences(left: str, right: str) -> list[dict[str, str]]:
@@ -399,7 +435,7 @@ def paragraph_translation_candidates(
                 "start_s": round(row["start"], 3),
                 "end_s": round(row["end"], 3),
                 "source_text": row["cleaned"],
-                "target_character_budget": max(32, round((row["end"] - row["start"]) * chars_per_second)),
+                "target_character_budget": timing_character_budget(row["end"] - row["start"], chars_per_second),
                 "uncertain_phrases": [
                     item.get("to", item["from"])
                     for item in row.get("cleanup_changes", [])
@@ -714,12 +750,20 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
 
     stt_cache = checkpoint_state.setdefault("stt_cache", {})
 
-    def cached_stt(audio: bytes, language: str, model: str, **options) -> dict:
+    def cached_stt(audio: bytes, language: str, model: str, *, provider: str = "sarvam", **options) -> dict:
         digest = hashlib.sha256(audio).hexdigest()
-        cache_key = json.dumps([digest, language, model, options], sort_keys=True, ensure_ascii=False)
+        key_parts = [digest, language, model, options]
+        if provider != "sarvam":
+            key_parts.insert(0, provider)
+        cache_key = json.dumps(key_parts, sort_keys=True, ensure_ascii=False)
         if cache_key not in stt_cache:
             check_continue()
-            stt_cache[cache_key] = sarvam_stt.stt(audio, language_code=language, **options)
+            if provider == "sarvam":
+                stt_cache[cache_key] = sarvam_stt.stt(audio, language_code=language, **options)
+            elif provider == "gnani":
+                stt_cache[cache_key] = transcribe_generated_speech(gnani, audio, language)
+            else:
+                raise ValueError(f"Unknown transcription provider: {provider}")
             checkpoint("transcript")
         return stt_cache[cache_key]
 
@@ -843,8 +887,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             check_continue()
             checkpoint_state["current_language"] = target_lang
             language_rows = []
-            # Seeded from the measured raw-reference Hindi A/B line (88 chars / 4.894 s).
-            measured_chars_per_second = 17.98 if target_lang == "hi-IN" else 12.0
+            # Use one cold-start estimate for every language; update from measured TTS below.
+            measured_chars_per_second = INITIAL_TARGET_CHARS_PER_SECOND
             translation_sheet_data = term_sheet.model_dump()
             for term_index, term in enumerate(translation_sheet_data["terms"]):
                 if term.get("rule_type") == "protected" or term.get("locked"):
@@ -928,7 +972,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     idioms=[idiom for idiom in term_sheet.idioms if idiom.phrase.casefold() in row["cleaned"].casefold()],
                 )
                 uncertainties = [item.get("to", item["from"]) for item in row["cleanup_changes"] if "uncertain source retained" in item.get("reason", "").casefold()]
-                duration_budget_chars = max(48, int(slot * measured_chars_per_second))
+                duration_budget_chars = timing_character_budget(slot, measured_chars_per_second)
                 retune_instruction = "Selected from the full-paragraph translation."
                 synthesis_history = []
                 sentence_audio = None
@@ -1124,7 +1168,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                 if recovery_step:
                     LOGGER.info("Timing recovery for %s clip %s: %s", target_lang, clip_index + 1, recovery_step)
-                transcript = cached_stt(sentence_audio.read_bytes(), target_lang, "saaras:v3", format="transcribe")
+                transcript = cached_stt(
+                    sentence_audio.read_bytes(), target_lang, "prisma-v3.0", provider="gnani",
+                )
                 audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
                 translation_checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
                 meaning_check_failed = False

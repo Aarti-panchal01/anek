@@ -16,6 +16,10 @@ from backend.pipeline.phase3b import (
     merge_incomplete_chunks,
     revise_for_timing,
     shorter_timing_budget,
+    INITIAL_TARGET_CHARS_PER_SECOND,
+    normalize_provider_transcript,
+    transcribe_generated_speech,
+    timing_character_budget,
     should_reuse_completed_clip,
     prepare_language_retry_checkpoint,
     silence_chunks,
@@ -137,6 +141,39 @@ def test_synthesis_sentences_and_srt_preserve_cue_times():
     srt = create_srt([{"start_s": 0, "end_s": 2.5, "translation": "வணக்கம்"}])
     assert "00:00:00,000 --> 00:00:02,500" in srt
     assert "வணக்கம்" in srt
+
+
+@pytest.mark.parametrize("target_lang", LANGUAGES)
+def test_all_target_languages_use_gnani_for_generated_speech_stt(target_lang):
+    class GnaniSpy:
+        def __init__(self):
+            self.call = None
+
+        def stt(self, audio, language_code, model):
+            self.call = (audio, language_code, model)
+            return {"success": True, "data": {"text": f"spoken {target_lang}"}}
+
+    gnani = GnaniSpy()
+    result = transcribe_generated_speech(gnani, b"generated wav", target_lang)
+
+    assert gnani.call == (b"generated wav", target_lang, "prisma-v3.0")
+    assert result["transcript"] == f"spoken {target_lang}"
+    assert result["detected_language_code"] == target_lang
+    # The first translation budget is identical for all languages, then timing
+    # recovery learns the actual TTS rate from generated audio.
+    assert INITIAL_TARGET_CHARS_PER_SECOND == 12.0
+    assert timing_character_budget(3.9) == 47
+
+
+def test_gnani_transcript_response_shapes_and_multiscript_sentence_boundaries():
+    assert normalize_provider_transcript({"text": "  नमस्ते  "}) == "नमस्ते"
+    assert normalize_provider_transcript({"data": {"transcript": "ನಮಸ್ಕಾರ"}}) == "ನಮಸ್ಕಾರ"
+    with pytest.raises(ValueError, match="no transcript"):
+        normalize_provider_transcript({"success": True, "data": {}})
+    assert transcript_sentences("पहला वाक्य। दूसरा वाक्य! ಒಳ್ಳೆಯದು. ಕೊನೆಯದು\nअगली पंक्ति") == [
+        "पहला वाक्य।", "दूसरा वाक्य!", "ಒಳ್ಳೆಯದು.", "ಕೊನೆಯದು", "अगली पंक्ति",
+    ]
+    assert transcript_sentences("First. 第二句。第三句！") == ["First.", "第二句。", "第三句！"]
 
 
 def test_sentence_join_rewrites_gnani_streaming_frame_count(monkeypatch, tmp_path):
