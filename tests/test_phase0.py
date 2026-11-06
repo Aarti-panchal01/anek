@@ -1,4 +1,6 @@
 import pytest
+import wave
+from io import BytesIO
 
 from backend.clients.gnani import MockGnaniClient, create_gnani_client
 from backend.clients.llm import MockLLMClient, create_llm_client
@@ -38,6 +40,14 @@ def test_mock_clients_are_selectable_and_never_call_live_services():
     response = llm.chat_json([])
     assert transcript["text"].startswith("Synthetic")
     assert response["mock"] is True
+
+
+def test_gnani_mock_synthesizes_a_valid_nonempty_wav_for_player_tests():
+    payload = MockGnaniClient().synth_stock("नमस्ते", "Shivani", "hi-IN")
+    with wave.open(BytesIO(payload), "rb") as audio:
+        assert audio.getnframes() > 0
+        assert audio.getframerate() > 0
+        assert audio.getnchannels() == 1
 
 
 @pytest.mark.parametrize(

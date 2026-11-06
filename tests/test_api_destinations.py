@@ -102,7 +102,7 @@ def test_video_upload_keeps_compatible_source_unchanged(monkeypatch):
         assert list(source.parent.iterdir()) == [source]
         assert result["filename"] == "source.mp4"
         assert result["evicted_projects"] == []
-        assert result["preview_notice"] is None
+        assert result["preview_status"] == "pending"
 
 
 def test_browser_detector_keeps_h264_mp4_without_video_conversion(monkeypatch, tmp_path):
@@ -138,7 +138,7 @@ def test_upload_falls_back_to_original_when_browser_conversion_fails(monkeypatch
             files={"video": ("source.mov", b"original hevc bytes", "video/quicktime")},
         )
         assert response.status_code == 200
-        assert "preview may not play" in response.json()["preview_notice"]
+        assert response.json()["preview_status"] == "pending"
         original = data_root / "uploads" / project["id"] / "source.mov"
         assert original.read_bytes() == b"original hevc bytes"
         assert app_module.project_row(project["id"])["video_path"] == str(original)
@@ -234,15 +234,26 @@ def test_storage_eviction_removes_oldest_finished_only(monkeypatch):
 
 def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
     with _sandbox(monkeypatch):
+        monkeypatch.setattr(app_module, "managed_data_bytes", lambda: 750)
         monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
             "Usage", (), {"total": 1000, "used": 750, "free": 250},
         )())
         assert _resolve(app_module.storage_status()) == {
-            "total_bytes": 1000, "used_bytes": 750, "free_bytes": 250,
+            "total_bytes": 1000, "used_bytes": 750, "managed_used_bytes": 750, "free_bytes": 250,
             "used_percent": 75.0, "free_percent": 25.0,
             "budget_bytes": 1000, "budget_percent": 100.0, "budget_used_percent": 75.0,
             "export_retention_hours": 24,
         }
+
+
+def test_project_budget_uses_managed_data_not_volume_used_bytes(monkeypatch):
+    with _sandbox(monkeypatch):
+        _roomy_disk(monkeypatch)
+        monkeypatch.setattr(app_module, "managed_data_bytes", lambda: 1024)
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Volume usage isolation", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        assert app_module.ensure_storage_room(project["id"], 4096) == []
 
 
 def test_expired_exports_are_removed_after_configured_retention(monkeypatch):
@@ -370,7 +381,8 @@ def _make_media_project(data_root):
     source = source_dir / "source.mp4"
     source.write_bytes(b"source-video")
     with db.connect() as connection:
-        connection.execute("UPDATE projects SET video_path=? WHERE id=?", (str(source), project["id"]))
+        connection.execute("UPDATE projects SET video_path=?,original_video_path=?,preview_path=?,preview_status='ready' WHERE id=?",
+                           (str(source), str(source), str(source), project["id"]))
     export_dir = data_root / "exports" / project["id"]
     export_dir.mkdir(parents=True)
     dubbed = export_dir / "sample_hi-IN_ai-dubbed.mp4"
@@ -383,6 +395,7 @@ def test_project_media_range_request_returns_partial_content_and_headers(monkeyp
         project_id, source, dubbed = _make_media_project(data_root)
         monkeypatch.setattr(app_module, "browser_video_path", lambda path: path)
         monkeypatch.setattr(app_module, "browser_dubbed_video_path", lambda path: path)
+        monkeypatch.setattr(app_module, "_browser_transcode_reason", lambda path: None)
         monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
         response = TestClient(app_module.app).get(
             f"/api/projects/{project_id}/video", headers={"Range": "bytes=2-5"},
@@ -400,6 +413,7 @@ def test_project_video_and_dubbed_media_without_range_return_full_content(monkey
         project_id, source, dubbed = _make_media_project(data_root)
         monkeypatch.setattr(app_module, "browser_video_path", lambda path: path)
         monkeypatch.setattr(app_module, "browser_dubbed_video_path", lambda path: path)
+        monkeypatch.setattr(app_module, "_browser_transcode_reason", lambda path: None)
         monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
         client = TestClient(app_module.app)
 
@@ -412,6 +426,59 @@ def test_project_video_and_dubbed_media_without_range_return_full_content(monkey
             assert response.headers["accept-ranges"] == "bytes"
         assert source_response.content == source.read_bytes()
         assert dubbed_response.content == dubbed.read_bytes()
+
+
+def test_project_video_waits_for_background_preview_and_retry_is_explicit(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, source, _ = _make_media_project(data_root)
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET preview_status='pending',preview_path=NULL WHERE id=?", (project_id,))
+        monkeypatch.setattr(app_module, "browser_video_path", lambda *_: pytest.fail("GET must not convert media"))
+        client = TestClient(app_module.app)
+        response = client.get(f"/api/projects/{project_id}/video")
+        assert response.status_code == 202
+        assert response.json()["preview_status"] == "pending"
+        assert response.headers["retry-after"] == "2"
+
+        queued = []
+        monkeypatch.setattr(app_module, "queue_project_preview", lambda project: queued.append(project))
+        retry = client.post(f"/api/projects/{project_id}/preview/retry")
+        assert retry.status_code == 202
+        assert retry.json()["status"] == "pending"
+        assert queued == [project_id]
+        assert app_module.project_row(project_id)["preview_status"] == "pending"
+
+
+def test_project_video_falls_back_to_original_when_prepared_copy_is_invalid(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, source, _ = _make_media_project(data_root)
+        broken_copy = source.parent / "source-browser.mp4"
+        broken_copy.write_bytes(b"truncated")
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET preview_path=? WHERE id=?", (str(broken_copy), project_id))
+
+        def validate(path):
+            if Path(path) == broken_copy:
+                raise ValueError("ffprobe could not read prepared copy")
+
+        monkeypatch.setattr(app_module, "_validate_media_file", validate)
+        response = TestClient(app_module.app).get(f"/api/projects/{project_id}/video")
+        assert response.status_code == 200
+        assert response.content == source.read_bytes()
+
+
+def test_audio_track_download_is_nonempty_wav(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, _, _ = _make_media_project(data_root)
+        folder = data_root / "exports" / project_id
+        track = folder / "sample_hi-IN_phase3d_ai-dubbed_dubbed-track.wav"
+        track.write_bytes(b"RIFF" + b"\0" * 256)
+        response = TestClient(app_module.app).get(
+            f"/api/projects/{project_id}/downloads/track-dubbed?lang=hi-IN",
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        assert len(response.content) > 0
 
 
 @pytest.mark.parametrize("bad_media", [b"", b"truncated mp4"])
@@ -445,10 +512,9 @@ def test_dubbed_media_returns_clear_409_if_all_recovery_options_fail(monkeypatch
         def fail(*args):
             raise app_module.subprocess.CalledProcessError(1, ["ffprobe"], stderr="invalid media")
 
-        monkeypatch.setattr(app_module, "browser_dubbed_video_path", fail)
+        monkeypatch.setattr(app_module, "_browser_transcode_reason", fail)
         monkeypatch.setattr(app_module, "_rebuild_dubbed_preview", fail)
-        monkeypatch.setattr(app_module, "browser_video_path", fail)
-        monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
+        monkeypatch.setattr(app_module, "_validate_media_file", fail)
         response = TestClient(app_module.app).get(f"/api/projects/{project_id}/media?lang=hi-IN")
 
         assert response.status_code == 409
@@ -495,7 +561,8 @@ def test_browser_preview_conversion_is_single_threaded_and_does_not_scale(monkey
         assert "-preset" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-preset") + 1] == "veryfast"
         assert "-pix_fmt" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-pix_fmt") + 1] == "yuv420p"
         assert "-movflags" in ffmpeg_command and ffmpeg_command[ffmpeg_command.index("-movflags") + 1] == "+faststart"
-        assert "-vf" not in ffmpeg_command
+        assert "-vf" in ffmpeg_command
+        assert "scale=in_range=full:out_range=tv,format=yuv420p" in ffmpeg_command
         assert options["timeout"] == 240
 
 

@@ -108,6 +108,30 @@ class MockLLMClient:
             if isinstance(response, Exception):
                 raise response
             return response
+        system = messages[0].get("content", "") if messages else ""
+        try:
+            payload = json.loads(messages[-1].get("content", "{}")) if len(messages) > 1 else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if "Correct only clear speech" in system or "Correct only clear speech recognition" in system:
+            source = payload.get("transcript", "")
+            return {"cleaned_text": source, "changes": [], "uncertain_spans": []}
+        if "Translate the full source paragraph" in system:
+            language = payload.get("target_language")
+            phrase = "नमस्ते, यह एक नमूना अनुवाद है।" if language == "hi-IN" else "ನಮಸ್ಕಾರ, ಇದು ಮಾದರಿ ಅನುವಾದವಾಗಿದೆ." if language == "kn-IN" else "Hello, this is a sample translation."
+            spans = payload.get("timed_source_spans", [])
+            translations = [phrase for _ in spans]
+            return {"candidates": [{"translations": translations, "review_notes": []} for _ in range(3)]}
+        if "Select the complete paragraph candidate" in system or "Choose by strict priority" in system:
+            return {"selected_index": 0, "reason": "Deterministic mock selection."}
+        if "Independently back-translate" in system:
+            return {"back_translation": payload.get("source_text", ""), "meaning_preserved": True,
+                    "speech_act_preserved": True, "agency_preserved": True, "issues": [], "severity": "none"}
+        if ("terms" in system.casefold() and "idioms" in system.casefold()
+                and ("clips" in payload or "glossary" in payload)):
+            return {"terms": [], "idioms": []}
+        if "target_character_budget" in payload or payload.get("revision_mode"):
+            return {"translation": payload.get("current_translation") or payload.get("source_segment", "")}
         return {"ok": True, "mock": True, "messages": len(messages)}
 
 
@@ -475,6 +499,8 @@ class SarvamTranslationClient:
 
 def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClient:
     """Use Sarvam translation first, Groq next, and Gemini as the final fallback."""
+    if settings.llm_mock:
+        return primary
     primary = _with_circuit_breaker(primary)
     gemini = _create_gemini_fallback_chain(settings)
     fallback: LLMClient = FallbackLLMClient(primary, gemini) if gemini else primary
@@ -485,6 +511,8 @@ def create_translation_client(primary: LLMClient, settings: Settings) -> LLMClie
 
 def create_workflow_client(primary: LLMClient, settings: Settings) -> LLMClient:
     """Use Sarvam chat for translation QA and keep configured providers as fallbacks."""
+    if settings.llm_mock:
+        return primary
     primary = _with_circuit_breaker(primary)
     gemini = _create_gemini_fallback_chain(settings)
     fallback: LLMClient = FallbackLLMClient(primary, gemini) if gemini else primary

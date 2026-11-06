@@ -26,7 +26,7 @@ from backend.brain.termsheet import (
     mask_protected_terms, restore_protected_terms,
 )
 from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import LiveLLMClient, create_translation_client, create_workflow_client
+from backend.clients.llm import LiveLLMClient, MockLLMClient, create_translation_client, create_workflow_client
 from backend.config import LANGUAGES, Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -659,7 +659,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             checkpoint("transcript")
         return stt_cache[cache_key]
 
-    llm = LiveLLMClient(settings)
+    llm = MockLLMClient() if settings.llm_mock else LiveLLMClient(settings)
     workflow_llm = create_workflow_client(llm, settings)
     translator = create_translation_client(llm, settings)
     all_outputs = []

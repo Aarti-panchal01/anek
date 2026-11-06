@@ -35,7 +35,8 @@ def test_mock_bilingual_job_survives_interruption_and_exports_playable_media(mon
             ], check=True, capture_output=True)
             video_duration = _probe_duration(source)
             with db.connect() as connection:
-                connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='processing' WHERE id=?", (str(source), video_duration, project["id"]))
+                connection.execute("UPDATE projects SET video_path=?,original_video_path=?,preview_path=?,preview_status='ready',duration_s=?,status='processing' WHERE id=?",
+                                   (str(source), str(source), str(source), video_duration, project["id"]))
                 connection.execute(
                     "INSERT INTO jobs(id,project_id,kind,content_type,translation_style,voice_mode,stock_voice,state,stage,total) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     ("smoke-job", project["id"], "dub", "explainer", "neutral", "stock", "Shivani", "pending", "queued", 2),

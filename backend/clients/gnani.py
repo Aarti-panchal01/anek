@@ -1,7 +1,11 @@
 """Gnani REST client using the request shapes in its public API docs."""
 
 import json
+import math
+import struct
 import time
+import wave
+from io import BytesIO
 from typing import Protocol
 
 import httpx
@@ -27,10 +31,26 @@ class MockGnaniClient:
         return {"embedding": "mock-embedding", "shape": [1, 768], "dtype": "mock"}
 
     def synth(self, text: str, speaker_embedding: dict) -> bytes:
-        return b"mock-audio"
+        return self._wav()
 
     def synth_stock(self, text: str, voice: str, language: str, speed: float = 1.0) -> bytes:
-        return b"mock-audio"
+        return self._wav()
+
+    @staticmethod
+    def _wav() -> bytes:
+        """Return a short valid tone so browser and ffmpeg smoke tests can play mocks."""
+        sample_rate = 24_000
+        frames = 9_600
+        output = BytesIO()
+        with wave.open(output, "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(sample_rate)
+            audio.writeframes(b"".join(
+                struct.pack("<h", int(4_000 * math.sin(2 * math.pi * 440 * index / sample_rate)))
+                for index in range(frames)
+            ))
+        return output.getvalue()
 
 
 class LiveGnaniClient:

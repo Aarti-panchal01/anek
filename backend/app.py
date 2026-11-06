@@ -52,6 +52,7 @@ LOGGER = logging.getLogger(__name__)
 _shutdown_requested = threading.Event()
 _active_job_tasks: set[asyncio.Task] = set()
 _storage_maintenance_task: asyncio.Task | None = None
+_preview_tasks: dict[str, asyncio.Task] = {}
 
 
 class JobInterrupted(Exception):
@@ -64,6 +65,58 @@ async def schedule_job(job_id: str) -> None:
     task = asyncio.create_task(run_job(job_id))
     _active_job_tasks.add(task)
     task.add_done_callback(_active_job_tasks.discard)
+
+
+async def prepare_project_preview(project_id: str) -> None:
+    """Prepare one browser copy per upload and persist its outcome."""
+    current = asyncio.current_task()
+    try:
+        project = project_row(project_id)
+        original_value = project.get("original_video_path") or project.get("video_path")
+        if not original_value:
+            raise FileNotFoundError("Original upload is missing")
+        original = Path(original_value)
+        if not original.is_file():
+            raise FileNotFoundError("Original upload is missing")
+        reason = await asyncio.to_thread(_browser_transcode_reason, original)
+        if reason is None:
+            playable = original
+        else:
+            playable = original.parent / "source-browser.mp4"
+            await asyncio.to_thread(create_browser_compatible_copy, original, playable)
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE projects SET video_path=?,preview_path=?,preview_status='ready',preview_error=NULL WHERE id=?",
+                (str(playable), str(playable), project_id),
+            )
+    except Exception as error:
+        LOGGER.exception("Project browser preview preparation failed project_id=%s", project_id)
+        try:
+            project = project_row(project_id)
+            original = project.get("original_video_path") or project.get("video_path")
+            with db.connect() as connection:
+                connection.execute(
+                    "UPDATE projects SET video_path=?,preview_path=NULL,preview_status='failed',preview_error=? WHERE id=?",
+                    (original, str(error)[:1000], project_id),
+                )
+        except Exception:
+            LOGGER.exception("Could not persist preview failure project_id=%s", project_id)
+    finally:
+        if _preview_tasks.get(project_id) is current:
+            _preview_tasks.pop(project_id, None)
+
+
+def queue_project_preview(project_id: str) -> asyncio.Task | None:
+    existing = _preview_tasks.get(project_id)
+    if existing and not existing.done():
+        return existing
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    task = loop.create_task(prepare_project_preview(project_id))
+    _preview_tasks[project_id] = task
+    return task
 
 
 def log_runtime_configuration(config=settings, environment: dict[str, str] | None = None) -> None:
@@ -244,6 +297,7 @@ def create_browser_compatible_copy(source: Path, output: Path) -> None:
     run_atomic_command(
         ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
          "-threads", "1", "-threads:v", "1", "-c:v", "libx264", "-preset", "veryfast",
+         "-vf", "scale=in_range=full:out_range=tv,format=yuv420p", "-color_range", "tv",
          "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(output)],
         check=True, capture_output=True, timeout=240,
     )
@@ -275,6 +329,20 @@ def _delete_project_data(project_id: str) -> dict:
     return {"id": project_id, "name": project["name"]}
 
 
+def managed_data_bytes() -> int:
+    total = 0
+    if not DATA_ROOT.exists():
+        return 0
+    root = DATA_ROOT.resolve()
+    for path in DATA_ROOT.rglob("*"):
+        try:
+            if path.is_file() and path.resolve().is_relative_to(root):
+                total += path.stat().st_size
+        except OSError:
+            LOGGER.warning("Could not measure stored file path=%s", path)
+    return total
+
+
 def ensure_storage_room(project_id: str, upload_size: int) -> list[dict[str, str]]:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     required = max(0, upload_size) * UPLOAD_WORKING_COPY_MULTIPLIER
@@ -287,7 +355,7 @@ def ensure_storage_room(project_id: str, upload_size: int) -> list[dict[str, str
                 "SELECT id,name FROM projects WHERE status='complete' AND id<>? ORDER BY created_at ASC,id ASC",
                 (project_id,),
             ).fetchall()
-        over_budget = disk.used + required > budget or disk.free < required
+        over_budget = managed_data_bytes() + required > budget or disk.free < required
         over_project_count = len(finished) >= MAX_FINISHED_PROJECTS
         if not over_budget and not over_project_count:
             return evicted
@@ -692,11 +760,12 @@ async def startup() -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     disk = shutil.disk_usage(DATA_ROOT)
     free_pct = disk.free / disk.total if disk.total else 0
-    LOGGER.info("Storage at startup total_bytes=%s used_bytes=%s free_bytes=%s free_percent=%.1f",
-                disk.total, disk.used, disk.free, free_pct * 100)
+    managed_used = managed_data_bytes()
+    LOGGER.info("Storage at startup volume_total_bytes=%s volume_free_bytes=%s managed_used_bytes=%s free_percent=%.1f",
+                disk.total, disk.free, managed_used, free_pct * 100)
     budget = min(disk.total, STORAGE_BUDGET_BYTES)
-    if disk.used >= budget * 0.8:
-        LOGGER.warning("Storage is nearing the configured budget used_bytes=%s budget_bytes=%s", disk.used, budget)
+    if managed_used >= budget * 0.8 or free_pct < 0.2:
+        LOGGER.warning("Storage is nearing its limit managed_used_bytes=%s budget_bytes=%s volume_free_bytes=%s", managed_used, budget, disk.free)
     mark_invalid_media_for_regeneration(DATA_ROOT / "exports", LOGGER)
     removed = cleanup_orphaned_files(DATA_ROOT)
     if removed:
@@ -710,6 +779,9 @@ async def startup() -> None:
         for row in interrupted:
             connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (row["project_id"],))
         pending = connection.execute("SELECT id FROM jobs WHERE state='pending'").fetchall()
+        preview_pending = connection.execute("SELECT id FROM projects WHERE preview_status='pending' AND original_video_path IS NOT NULL").fetchall()
+    for item in preview_pending:
+        queue_project_preview(item["id"])
     for item in pending:
         await schedule_job(item["id"])
     cleanup_expired_exports()
@@ -736,15 +808,17 @@ async def storage_status() -> dict:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(DATA_ROOT)
     budget = min(usage.total, STORAGE_BUDGET_BYTES)
+    managed_used = managed_data_bytes()
     return {
         "total_bytes": usage.total,
         "used_bytes": usage.used,
+        "managed_used_bytes": managed_used,
         "free_bytes": usage.free,
         "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
         "free_percent": round(usage.free / usage.total * 100, 1) if usage.total else 0,
         "budget_bytes": budget,
         "budget_percent": round(budget / usage.total * 100, 1) if usage.total else 0,
-        "budget_used_percent": round(usage.used / budget * 100, 1) if budget else 0,
+        "budget_used_percent": round(managed_used / budget * 100, 1) if budget else 0,
         "export_retention_hours": settings.export_retention_hours,
     }
 
@@ -1030,32 +1104,15 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if duration > settings.max_video_seconds:
         path.unlink(missing_ok=True)
         raise HTTPException(413, f"Video is {duration:.1f}s; maximum is {settings.max_video_seconds}s")
-    preview_notice = None
-    stored_path = path
-    try:
-        transcode_reason = _browser_transcode_reason(path)
-    except Exception as error:
-        LOGGER.warning("Could not inspect uploaded video for browser playback path=%s error=%s; keeping original", path, error)
-        transcode_reason = None
-        preview_notice = "The video was uploaded and kept as-is. Its browser preview could not be checked; if it does not play, try exporting an H.264 MP4."
-    if transcode_reason:
-        converted = folder / "source-browser.mp4"
-        try:
-            create_browser_compatible_copy(path, converted)
-            converted_duration, converted_has_video = probe_video(converted)
-            if not converted_has_video or abs(converted_duration - duration) > 0.1:
-                raise RuntimeError("Converted video failed duration or stream verification")
-            path.unlink()
-            stored_path = converted
-        except Exception as error:
-            converted.unlink(missing_ok=True)
-            LOGGER.warning("Upload compatibility conversion failed path=%s reason=%s error=%s; keeping original",
-                           path, transcode_reason, error)
-            preview_notice = "The video was uploaded and kept in its original format, but its browser preview may not play. You can still continue dubbing."
+    preview_notice = "Preparing a browser-compatible preview in the background."
     with db.connect() as connection:
-        connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='uploaded' WHERE id=?", (str(stored_path), duration, project_id))
+        connection.execute(
+            "UPDATE projects SET video_path=?,original_video_path=?,preview_path=NULL,preview_status='pending',preview_error=NULL,duration_s=?,status='uploaded' WHERE id=?",
+            (str(path), str(path), duration, project_id),
+        )
+    queue_project_preview(project_id)
     return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id,
-            "evicted_projects": evicted_projects, "preview_notice": preview_notice}
+            "evicted_projects": evicted_projects, "preview_notice": preview_notice, "preview_status": "pending"}
 
 
 @app.post("/api/media/browser-preview")
@@ -1107,14 +1164,39 @@ async def project_video(project_id: str, request: Request):
     project = project_row(project_id)
     if not project["video_path"]:
         raise HTTPException(404, "Project video not found")
-    try:
-        playable = browser_video_path(Path(project["video_path"]))
-    except Exception as error:
-        if is_storage_full(error):
-            raise StorageFullError() from error
-        LOGGER.exception("Project video preview conversion failed for project %s", project_id)
-        raise HTTPException(422, "The uploaded video is saved, but this server could not prepare its preview. Try an H.264 MP4 export.") from error
-    return media_response(playable, request)
+    if project.get("preview_status") == "pending":
+        return JSONResponse({"preview_status": "pending"}, status_code=202, headers={"Retry-After": "2"})
+    primary = project.get("preview_path") if project.get("preview_status") == "ready" else project.get("original_video_path") or project["video_path"]
+    fallback = project.get("original_video_path") or project["video_path"]
+    failures = []
+    candidates = list(dict.fromkeys(path for path in (primary, fallback) if path))
+    for candidate in candidates:
+        path = Path(candidate)
+        try:
+            _validate_media_file(path)
+            return media_response(path, request)
+        except Exception as error:
+            _log_media_failure(path, error)
+            failures.append(str(error)[:300])
+    reason = project.get("preview_error") or "; ".join(failures) or "No browser preview is available."
+    return JSONResponse({"error": "media_unavailable", "reason": reason}, status_code=409)
+
+
+@app.get("/api/projects/{project_id}/preview-status")
+async def project_preview_status(project_id: str) -> dict:
+    project = project_row(project_id)
+    return {"status": project.get("preview_status") or "ready", "reason": project.get("preview_error")}
+
+
+@app.post("/api/projects/{project_id}/preview/retry", status_code=202)
+async def retry_project_preview(project_id: str) -> dict:
+    project = project_row(project_id)
+    if not project.get("original_video_path") and not project.get("video_path"):
+        raise HTTPException(404, "Project video not found")
+    with db.connect() as connection:
+        connection.execute("UPDATE projects SET preview_status='pending',preview_error=NULL WHERE id=?", (project_id,))
+    queue_project_preview(project_id)
+    return {"status": "pending"}
 
 
 @app.get("/api/projects/{project_id}/voice-reference-preview")
@@ -1155,33 +1237,39 @@ async def dubbed_media(project_id: str, lang: str, request: Request):
     folder = DATA_ROOT / "exports" / project_id
     matches = list(folder.glob(f"*_{lang}*ai-dubbed.mp4"))
     failures: list[str] = []
+    if project.get("preview_status") == "pending":
+        return JSONResponse({"preview_status": "pending"}, status_code=202, headers={"Retry-After": "2"})
     if matches:
         candidate = matches[0]
         try:
-            playable = browser_dubbed_video_path(candidate)
-            _validate_media_file(playable)
-            return media_response(playable, request)
-        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            reason = _browser_transcode_reason(candidate)
+            if reason:
+                raise ValueError(reason)
+            _validate_media_file(candidate)
+            return media_response(candidate, request)
+        except Exception as error:
             _log_media_failure(candidate, error)
             failures.append("The dubbed video is incomplete or could not be converted.")
 
-    source = Path(project["video_path"]) if project.get("video_path") else None
+    source_value = project.get("preview_path") if project.get("preview_status") == "ready" else project.get("original_video_path") or project.get("video_path")
+    source = Path(source_value) if source_value else None
     if source is not None:
         try:
             rebuilt = _rebuild_dubbed_preview(project_id, lang, source, folder)
-            playable = browser_dubbed_video_path(rebuilt)
-            _validate_media_file(playable)
-            return media_response(playable, request)
-        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            reason = _browser_transcode_reason(rebuilt)
+            if reason:
+                raise ValueError(reason)
+            _validate_media_file(rebuilt)
+            return media_response(rebuilt, request)
+        except Exception as error:
             _log_media_failure(source, error)
             failures.append("The dubbed preview could not be rebuilt from its saved tracks.")
 
         try:
-            original_preview = browser_video_path(source)
-            _validate_media_file(original_preview)
-            return media_response(original_preview, request)
-        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
-            _log_media_failure(original_preview if "original_preview" in locals() else source, error)
+            _validate_media_file(source)
+            return media_response(source, request)
+        except Exception as error:
+            _log_media_failure(source, error)
             failures.append("The original video preview is unavailable.")
 
     reason = " ".join(failures) or "The dubbed video and original upload are unavailable."
@@ -1561,6 +1649,14 @@ async def run_job(job_id: str) -> None:
         voice = connection.execute("SELECT * FROM voices WHERE id=?", (job["voice_id"],)).fetchone() if job["voice_mode"] == "clone" else None
         checkpoint_state = json.loads(job["checkpoint_json"] or "{}")
         connection.execute("UPDATE jobs SET state='running',stage='resuming',error=NULL,attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
+    project = dict(project)
+    if project.get("preview_status") == "pending":
+        preview_task = _preview_tasks.get(project["id"])
+        if preview_task:
+            await preview_task
+        with db.connect() as connection:
+            project = connection.execute("SELECT * FROM projects WHERE id=?", (project["id"],)).fetchone()
+        project = dict(project)
     output_dir = DATA_ROOT / "exports" / project["id"]
     checkpoint_path = output_dir / f".job-{job_id}.checkpoint.json"
     if checkpoint_path.is_file():
@@ -2153,7 +2249,7 @@ def _rebuild_dubbed_preview(project_id: str, lang: str, source: Path, output_dir
     dubbed_track = _track_artifact_path(project_id, lang, "dubbed")
     if dubbed_track is None or not source.is_file():
         raise FileNotFoundError("Saved dubbed track or original upload is missing")
-    playable_source = browser_video_path(source)
+    playable_source = source
     duration, has_video = probe_video(playable_source)
     if not has_video:
         raise ValueError("Original upload has no video stream")

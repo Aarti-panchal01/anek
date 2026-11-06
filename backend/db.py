@@ -95,6 +95,16 @@ def initialize() -> None:
     """
     with connect() as db:
         db.executescript(schema)
+        project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
+        for name, definition in (
+            ("original_video_path", "TEXT"),
+            ("preview_path", "TEXT"),
+            ("preview_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("preview_error", "TEXT"),
+        ):
+            if name not in project_columns:
+                db.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
+        db.execute("UPDATE projects SET original_video_path=video_path WHERE original_video_path IS NULL AND video_path IS NOT NULL")
         job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
         if "clip_id" not in job_columns:
             db.execute("ALTER TABLE jobs ADD COLUMN clip_id TEXT")
