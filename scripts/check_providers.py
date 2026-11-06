@@ -29,6 +29,8 @@ def _category(exc: Exception) -> str:
         return "rate limited or quota exhausted"
     if status and int(status) >= 500:
         return "provider unavailable"
+    if status:
+        return f"HTTP {int(status)}"
     return "request failed"
 
 
@@ -43,9 +45,11 @@ def main() -> int:
     failed = False
     for code, name in LANGUAGES.items():
         try:
+            source_code = "hi-IN" if code == "en-IN" else "en-IN"
+            source_text = "नमस्ते, यह एक छोटा प्रदाता परीक्षण है।" if source_code == "hi-IN" else "Hello, this is a short provider check."
             result = client.text.translate(
-                input="Hello, this is a short provider check.",
-                source_language_code="en-IN", target_language_code=code,
+                input=source_text,
+                source_language_code=source_code, target_language_code=code,
                 model=settings.sarvam_translation_model, mode="formal",
                 request_options={"timeout_in_seconds": 45, "max_retries": 0},
             )

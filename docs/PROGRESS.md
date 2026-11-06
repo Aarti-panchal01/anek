@@ -171,3 +171,7 @@ Exact ffprobe outputs:
 
 - Docker follow-up validation: python -m pytest tests -q -o addopts='' passed (121 tests, 4 lifecycle deprecation warnings); cd frontend && npm run build passed.
 - Current: commit and push the image packaging fix. Next: wait for Railway deployment, run python scripts/check_providers.py remotely, inspect only the sanitized status output, and confirm the obsolete variable names remain absent.
+
+- Live check on deployment 6eefea6-db49-4921-b2c0-fd29ad63694a: Bengali, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil, Telugu, Saaras STT, and Gnani key presence were OK; English failed. The check used English as both source and target, which tested a no-op rather than English translation. Fixed the probe to translate Hindi into English and made same-language project targets reuse source text. Re-run against a fresh deployment is required.
+
+- English-target fix validation: python -m pytest tests -q -o addopts='' passed (122 tests, 4 existing lifecycle deprecation warnings); cd frontend && npm run build passed. The corrected provider check awaits deployment.

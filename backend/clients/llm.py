@@ -184,10 +184,14 @@ class SarvamTranslationClient:
                 mode = "formal"
             translations = []
             for span in spans:
+                source_language = payload.get("source_language") or "auto"
+                if source_language == target:
+                    translations.append(str(span.get("source_text", "")).strip())
+                    continue
                 try:
                     result = _provider_call(lambda span=span: self.client.text.translate(
                         input=span["source_text"],
-                        source_language_code=payload.get("source_language") or "auto",
+                        source_language_code=source_language,
                         target_language_code=target,
                         model=self.translation_model,
                         mode=mode,

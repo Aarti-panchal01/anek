@@ -66,6 +66,27 @@ def test_sarvam_rejects_unsupported_language_before_request():
         client.chat_json(messages)
 
 
+def test_same_language_translation_reuses_source_text_without_provider_call(monkeypatch):
+    client = _client()
+    calls = []
+
+    class Text:
+        def translate(self, **kwargs):
+            calls.append(kwargs)
+            raise AssertionError("same-language text does not need translation")
+
+    client.client = type("Sarvam", (), {"text": Text()})()
+    response = client.chat_json([
+        {"role": "system", "content": "Translate the full source paragraph"},
+        {"role": "user", "content": json.dumps({
+            "source_language": "en-IN", "target_language": "en-IN",
+            "timed_source_spans": [{"source_text": "Hello."}],
+        })},
+    ])
+    assert response["candidates"][0]["translations"] == ["Hello."]
+    assert not calls
+
+
 def test_shared_provider_retry_classifies_rate_limit_and_recovers(monkeypatch):
     monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
     monkeypatch.setattr("backend.clients.llm.time.sleep", lambda _: None)
