@@ -9,14 +9,15 @@
 - Task 4, Terms and edit persistence: `d063b83` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 - Task 5, Attempt history: `585d67f` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
 - Task 6, Editor UX: `96d5902` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
+- Production playback hotfix: `pending` — when ffprobe cannot read a dubbed MP4, `/media` serves the project's original upload; regression test added. Backend suite and frontend build passed.
 
 ## Current task
 
-- Complete. Final backend suite (`python -m pytest tests -q`) and frontend production build passed.
+- Complete. Final backend suite (`python -m pytest tests -q`) and frontend production build passed. Follow-up deployment diagnosis found `/media` returning 500 when ffprobe rejected an existing dubbed MP4; hotfix above is ready to ship.
 
 ## Next task
 
-- None.
+- Deploy the production playback hotfix and confirm Railway's latest deployment is active.
 
 ## Decisions
 
@@ -31,3 +32,4 @@
 - Task 5 stores attempt WAVs under the project's export directory and serves them through a clip-scoped endpoint. The first take has no previous audio; subsequent retries carry both versions.
 - Task 6 keeps attempts collapsed by default. Clicking a clip plays its timed range from the mixed dub, and the single-player mode is the default.
 - Current task: complete. Environment inventory was collected with variable names only.
+- Deployment diagnosis: the Railway deployment shown as Removed was superseded; the current service has a successful deployment, but production requests to `/api/projects/.../media` still returned 500 because `ffprobe` raised `CalledProcessError`. The UI consequently showed no dubbed video. The hotfix logs the failure and serves the original upload, preserving a visible video while dubbed media is unavailable.

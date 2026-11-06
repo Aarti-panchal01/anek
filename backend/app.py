@@ -745,12 +745,18 @@ async def voice_reference_preview(project_id: str, request: Request):
 @app.get("/api/projects/{project_id}/media")
 async def dubbed_media(project_id: str, lang: str, request: Request):
     enforce_ip_limit(request, "previews")
-    project_row(project_id)
+    project = project_row(project_id)
     folder = DATA_ROOT / "exports" / project_id
     matches = list(folder.glob(f"*_{lang}*ai-dubbed.mp4"))
     if not matches:
         raise HTTPException(404, "Dubbed video is not ready")
-    playable = browser_dubbed_video_path(matches[0])
+    try:
+        playable = browser_dubbed_video_path(matches[0])
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        LOGGER.exception("Dubbed video preview failed for project %s; serving the original upload", project_id)
+        if not project.get("video_path") or not Path(project["video_path"]).is_file():
+            raise HTTPException(422, "The dubbed video is unavailable and the original upload could not be served") from error
+        playable = Path(project["video_path"])
     return media_response(playable, request)
 
 

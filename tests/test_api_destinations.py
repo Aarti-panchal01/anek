@@ -133,6 +133,22 @@ def test_project_video_and_dubbed_media_without_range_return_full_content(monkey
         assert dubbed_response.content == dubbed.read_bytes()
 
 
+def test_dubbed_media_falls_back_to_original_when_ffprobe_fails(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, source, _ = _make_media_project(data_root)
+
+        def fail_probe(path):
+            raise app_module.subprocess.CalledProcessError(1, ["ffprobe", str(path)])
+
+        monkeypatch.setattr(app_module, "browser_dubbed_video_path", fail_probe)
+        response = TestClient(app_module.app).get(f"/api/projects/{project_id}/media?lang=hi-IN")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "video/mp4"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert response.content == source.read_bytes()
+
+
 def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         data_root.mkdir(parents=True, exist_ok=True)
