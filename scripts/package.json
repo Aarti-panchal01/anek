@@ -1,0 +1,11 @@
+{
+  "name": "anek-doc-screenshots",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "capture:screenshots": "node capture_screenshots.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.56.1"
+  }
+}

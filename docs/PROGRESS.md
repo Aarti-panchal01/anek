@@ -59,3 +59,40 @@
 - The previous fallback hotfix `f97b1ee` avoided a 500 by serving the upload, but this round replaces that shortcut with the requested recovery order and explicit unavailable state.
 - Task 1 considers a media file available only when it is non-empty and ffprobe finds a video stream; failed candidates are logged with stderr and size.
 - Task 6 smoke test uses deterministic mock job execution at the pipeline boundary so it can exercise application checkpoint/resume, persisted clips, API media delivery, and ffprobe locally without calling paid providers; the media artifacts themselves are generated with local FFmpeg.
+
+## Round 3: README
+
+### Tasks done
+
+- Verified and replaced the root README against `pyproject.toml`, frontend lock/config, FastAPI, Dockerfile, Railway config, `.env.example`, and current pipeline/UI code. Corrected the local dev port, added complete Vercel and Railway variable tables, documented current timing, terms, checkpoints, status states, smoke coverage, and the API-prefix build check. Rewrote both Mermaid diagrams and updated completed roadmap items.
+- Checked current files and Git history for key patterns without printing values. The ignored local `.env` contains configured keys; no committed real-key pattern was identified. Test fixtures in `tests/test_llm_client.py` use mocked provider values.
+- Confirmed `.gitignore` ignores `.env` and `data/`.
+
+### Current task
+
+- Complete. README verification and the requested security search are done.
+
+### Next task
+
+- Complete Round 3b screenshot seeding and automated capture, update README image links, run checks, commit, and push.
+
+### Decisions
+
+- Do not invent screenshots. Preserve links and mark missing images until the automated capture task produces them.
+
+## Round 3b: screenshots
+
+### Current task
+
+- Complete. Screenshot seeding, automated capture, README links, backend tests, and frontend build are done. Commit and push are the remaining actions.
+
+### Next task
+
+- Commit the completed README and screenshot documentation work, then push to main.
+
+### Decisions
+
+- Use a temporary `ANEK_DATA_DIR` and local deterministic demo fixtures. Do not commit demo video files or modify app behavior.
+- Use viewport 1440x900 at device scale factor 2. The six generated PNGs are each under 600 KB and were visually inspected.
+- Verification passed: `python -m pytest tests -q`; `cd frontend && npm run build` (including the API-prefix check).
+- The README includes links to all generated screenshots and notes that they use seeded demo data.

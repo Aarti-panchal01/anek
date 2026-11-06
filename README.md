@@ -1,242 +1,166 @@
 <div align="center">
 
-# anek
+# Anek
 
 **Speak once. India understands.**
 
-Dub your video into ten Indian languages in your own cloned voice, with every clip checked before you publish.
+Dub a video into ten Indian languages, review each clip, then export the result.
 
-[![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF?logo=vite&logoColor=white)](https://anek-tau.vercel.app)
-[![Backend](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://anek-production.up.railway.app)
-[![Deployed on Vercel](https://img.shields.io/badge/web-Vercel-000000?logo=vercel&logoColor=white)](https://anek-tau.vercel.app)
-[![Deployed on Railway](https://img.shields.io/badge/api-Railway-0B0D0E?logo=railway&logoColor=white)](https://anek-production.up.railway.app)
-
-[Live demo](https://anek-tau.vercel.app) | [Spec](SPEC.md) | [Eval report](EVAL.md)
+[Live app](https://anek-tau.vercel.app) | [Product spec](SPEC.md) | [Evaluation report](EVAL.md)
 
 </div>
 
-![Anek landing page](docs/images/landing.png)
-
----
-
-## Table of contents
-
-1. [What it does](#what-it-does)
-2. [Screenshots](#screenshots)
-3. [How a dub is made](#how-a-dub-is-made)
-4. [Architecture](#architecture)
-5. [Timing fit and recovery](#timing-fit-and-recovery)
-6. [Review states](#review-states)
-7. [Tech stack](#tech-stack)
-8. [Repository layout](#repository-layout)
-9. [Run it locally](#run-it-locally)
-10. [Environment variables](#environment-variables)
-11. [Deployment](#deployment)
-12. [Testing](#testing)
-13. [Known limitations](#known-limitations)
-14. [Roadmap](#roadmap)
-15. [Credits](#credits)
-
----
-
 ## What it does
 
-You upload a video of yourself talking. Anek:
+Anek transcribes a video once, applies project terms before translation, creates spoken translations with Gnani speech APIs, and fits each take to its timed clip. The review studio marks clips Green, Yellow, or Red and lets you edit or regenerate them before export.
 
-1. Listens to the speech and transcribes it.
-2. Lets you fix names and terms in a term sheet before anything is translated.
-3. Translates the script into up to ten Indian languages.
-4. Speaks each translation in a clone of your voice.
-5. Fits every spoken line into the time slot of the original clip.
-6. Flags anything it is not sure about, so you review it instead of publishing a bad dub.
-7. Exports a dubbed MP4 per language.
-
-The point is not just to dub. The point is to make sure the dub is right. Numbers, names, meaning and timing are checked per clip, and clips that fail a check are marked for you instead of being passed through quietly.
+The supported target languages are Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil, and Telugu. The source transcript is shared across targets.
 
 ## Screenshots
 
-| New dub | Review studio |
-| --- | --- |
-| ![New dub screen](docs/images/new-dub.png) | ![Review studio with clips and players](docs/images/review-studio.png) |
+![Anek landing page](docs/images/landing.png)
 
-| Clip review, Hindi | Clip review, Kannada |
-| --- | --- |
-| ![Hindi clip review](docs/images/clips-hindi.png) | ![Kannada clip review](docs/images/clips-kannada.png) |
+### New dub
 
-> Put your screenshots in `docs/images/` with these names. See [docs/images/README.md](docs/images/README.md) if you add one.
+![New dub screen](docs/images/new-dub.png)
 
-## How a dub is made
+### Review studio
+
+![Review studio with an active clip](docs/images/review-studio.png)
+
+### Clip review
+
+![Hindi clip review](docs/images/clips-hindi.png)
+
+![Kannada clip review](docs/images/clips-kannada.png)
+
+### Term memory
+
+![Term memory](docs/images/term-memory.png)
+
+Studio screenshots use seeded demo data. The landing page uses its built-in sample.
+
+## How dubbing works
 
 ```mermaid
 flowchart TD
-    A[Upload or record video] --> B[Voice consent recording]
-    B --> C[Voice setup: clone from your audio]
-    A --> D[Extract audio with ffmpeg]
-    D --> E[Speech to text with Gnani Prisma]
-    E --> F[Clean transcript and split into clips]
-    F --> G[Term sheet: names, brands, glossary]
-    G --> H{You approve the source?}
-    H -- edit --> G
-    H -- approve --> I[Translate each clip per language]
-    I --> J[Speak each clip in your cloned voice]
-    J --> K[Fit speech into the clip time slot]
-    K --> L[Quality checks per clip]
-    L --> M[Review studio: Green, Yellow, Red]
-    M -- edit or regenerate --> I
-    M -- approved --> N[Mix tracks and export MP4]
+    A[Upload video] --> B[Extract source audio]
+    B --> C[Transcribe once with Gnani]
+    C --> D[Apply mishearing maps and protected terms]
+    D --> E[Clean transcript and make timed clips]
+    E --> F[Translate with Sarvam]
+    F --> G[Speak clips with Gnani]
+    G --> H[Fit timing and run clip checks]
+    H --> I[Review Green Yellow Red clips]
+    I --> J[Mix tracks and export]
+    C --> K[(Checkpoint store)]
+    D --> K
+    H --> K
+    K --> L[Resume after restart]
+    F -. fallback .-> M[Existing LLM provider chain]
+    M --> N[Groq then Gemini]
 ```
-
-A few things worth knowing about this flow:
-
-- Transcription runs once per project and is shared across all target languages. It is not repeated per language.
-- Nothing is charged until voice consent is given and processing starts.
-- The term sheet is applied before translation, so a brand name is fixed in the source and does not get translated wrongly in every language.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    U[Browser] --> V[Vercel<br/>React + Vite SPA]
-    V -- "HTTPS /api/..." --> R[Railway<br/>FastAPI service]
-
-    subgraph Backend
-        R --> P[Dubbing pipeline<br/>backend/pipeline]
-        R --> S[(Railway volume<br/>uploads, takes, exports)]
-        P --> F[ffmpeg<br/>preview, mix, export]
-        P --> S
+    Browser --> Vercel["Vercel: React and Vite"]
+    Vercel -->|"HTTPS /api requests"| API["Railway: FastAPI"]
+    subgraph BackendService["Backend service"]
+        API --> Pipeline["Dubbing pipeline"]
+        API --> DB[("SQLite jobs and checkpoints")]
+        API --> Volume[("Railway volume: uploads, takes, exports")]
+        Pipeline --> Volume
+        Pipeline --> FFmpeg["FFmpeg: preview, mix, export"]
     end
-
-    P --> G1[Gnani Prisma<br/>speech to text]
-    P --> G2[Gnani TTS<br/>voice clone and speech]
-    P --> L[LLM providers<br/>translate, shorten, QA]
+    Pipeline --> Gnani["Gnani: transcription, TTS, voice APIs"]
+    Pipeline --> Sarvam["Sarvam: primary translation and QA"]
+    Sarvam -. fallback .-> Legacy["Existing LLM chain: Groq then Gemini"]
 ```
 
-**Frontend.** A single page app. Every request, including video and media URLs, goes through one `apiUrl()` helper so the `/api` prefix is never missed. A build step (`check:api-prefix`) fails if a URL is built without it.
+The frontend builds API and media links through `apiUrl()`, which adds `/api`. The build runs a source scan and fails if project video, media, or preview URLs bypass that helper.
 
-**Backend.** A FastAPI service. It owns projects, jobs, the review state of each clip, and serves video and media with HTTP Range support so seeking works.
+The backend uses atomic writes for generated takes, tracks, video previews, and exports. Jobs save checkpoints for transcription, term fixes, clips, and exports. On restart, a job that was running is marked Interrupted and can be resumed. The project UI shows Processing with its stage, Interrupted with Resume, or Failed with a reason and Retry.
 
-**Pipeline.** `backend/pipeline` holds the dubbing stages. The LLM client in `backend/clients/llm.py` tries providers in order, backs off failing models, and rotates keys when one hits quota.
+## Translation and timing
 
-**Storage.** Uploads, generated takes and exports live on a mounted Railway volume.
+Sarvam is the primary translation and translation QA provider. The existing LLM chain is the fallback. Failed models are skipped by a five-minute circuit breaker. Gnani handles speech recognition, synthesis, and voice services.
 
-### One request, end to end
+Speech starts at the source clip's start time. The fitting sequence is:
 
-```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant API as FastAPI
-    participant STT as Gnani Prisma
-    participant LLM as LLM provider
-    participant TTS as Gnani TTS
-    participant FF as ffmpeg
+1. Retry with a shorter translation and reduced character budget.
+2. Speed up speech by at most 15 percent, up to 1.15x.
+3. Trim fixed pauses.
+4. Spill into the detected silent gap before the next speech, when it fits without overlap.
+5. Withhold speech only if it still cannot fit safely.
 
-    B->>API: Upload video
-    API->>FF: Build browser-safe preview
-    API-->>B: Project created
-    B->>API: Consent + start processing
-    API->>STT: Transcribe source audio (once)
-    STT-->>API: Transcript + segments
-    API->>LLM: Translate clips for each language
-    LLM-->>API: Translations
-    API->>TTS: Speak each clip in cloned voice
-    TTS-->>API: Audio takes
-    API->>API: Fit to slot, run quality checks
-    API-->>B: Clips with Green, Yellow or Red
-    B->>API: Edit or regenerate a clip
-    B->>API: Export
-    API->>FF: Mix tracks, mux with video
-    API-->>B: Dubbed MP4
-```
+The configured overrun tolerance is 100 ms and is accepted only when it fits in detected silence. No speech clips may overlap. The final mixed dub duration is checked against the video within 50 ms.
 
-## Timing fit and recovery
+## Term memory and edits
 
-Hindi, Kannada and most other Indian languages take more syllables than English for the same meaning. So a spoken line often runs longer than the original clip. Anek tries to recover in a fixed order and logs which step worked.
-
-```mermaid
-flowchart TD
-    A[Speak translated line] --> B{Fits the slot?}
-    B -- yes --> Z[Keep as is]
-    B -- no --> C[Ask for a shorter translation<br/>with a reduced character budget]
-    C --> D[Speak again]
-    D --> E{Fits?}
-    E -- yes --> Z
-    E -- no --> F[Speed up, maximum 8 percent]
-    F --> G{Fits?}
-    G -- yes --> Z
-    G -- no --> H[Trim fixed pauses]
-    H --> I{Fits?}
-    I -- yes --> Z
-    I -- no --> J[Withhold from the dub track<br/>mark clip Red for review]
-```
-
-This applies to all ten target languages. Each recovery step writes a `Timing recovery for <lang> clip <n>` line to the server log, so you can see why a clip was kept or withheld.
+Term rules can be project-specific or saved to global memory for future projects. A mishearing map replaces heard variants with the canonical term before translation. Protected terms use placeholders during translation, are restored and checked in every output, and can have a spoken spelling per language for TTS. Edited clips are locked so later generation does not overwrite user text.
 
 ## Review states
 
-Each clip gets a status so you know where to look first.
-
-| Status | Meaning |
+| State | Meaning |
 | --- | --- |
-| Green (verified) | Passed all checks. |
-| Yellow (review) | Passed timing but a check raised a concern, for example a missing phrase in the translation or a transcript mismatch. |
-| Red (need you) | Failed a hard check, for example the speech cannot fit its slot, or the source wording is uncertain. |
+| Green | Passed automated checks. |
+| Yellow | Needs review for a quality concern. |
+| Red | Needs attention for a hard failure or uncertain source. |
 
-The studio shows an original and a dubbed player, a per clip editor for the translated text, the generated take, the reasons a clip was flagged, and a history of automatic attempts. You can edit the text, regenerate a clip, or listen to the original, the full dub, or original then dub.
-
-## Tech stack
-
-| Layer | Tools |
-| --- | --- |
-| Frontend | React, TypeScript, Vite |
-| Backend | Python, FastAPI, Uvicorn |
-| Speech to text | Gnani Prisma |
-| Text to speech and voice cloning | Gnani speech APIs |
-| LLM (translate, shorten, QA) | Provider chain with fallback, key rotation and backoff |
-| Media | ffmpeg |
-| Hosting | Vercel (frontend), Railway (backend and volume) |
-| Tests | pytest, plus a frontend build check |
+The studio has an Original/Dubbed main-player toggle, optional side-by-side playback, per-clip timing and character-budget details, take history, editing, and regeneration controls.
 
 ## Repository layout
 
 ```text
 anek/
   backend/
-    app.py              FastAPI app and routes
-    clients/            Gnani and LLM clients (llm.py holds the provider chain)
-    pipeline/           Dubbing stages (phase3b.py handles synthesis and timing)
+    app.py                 FastAPI routes and job orchestration
+    atomic_files.py        Durable generated-file helpers
+    clients/               Gnani and LLM provider clients
+    pipeline/              Transcription, translation, synthesis, timing
+    static/                Built frontend served by the backend container
   frontend/
-    src/main.tsx        App entry, studio UI, apiUrl() helper
-    scripts/            check-api-prefix.mjs
-    vercel.json         Build, output and SPA rewrite settings
-  scripts/              Helper scripts
-  tests/                Backend tests
-  Dockerfile            Backend image for Railway
-  SPEC.md               Product spec
-  EVAL.md               Evaluation notes
-  eval_report.json      Evaluation results
-  .env.example          Environment variable names
+    src/main.tsx            React application and apiUrl() helper
+    scripts/check-api-prefix.mjs
+    vercel.json             Vercel Vite settings and SPA rewrite
+  docs/
+    images/                 README screenshots
+    PROGRESS.md             Work handoff and task progress
+  scripts/                  Local helper scripts
+  tests/                    Backend tests
+  Dockerfile                Railway container build
+  railway.toml              Railway Dockerfile and health settings
+  pyproject.toml            Python package and test configuration
+  README.md
 ```
 
-## Run it locally
+## Run locally
 
-You need Python 3.11 or newer, Node.js 20 or newer, and ffmpeg on your PATH.
+Requirements: Python 3.11 or newer, Node 20.19 or newer in the 20.x line or Node 22.12 or newer (the Vite version in the lockfile declares these ranges), and FFmpeg with ffprobe on `PATH`.
 
 ```bash
 git clone https://github.com/Aarti-panchal01/anek.git
 cd anek
-cp .env.example .env        # then fill in your keys
+cp .env.example .env
 ```
 
-**Backend**
+Set `GNANI_MOCK=1` and `LLM_MOCK=1` in `.env` for local mock mode. Set actual service keys only when you intend to make live requests.
+
+Start the backend on port 8000. The Vite development proxy forwards `/api` and `/health` to this port.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e .
-uvicorn backend.app:app --reload --port 8080
+# macOS or Linux
+source .venv/bin/activate
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+uvicorn backend.app:app --reload --port 8000
 ```
 
-**Frontend**
+In a second terminal:
 
 ```bash
 cd frontend
@@ -244,22 +168,65 @@ npm ci
 npm run dev
 ```
 
-Set `VITE_API_BASE_URL` to `http://localhost:8080` for local development.
+For a deployed frontend build, `VITE_API_BASE_URL` is read at build time from `import.meta.env`. Set it to the backend origin, with or without a trailing `/api`; `apiUrl()` normalizes the value and adds `/api` to API paths. For local Vite development, leave it unset to use the proxy.
 
 ## Environment variables
 
-Only names are listed here. Never commit values. `.env.example` is the source of truth.
+Names and purposes only. `.env.example` lists the application settings; `PORT` is supplied by Railway. Set backend variables on Railway. The frontend uses only `VITE_API_BASE_URL` on Vercel.
 
-| Name | Where | Purpose |
-| --- | --- | --- |
-| `VITE_API_BASE_URL` | Vercel, frontend | Base URL of the backend, for example the Railway domain. No trailing slash. Read at build time, so redeploy after changing it. |
-| Gnani API keys | Railway, backend | Speech to text and text to speech. Exact names are in `.env.example`. |
-| LLM provider keys | Railway, backend | One or more keys per provider. Exact names are in `.env.example`. |
-| Allowed origins (CORS) | Railway, backend | Must include your Vercel domain. |
+### Vercel
+
+| Name | Purpose |
+| --- | --- |
+| `VITE_API_BASE_URL` | Backend origin used while building the frontend. Set to the Railway service origin. |
+| `VERCEL` | Set automatically by Vercel; selects `dist` as the Vite build output. |
+
+### Railway
+
+| Name | Purpose |
+| --- | --- |
+| `PORT` | Railway-assigned HTTP port; the container defaults to 8080 when unset. |
+| `APP_NAME` | Application display/configuration name. |
+| `ANEK_DATA_DIR` | Persistent data root; mount the Railway volume here, normally `/data`. |
+| `GNANI_API_KEY` | Gnani speech API authentication. |
+| `GNANI_BASE_URL` | Gnani API origin. |
+| `STT_MODEL` | Source speech recognition model. |
+| `VERIFY_STT_MODEL` | Speech recognition model used for audio verification. |
+| `GNANI_DAILY_LIMIT` | Daily Gnani credit safety limit. |
+| `SARVAM_API_KEY` | Sarvam authentication for translation and QA. |
+| `SARVAM_TRANSLATION_MODEL` | Sarvam translation model configuration. |
+| `SARVAM_REWRITE_MODEL` | Sarvam rewrite and QA model configuration. |
+| `LLM_BASE_URL` | OpenAI-compatible primary fallback endpoint. |
+| `LLM_MODEL` | Model name for the primary fallback endpoint. |
+| `GROQ_API_KEYS` | Comma-separated Groq key pool for fallback calls. |
+| `LLM_API_KEY` | Single-key fallback when the Groq key pool is empty. |
+| `LLM_2_API_KEYS` | Comma-separated keys for the final Gemini fallback pool. |
+| `LLM_2_BASE_URL` | Gemini OpenAI-compatible endpoint. |
+| `LLM_2_MODEL` | First model in the final Gemini fallback chain. |
+| `LLM_CACHE_PATH` | Optional SQLite cache path for LLM responses. |
+| `NUMERAL_STYLE` | Numeral formatting preference in generated speech text. |
+| `MAX_VIDEO_SECONDS` | Maximum accepted video duration. |
+| `MAX_CREDITS_PER_JOB` | Optional per-job credit cap; zero disables this cap. |
+| `ENABLED_LANGS` | Comma-separated enabled language codes. |
+| `LOW_TRUST_VERIFY_LANGS` | Comma-separated languages requiring stricter audio verification. |
+| `FIT_TOLERANCE` | Speech-to-slot fit ratio used by the timing checks. |
+| `MAX_STRETCH` | Configured stretch ratio for timing fit. |
+| `SIMILARITY_THRESHOLD` | Similarity threshold for source and consent checks. |
+| `CONSENT_MATCH_THRESHOLD` | Minimum consent match score. |
+| `REQUIRE_ACCESS_AUTH` | Enables access-password authentication when true. |
+| `ANEK_ACCESS_PASSWORD` | Optional password for app access. |
+| `ANEK_AUTH_SECRET` | Signing secret for access-auth sessions. |
+| `CORS_ORIGINS` | Comma-separated allowed browser origins; include the deployed Vercel domain. |
+| `CORS_ORIGIN_REGEX` | Optional regular expression for allowed browser origins. |
+| `GNANI_MOCK` | Uses mock Gnani responses when enabled. |
+| `LLM_MOCK` | Uses mock LLM responses when enabled. |
+| `PER_IP_LIMITS` | Per-IP hourly request limits by operation. |
+
+The Railway CORS origin must match the Vercel site origin, including the scheme and hostname. Do not include a trailing slash in `CORS_ORIGINS`.
 
 ## Deployment
 
-**Frontend on Vercel**
+### Vercel frontend
 
 | Setting | Value |
 | --- | --- |
@@ -269,47 +236,41 @@ Only names are listed here. Never commit values. `.env.example` is the source of
 | Output Directory | `dist` |
 | Production branch | `main` |
 
-If Root Directory is left at the repo root, Vercel finds no `package.json`, builds nothing, and serves a 404.
+Set `VITE_API_BASE_URL` for Production and Preview environments as needed. The repository has `frontend/vercel.json`; there is no root-level `vercel.json`.
 
-**Backend on Railway**
+### Railway backend
 
-- Built from the `Dockerfile`.
-- A volume is mounted for uploads and exports.
-- The service listens on port 8080.
-- Deploys from `main` through the GitHub integration.
+Railway is configured by `railway.toml` to build the root `Dockerfile`. The Dockerfile installs FFmpeg, serves the built frontend assets through FastAPI, and starts `uvicorn backend.app:app` on `$PORT` or port 8080. Mount a persistent volume at `/data`, matching `ANEK_DATA_DIR`. The health check is `/health`.
 
-Push to `main` and both services redeploy.
+## Tests
 
-## Testing
+From the repository root:
 
 ```bash
-# backend
 python -m pytest tests -q
-
-# frontend: checks API prefixes, type checks, then builds
 cd frontend
+npm ci
 npm run build
 ```
 
-The frontend build runs `check:api-prefix` first. It fails if any media or API URL is built without the `/api` prefix. Backend tests cover the API routes, Range requests, the preview fallback, and timing recovery across all ten target languages.
+The backend suite includes a mock resilience smoke test for Hindi and Kannada, media validation, timing, and job interruption/resume. It uses deterministic mocked job execution and locally generated FFmpeg media. The frontend build runs `check:api-prefix`, TypeScript checks, and Vite production build.
 
-## Known limitations
+## Current limitations
 
-- Voice cloning quality depends on the reference audio. A noisy phone recording gives a more synthetic result than a clean 30 to 60 second sample.
-- Speech to text can mishear brand names and unusual terms. Add them to the term sheet before translating.
-- LLM free tier quotas can run out, which weakens the shorter translation retry and leaves more clips Red. Use billing enabled keys for real use.
-- Only one speaker per video is supported.
-- Videos are limited to 120 seconds.
-- Original background sound is replaced, not mixed in.
+- Voice cloning quality depends on the recording quality and length.
+- Speech recognition can mishear unusual names. Use the term rules to correct known variants.
+- One speaker per video is supported.
+- Videos are limited to 120 seconds by default.
+- Original background sound is replaced. The pipeline can restore a short room-tone sample.
 
 ## Roadmap
 
-- [ ] Timing: a small overrun tolerance, and letting a clip run into the silent gap before the next clip when nothing overlaps.
-- [ ] Higher speed-up limit on retries for Indic languages.
-- [ ] Term correction pass that fixes known mishearings of brand names before translation.
-- [ ] Add Sarvam for translation and quality checks, with the current LLM chain as fallback.
-- [ ] Studio player: one player with an Original and Dubbed toggle, and side by side that replaces it instead of adding more players.
-- [ ] Better voice clone quality and a reference audio quality check at upload.
+- [x] Sarvam translation and QA with fallback providers and model circuit breakers.
+- [x] Timing recovery, silent-gap spill, and no-overlap checks across ten languages.
+- [x] Project and global term rules, protected terms, and edit locking.
+- [x] Checkpointed jobs, restart resume, and atomic generated-file writes.
+- [x] Single-player toggle, clip editing, attempts, and media API prefix check.
+- [ ] Improve voice-clone quality and add a reference-audio quality check.
 
 ## Credits
 
