@@ -1208,6 +1208,32 @@ async def project_preview_status(project_id: str) -> dict:
     return {"status": project.get("preview_status") or "ready", "reason": project.get("preview_error")}
 
 
+@app.get("/api/projects/{project_id}/thumbnail")
+async def project_thumbnail(project_id: str):
+    """Serve a cached frame from the original upload for project cards."""
+    project = project_row(project_id)
+    source_value = project.get("original_video_path") or project.get("video_path")
+    if not source_value:
+        return Response(status_code=204)
+    source = Path(source_value).resolve()
+    root = (DATA_ROOT / "uploads" / project_id).resolve()
+    if not source.is_relative_to(root) or not source.is_file():
+        return Response(status_code=204)
+    poster = root / "poster.jpg"
+    if poster.is_file() and poster.stat().st_size > 0:
+        return FileResponse(poster, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    try:
+        await asyncio.to_thread(
+            run_atomic_command,
+            ["ffmpeg", "-y", "-v", "error", "-ss", "0.25", "-i", str(source), "-frames:v", "1", "-q:v", "4", "-an", str(poster)],
+            check=True, capture_output=True, timeout=45,
+        )
+        return FileResponse(poster, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    except Exception as error:
+        LOGGER.info("Project thumbnail unavailable id=%s reason=%s", project_id, str(error)[:250])
+        return Response(status_code=204)
+
+
 @app.post("/api/projects/{project_id}/preview/retry", status_code=202)
 async def retry_project_preview(project_id: str) -> dict:
     project = project_row(project_id)
