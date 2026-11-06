@@ -33,3 +33,22 @@
 - Task 6 keeps attempts collapsed by default. Clicking a clip plays its timed range from the mixed dub, and the single-player mode is the default.
 - Current task: complete. Environment inventory was collected with variable names only.
 - Deployment diagnosis: the Railway deployment shown as Removed was superseded; the current service has a successful deployment, but production requests to `/api/projects/.../media` still returned 500 because `ffprobe` raised `CalledProcessError`. The UI consequently showed no dubbed video. The hotfix logs the failure and serves the original upload, preserving a visible video while dubbed media is unavailable.
+
+## Round 2: resilience
+
+### Tasks done
+
+- Task 1: implementation complete and verified (backend suite passed; frontend build passed); commit/push is in progress. `/media` now rebuilds from a saved dub track, falls back to the browser-ready original, then returns a structured 409. Logs include failed path, byte size, and ffprobe stderr. UI displays the reason with Retry. Zero-byte, truncated, and exhausted-fallback tests added.
+
+### Current task
+
+- Task 1: commit and push the verified recovery behavior; then begin atomic generated-file writes.
+
+### Next task
+
+- Task 2: atomic writes and startup validation for generated outputs.
+
+### Decisions
+
+- Resume this round from the reported production failure; retain the earlier implementation history above without redoing completed tasks.
+- The previous fallback hotfix `f97b1ee` avoided a 500 by serving the upload, but this round replaces that shortcut with the requested recovery order and explicit unavailable state.

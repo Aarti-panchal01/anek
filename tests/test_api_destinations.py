@@ -4,6 +4,7 @@ import tempfile
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend import db
@@ -104,6 +105,7 @@ def test_project_media_range_request_returns_partial_content_and_headers(monkeyp
         project_id, source, dubbed = _make_media_project(data_root)
         monkeypatch.setattr(app_module, "browser_video_path", lambda path: path)
         monkeypatch.setattr(app_module, "browser_dubbed_video_path", lambda path: path)
+        monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
         response = TestClient(app_module.app).get(
             f"/api/projects/{project_id}/video", headers={"Range": "bytes=2-5"},
         )
@@ -120,6 +122,7 @@ def test_project_video_and_dubbed_media_without_range_return_full_content(monkey
         project_id, source, dubbed = _make_media_project(data_root)
         monkeypatch.setattr(app_module, "browser_video_path", lambda path: path)
         monkeypatch.setattr(app_module, "browser_dubbed_video_path", lambda path: path)
+        monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
         client = TestClient(app_module.app)
 
         source_response = client.get(f"/api/projects/{project_id}/video")
@@ -133,20 +136,46 @@ def test_project_video_and_dubbed_media_without_range_return_full_content(monkey
         assert dubbed_response.content == dubbed.read_bytes()
 
 
-def test_dubbed_media_falls_back_to_original_when_ffprobe_fails(monkeypatch):
+@pytest.mark.parametrize("bad_media", [b"", b"truncated mp4"])
+def test_dubbed_media_recovers_zero_byte_and_truncated_mp4(monkeypatch, bad_media):
     with _sandbox(monkeypatch) as (_, data_root):
-        project_id, source, _ = _make_media_project(data_root)
+        project_id, source, dubbed = _make_media_project(data_root)
+        dubbed.write_bytes(bad_media)
 
         def fail_probe(path):
-            raise app_module.subprocess.CalledProcessError(1, ["ffprobe", str(path)])
+            raise app_module.subprocess.CalledProcessError(1, ["ffprobe", str(path)], stderr="invalid MP4")
 
         monkeypatch.setattr(app_module, "browser_dubbed_video_path", fail_probe)
+        monkeypatch.setattr(app_module, "_rebuild_dubbed_preview", lambda *args: (_ for _ in ()).throw(
+            app_module.subprocess.CalledProcessError(1, ["ffmpeg"], stderr="saved track unavailable")
+        ))
+        monkeypatch.setattr(app_module, "browser_video_path", lambda path: source)
+        monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
         response = TestClient(app_module.app).get(f"/api/projects/{project_id}/media?lang=hi-IN")
 
         assert response.status_code == 200
         assert response.headers["content-type"] == "video/mp4"
         assert response.headers["accept-ranges"] == "bytes"
         assert response.content == source.read_bytes()
+
+
+def test_dubbed_media_returns_clear_409_if_all_recovery_options_fail(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project_id, _, dubbed = _make_media_project(data_root)
+        dubbed.write_bytes(b"truncated")
+
+        def fail(*args):
+            raise app_module.subprocess.CalledProcessError(1, ["ffprobe"], stderr="invalid media")
+
+        monkeypatch.setattr(app_module, "browser_dubbed_video_path", fail)
+        monkeypatch.setattr(app_module, "_rebuild_dubbed_preview", fail)
+        monkeypatch.setattr(app_module, "browser_video_path", fail)
+        monkeypatch.setattr(app_module, "_validate_media_file", lambda path: None)
+        response = TestClient(app_module.app).get(f"/api/projects/{project_id}/media?lang=hi-IN")
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "media_unavailable"
+        assert "could not be rebuilt" in response.json()["reason"]
 
 
 def test_browser_preview_conversion_bounds_portrait_resolution_and_time(monkeypatch):

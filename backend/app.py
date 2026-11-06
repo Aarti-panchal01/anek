@@ -748,16 +748,38 @@ async def dubbed_media(project_id: str, lang: str, request: Request):
     project = project_row(project_id)
     folder = DATA_ROOT / "exports" / project_id
     matches = list(folder.glob(f"*_{lang}*ai-dubbed.mp4"))
-    if not matches:
-        raise HTTPException(404, "Dubbed video is not ready")
-    try:
-        playable = browser_dubbed_video_path(matches[0])
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        LOGGER.exception("Dubbed video preview failed for project %s; serving the original upload", project_id)
-        if not project.get("video_path") or not Path(project["video_path"]).is_file():
-            raise HTTPException(422, "The dubbed video is unavailable and the original upload could not be served") from error
-        playable = Path(project["video_path"])
-    return media_response(playable, request)
+    failures: list[str] = []
+    if matches:
+        candidate = matches[0]
+        try:
+            playable = browser_dubbed_video_path(candidate)
+            _validate_media_file(playable)
+            return media_response(playable, request)
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            _log_media_failure(candidate, error)
+            failures.append("The dubbed video is incomplete or could not be converted.")
+
+    source = Path(project["video_path"]) if project.get("video_path") else None
+    if source is not None:
+        try:
+            rebuilt = _rebuild_dubbed_preview(project_id, lang, source, folder)
+            playable = browser_dubbed_video_path(rebuilt)
+            _validate_media_file(playable)
+            return media_response(playable, request)
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            _log_media_failure(source, error)
+            failures.append("The dubbed preview could not be rebuilt from its saved tracks.")
+
+        try:
+            original_preview = browser_video_path(source)
+            _validate_media_file(original_preview)
+            return media_response(original_preview, request)
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            _log_media_failure(original_preview if "original_preview" in locals() else source, error)
+            failures.append("The original video preview is unavailable.")
+
+    reason = " ".join(failures) or "The dubbed video and original upload are unavailable."
+    return JSONResponse(status_code=409, content={"error": "media_unavailable", "reason": reason})
 
 
 @app.get("/api/projects/{project_id}/estimate")
@@ -1621,6 +1643,60 @@ def _track_artifact_path(project_id: str, lang: str, kind: str) -> Path | None:
         return None
     path = matches[0].resolve()
     return path if path.is_file() and path.is_relative_to(folder) else None
+
+
+def _validate_media_file(path: Path) -> None:
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError("media file is empty")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    if not any(item.get("codec_type") == "video" for item in json.loads(probe.stdout).get("streams", [])):
+        raise ValueError("media file has no video stream")
+
+
+def _log_media_failure(path: Path, error: Exception) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = "missing"
+    stderr = getattr(error, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    LOGGER.warning("Media candidate failed path=%s size=%s ffprobe_stderr=%s error=%s",
+                   path, size, (stderr or "")[:1000], error)
+
+
+def _rebuild_dubbed_preview(project_id: str, lang: str, source: Path, output_dir: Path) -> Path:
+    dubbed_track = _track_artifact_path(project_id, lang, "dubbed")
+    if dubbed_track is None or not source.is_file():
+        raise FileNotFoundError("Saved dubbed track or original upload is missing")
+    playable_source = browser_video_path(source)
+    duration, has_video = probe_video(playable_source)
+    if not has_video:
+        raise ValueError("Original upload has no video stream")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rebuilt = output_dir / f"{source.stem}_{lang}_recovered.mp4"
+    temporary = output_dir / f".{source.stem}_{lang}_recovered.part.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(playable_source), "-i", str(dubbed_track),
+             "-map", "0:v:0", "-map", "1:a:0", "-vf",
+             "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+             "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
+             "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", str(duration),
+             "-movflags", "+faststart", str(temporary)],
+            check=True, capture_output=True, timeout=240,
+        )
+        _validate_media_file(temporary)
+        with temporary.open("rb") as recovered_file:
+            os.fsync(recovered_file.fileno())
+        temporary.replace(rebuilt)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return rebuilt
 
 
 @app.get("/api/projects/{project_id}/downloads/{artifact}")
