@@ -42,18 +42,20 @@
 - Task 2: `5b7576a` (pushed). Backend suite and frontend build passed. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
 - Task 3: `1b309d2` (pushed). Backend suite and frontend build passed. Jobs persist transcription cache, term fixes, clips per language, and exports to SQLite plus an atomic checkpoint file. Startup marks running work interrupted, Resume queues it, and SIGTERM stops the runner at the next checkpoint. Added restart/resume test proving a saved transcript and clip take are reused.
 - Task 4: `50d7e90` (pushed). Backend suite and frontend build passed. Project listings expose the latest job stage/error; no-clip jobs fail explicitly, and the editor provides Processing, Interrupted/Resume, and Failed/Retry states instead of an empty Review.
-- Task 5: `c5acef8` (committed; will be pushed with Task 6). Backend suite (`python -m pytest tests -q`) passed; frontend build passed. Startup logs resolved timing values and enabled provider names, and names of Railway timing variables overriding defaults. Logging test confirms secrets and environment values are not emitted.
+- Task 5: `c5acef8` (pushed in `7d44139`). Backend suite (`python -m pytest tests -q`) passed; frontend build passed. Startup logs resolved timing values and enabled provider names, and names of Railway timing variables overriding defaults. Logging test confirms secrets and environment values are not emitted.
+- Task 6: `77cfb36` (pushed with this progress update). Backend suite (`python -m pytest tests -q`) passed; frontend build passed. Added a mock bilingual job smoke test that simulates shutdown after a durable Hindi clip, resumes Kannada without repeating the cached transcript, checks both playable media routes with ffprobe and duration tolerance, and asserts speech intervals do not overlap.
 
 ### Current task
 
-- Task 6: mock end-to-end smoke test for bilingual clips, valid media, duration/timing invariants, and kill/restart/resume.
+- Complete: all six resilience tasks implemented, verified, and pushed to main.
 
 ### Next task
 
-- Task 6: mock end-to-end smoke test for bilingual clips, valid media, duration/timing invariants, and kill/restart/resume.
+- Complete. No further tasks remain in this round.
 
 ### Decisions
 
 - Resume this round from the reported production failure; retain the earlier implementation history above without redoing completed tasks.
 - The previous fallback hotfix `f97b1ee` avoided a 500 by serving the upload, but this round replaces that shortcut with the requested recovery order and explicit unavailable state.
 - Task 1 considers a media file available only when it is non-empty and ffprobe finds a video stream; failed candidates are logged with stderr and size.
+- Task 6 smoke test uses deterministic mock job execution at the pipeline boundary so it can exercise application checkpoint/resume, persisted clips, API media delivery, and ffprobe locally without calling paid providers; the media artifacts themselves are generated with local FFmpeg.
