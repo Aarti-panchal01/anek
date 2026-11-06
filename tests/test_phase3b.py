@@ -18,6 +18,7 @@ from backend.pipeline.phase3b import (
     shorter_timing_budget,
     INITIAL_TARGET_CHARS_PER_SECOND,
     normalize_provider_transcript,
+    normalize_cleanup_changes,
     transcribe_generated_speech,
     timing_character_budget,
     should_reuse_completed_clip,
@@ -174,6 +175,20 @@ def test_gnani_transcript_response_shapes_and_multiscript_sentence_boundaries():
         "पहला वाक्य।", "दूसरा वाक्य!", "ಒಳ್ಳೆಯದು.", "ಕೊನೆಯದು", "अगली पंक्ति",
     ]
     assert transcript_sentences("First. 第二句。第三句！") == ["First.", "第二句。", "第三句！"]
+
+
+def test_legacy_checkpoint_cleanup_notes_are_safe_for_language_retry():
+    notes = normalize_cleanup_changes([
+        "No cleanup changes were needed.",
+        {"from": "a head", "to": "Anek", "reason": "mishearing corrected"},
+    ])
+    assert notes == [
+        {"from": "", "to": "", "reason": "No cleanup changes were needed."},
+        {"from": "a head", "to": "Anek", "reason": "mishearing corrected"},
+    ]
+    uncertain = [item.get("to", item["from"]) for item in notes
+                 if "uncertain source retained" in item.get("reason", "").casefold()]
+    assert uncertain == []
 
 
 def test_sentence_join_rewrites_gnani_streaming_frame_count(monkeypatch, tmp_path):

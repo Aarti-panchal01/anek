@@ -281,6 +281,23 @@ def normalize_provider_transcript(response: dict | str) -> str:
     return transcript.strip()
 
 
+def normalize_cleanup_changes(changes) -> list[dict]:
+    """Normalize current and legacy cleanup notes restored from job checkpoints."""
+    if not isinstance(changes, (list, tuple)):
+        return []
+    normalized = []
+    for change in changes:
+        if isinstance(change, dict):
+            normalized.append({
+                "from": str(change.get("from", "")),
+                "to": str(change.get("to", change.get("from", ""))),
+                "reason": str(change.get("reason", "")),
+            })
+        elif isinstance(change, str):
+            normalized.append({"from": "", "to": "", "reason": change})
+    return normalized
+
+
 def transcribe_generated_speech(gnani, audio: bytes, language: str) -> dict:
     """Use Gnani STT to check target-language audio produced by Gnani TTS."""
     response = gnani.stt(audio, language, "prisma-v3.0")
@@ -875,6 +892,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 "source_lang": source_lang, "term_sheet": term_sheet.model_dump(), "cleaned_rows": cleaned_rows,
             }
             checkpoint("term_fixes")
+        for row in cleaned_rows:
+            row["cleanup_changes"] = normalize_cleanup_changes(row.get("cleanup_changes"))
         reference_seconds = None
         if stock_voice:
             embedding = None
