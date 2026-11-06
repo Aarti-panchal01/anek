@@ -166,3 +166,8 @@ Exact ffprobe outputs:
 
 - Validation before Part C push: python -m pytest tests -q -o addopts='' passed (121 tests, 4 existing FastAPI lifecycle deprecation warnings); cd frontend && npm run build passed (API-prefix scan, TypeScript, Vite). git diff --check passed. The repository search for retired provider names in backend, frontend source, config, README, docs, scripts, and tests returned no matches.
 - Push checkpoint: pending.
+
+- Deployment check follow-up: the active Railway container lacked scripts/check_providers.py because the Dockerfile copied only backend files. Added an explicit scripts copy in the final image. The first remote invocation exited 2 with a missing-file error; the live provider check is deferred to the updated deployment.
+
+- Docker follow-up validation: python -m pytest tests -q -o addopts='' passed (121 tests, 4 lifecycle deprecation warnings); cd frontend && npm run build passed.
+- Current: commit and push the image packaging fix. Next: wait for Railway deployment, run python scripts/check_providers.py remotely, inspect only the sanitized status output, and confirm the obsolete variable names remain absent.

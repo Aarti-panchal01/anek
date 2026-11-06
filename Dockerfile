@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -r
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir .
 COPY backend/ ./backend/
+COPY scripts/ ./scripts/
 COPY --from=frontend /app/backend/static/ ./backend/static/
 RUN mkdir -p /data
 EXPOSE 8080
