@@ -125,8 +125,11 @@ Exact ffprobe outputs:
 ## Round 9: red clips and clean review studio
 
 - Tasks done: Part A complete; Part B implementation and visual checks complete, awaiting its dedicated checkpoint push.
-- Current task: commit and push the Part A backend and regression-test checkpoint.
-- Next task: commit the Part B review-studio UI and mobile overflow fix after repeating full backend tests and frontend build.
+- Part A checkpoint: committed and pushed to `main` as `bf3d7ff2a5c0d62803f9f18d1ffa9506326728b1` (`Fix red clip recovery and review reasons`).
+- Part B validation: after the mobile CSS fix, `python -m pytest tests -q` passed and `cd frontend && npm run build` passed (API prefix check, TypeScript, Vite build). Playwright mock screenshots passed for verified, review, red, side-by-side, and 375px mobile with no horizontal overflow.
+- Verification limit: the original production project media and database were not accessed, so the reported real clip with a 3.9-second slot could not be replayed. Timing behavior is covered by the all-language parametrized tests; visual red-state behavior used a local mocked clip.
+- Current task: commit and push Part B.
+- Next task: final report with both checkpoint hashes, timing test/build results, and the production-sample verification limit.
 - Decisions: follow the attached Base44 screenshots for layout only; retain Anek branding. Do not touch /data/voices or the database file. Validate and push once after each part.
 - Step 1 done: timing rewrites now submit only the active source segment, label neighboring source and translation as read-only context, enforce the actual character limit on returned text, and reject copied four-word phrases from neighboring source/translation. Added parametrized regression coverage for all 10 target languages. `python -m pytest tests/test_phase3b.py -q` passed (32 tests).
 - Current task: finish Part A remaining clip segmentation, term rule actions, missing-audio UX, and plain-language red reasons.
