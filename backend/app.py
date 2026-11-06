@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -33,7 +34,7 @@ except ImportError:
     ratio = lambda left, right: SequenceMatcher(None, left, right).ratio() * 100
 
 from backend import db
-from backend.atomic_files import atomic_write_bytes, mark_invalid_media_for_regeneration, run_atomic_command
+from backend.atomic_files import atomic_write_bytes, atomic_write_text, mark_invalid_media_for_regeneration, run_atomic_command
 from backend.brain.checks import run_checks
 from backend.clients.gnani import create_gnani_client
 from backend.clients.llm import clear_response_cache
@@ -43,6 +44,20 @@ from backend.pipeline.phase3b import run_quality_pass
 
 settings = get_settings()
 LOGGER = logging.getLogger(__name__)
+_shutdown_requested = threading.Event()
+_active_job_tasks: set[asyncio.Task] = set()
+
+
+class JobInterrupted(Exception):
+    pass
+
+
+async def schedule_job(job_id: str) -> None:
+    if _shutdown_requested.is_set():
+        raise JobInterrupted("Service is shutting down; job remains resumable")
+    task = asyncio.create_task(run_job(job_id))
+    _active_job_tasks.add(task)
+    task.add_done_callback(_active_job_tasks.discard)
 app = FastAPI(title=settings.app_name)
 DATA_ROOT = Path(settings.anek_data_dir)
 CONSENT_PHRASES = [
@@ -375,13 +390,24 @@ def estimated_job_credits(duration_s: float, language_count: int) -> int:
 
 @app.on_event("startup")
 async def startup() -> None:
+    _shutdown_requested.clear()
     db.initialize()
     mark_invalid_media_for_regeneration(DATA_ROOT / "exports", LOGGER)
     with db.connect() as connection:
-        connection.execute("UPDATE jobs SET state='pending', stage='resuming' WHERE state='running'")
+        interrupted = connection.execute("SELECT DISTINCT project_id FROM jobs WHERE state='running'").fetchall()
+        connection.execute("UPDATE jobs SET state='interrupted', stage='interrupted', error='Worker stopped before completion; resume to continue.' WHERE state='running'")
+        for row in interrupted:
+            connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (row["project_id"],))
         pending = connection.execute("SELECT id FROM jobs WHERE state='pending'").fetchall()
     for item in pending:
-        asyncio.create_task(run_job(item["id"]))
+        await schedule_job(item["id"])
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    _shutdown_requested.set()
+    if _active_job_tasks:
+        await asyncio.wait(tuple(_active_job_tasks), timeout=25)
 
 
 @app.get("/health")
@@ -1140,7 +1166,49 @@ async def run_job(job_id: str) -> None:
             return
         project = connection.execute("SELECT * FROM projects WHERE id=?", (job["project_id"],)).fetchone()
         voice = connection.execute("SELECT * FROM voices WHERE id=?", (job["voice_id"],)).fetchone() if job["voice_mode"] == "clone" else None
-        connection.execute("UPDATE jobs SET state='running',stage='processing',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
+        checkpoint_state = json.loads(job["checkpoint_json"] or "{}")
+        connection.execute("UPDATE jobs SET state='running',stage='resuming',error=NULL,attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
+    output_dir = DATA_ROOT / "exports" / project["id"]
+    checkpoint_path = output_dir / f".job-{job_id}.checkpoint.json"
+    if checkpoint_path.is_file():
+        try:
+            file_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if isinstance(file_checkpoint, dict):
+                checkpoint_state.update(file_checkpoint)
+        except (OSError, ValueError):
+            LOGGER.warning("Ignoring unreadable job checkpoint %s", checkpoint_path)
+
+    def check_continue() -> None:
+        if _shutdown_requested.is_set():
+            raise JobInterrupted("Service shutdown requested; job checkpointed for resume")
+
+    def save_checkpoint(stage: str, state: dict) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(state, ensure_ascii=False)
+        atomic_write_text(checkpoint_path, encoded)
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET checkpoint_json=?,stage=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (encoded, stage, job_id),
+            )
+            if stage == "clip":
+                lang = state.get("current_language")
+                index = state.get("last_clip_index")
+                saved = state.get("clips", {}).get(lang, {}).get(str(index))
+                if saved:
+                    clip = dict(saved["clip"])
+                    clip["audio_path"] = output_dir / saved["audio_key"]
+                    clip_row = connection.execute(
+                        "SELECT id FROM clips WHERE project_id=? AND idx=?", (project["id"], int(clip["clip"])-1),
+                    ).fetchone()
+                    clip_id = clip_row["id"] if clip_row else new_id()
+                    if not clip_row:
+                        connection.execute(
+                            "INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)",
+                            (clip_id, project["id"], int(clip["clip"])-1, clip["start_s"], clip["end_s"], clip["source_cleaned"]),
+                        )
+                    persist_generated_dub(connection, clip_id, lang, clip)
+
     try:
         targeted_clip_index = None
         translation_override = None
@@ -1191,7 +1259,8 @@ async def run_job(job_id: str) -> None:
                 output_dir, settings, job["content_type"], job["translation_style"], embedding,
                 project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
                 only_clip_index=targeted_clip_index, translation_override=translation_override,
-                preserve_translation=preserve_translation,
+                preserve_translation=preserve_translation, resume_state=checkpoint_state,
+                checkpoint_callback=save_checkpoint, continue_check=check_continue,
             )
             for result_index, result in enumerate(results):
                 lang = result["language"]
@@ -1216,6 +1285,11 @@ async def run_job(job_id: str) -> None:
         with db.connect() as connection:
             connection.execute("UPDATE jobs SET state='complete',stage='complete',done=total,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
             connection.execute("UPDATE projects SET status='complete' WHERE id=?", (project["id"],))
+    except JobInterrupted as error:
+        LOGGER.info("Dub job %s interrupted safely for restart", job_id)
+        with db.connect() as connection:
+            connection.execute("UPDATE jobs SET state='interrupted',stage='interrupted',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (str(error)[:1000], job_id))
+            connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (project["id"],))
     except Exception as error:
         LOGGER.exception("Dub job %s failed", job_id)
         with db.connect() as connection:
@@ -1248,8 +1322,25 @@ async def start_job(request: Request, project_id: str, body: StartJob, backgroun
         connection.execute("INSERT INTO jobs(id,project_id,kind,voice_id,content_type,translation_style,voice_mode,stock_voice,state,stage,total) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (job_id, project_id, "dub", body.voice_id if body.voice_mode == "clone" else None, body.content_type, body.translation_style, body.voice_mode, body.stock_voice if body.voice_mode == "stock" else None, "pending", "queued", len(json.loads(project["target_langs_json"]))))
         connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
         connection.execute("INSERT INTO credit_ledger(id,project_id,kind,units,est_credits) VALUES(?,?,?,?,?)", (new_id(), project_id, "dub-job-estimate", 1, credits))
-    background.add_task(run_job, job_id)
+    background.add_task(schedule_job, job_id)
     return {"job_id": job_id, "state": "pending"}
+
+
+@app.post("/api/projects/{project_id}/resume", status_code=202)
+async def resume_job(request: Request, project_id: str, background: BackgroundTasks) -> dict:
+    enforce_ip_limit(request, "jobs")
+    project_row(project_id)
+    with db.connect() as connection:
+        job = connection.execute(
+            "SELECT id FROM jobs WHERE project_id=? AND state='interrupted' ORDER BY created_at DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if job is None:
+            raise HTTPException(409, "There is no interrupted job to resume")
+        connection.execute("UPDATE jobs SET state='pending',stage='queued',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (job["id"],))
+        connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
+    background.add_task(schedule_job, job["id"])
+    return {"job_id": job["id"], "state": "pending"}
 
 
 @app.get("/api/projects/{project_id}/events")
@@ -1267,7 +1358,7 @@ async def project_events(project_id: str):
                 if serialized != last:
                     yield f"data: {serialized}\n\n"
                     last = serialized
-                if row["state"] in {"complete", "failed"}:
+                if row["state"] in {"complete", "failed", "interrupted"}:
                     break
             await asyncio.sleep(1)
 
@@ -1309,7 +1400,7 @@ async def regenerate_clip(request: Request, clip_id: str, lang: str, background:
         connection.execute("UPDATE projects SET status='processing' WHERE id=?", (clip["project_id"],))
         connection.execute("INSERT INTO credit_ledger(id,project_id,kind,units,est_credits) VALUES(?,?,?,?,?)",
                            (new_id(), clip["project_id"], "regenerate-language-estimate", 1, credits))
-    background.add_task(run_job, job_id)
+    background.add_task(schedule_job, job_id)
     return {"queued": True, "job_id": job_id, "state": "pending", "language": lang,
             "clip_id": clip_id, "scope": "selected clip only", "estimated_credits": credits}
 

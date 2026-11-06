@@ -42,11 +42,12 @@
 
 ### Current task
 
-- Task 2: implementation complete and verified (backend suite passed; frontend build passed); commit/push is in progress. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
+- Task 2: `5b7576a` (pushed). Backend suite and frontend build passed. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
+- Task 3: implementation complete and verified (backend suite passed; frontend build passed); commit/push in progress. Jobs persist transcription cache, term fixes, clips per language, and exports to SQLite plus an atomic checkpoint file. Startup marks running work interrupted, Resume queues it, and SIGTERM stops the runner at the next checkpoint. Added restart/resume test proving a saved transcript and clip take are reused.
 
 ### Next task
 
-- Task 2: commit/push the verified atomic output changes; then persist job checkpoints and resume after restarts.
+- Task 4: project status states in the editor; never present zero clips as completed Review.
 
 ### Decisions
 

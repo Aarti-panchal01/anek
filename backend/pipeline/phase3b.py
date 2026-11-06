@@ -2,6 +2,7 @@
 
 import argparse
 import difflib
+import hashlib
 import json
 import re
 import shutil
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import wave
 from pathlib import Path
+from collections.abc import Callable
 
 import httpx
 
@@ -612,7 +614,10 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                      speaker_embedding: dict | None = None, source_language: str = "auto",
                      seed_terms: list[dict] | None = None, stock_voice: str | None = None,
                      only_clip_index: int | None = None, translation_override: str | None = None,
-                     preserve_translation: bool = False) -> list[dict]:
+                      preserve_translation: bool = False,
+                      resume_state: dict | None = None,
+                      checkpoint_callback: Callable[[str, dict], None] | None = None,
+                      continue_check: Callable[[], None] | None = None) -> list[dict]:
     if not video.is_file() or (not stock_voice and (reference is None or not reference.is_file())):
         raise FileNotFoundError("Video and cloned voice reference audio must exist")
     duration = duration_of(video)
@@ -633,6 +638,27 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             raise ValueError("Regeneration clip index is outside the saved segment map")
         prior_clip = prior_rows[only_clip_index]
     gnani = LiveGnaniClient(settings)
+    checkpoint_state = resume_state if resume_state is not None else {}
+
+    def checkpoint(stage: str) -> None:
+        if checkpoint_callback:
+            checkpoint_callback(stage, checkpoint_state)
+
+    def check_continue() -> None:
+        if continue_check:
+            continue_check()
+
+    stt_cache = checkpoint_state.setdefault("stt_cache", {})
+
+    def cached_stt(audio: bytes, language: str, model: str, **options) -> dict:
+        digest = hashlib.sha256(audio).hexdigest()
+        cache_key = json.dumps([digest, language, model, options], sort_keys=True, ensure_ascii=False)
+        if cache_key not in stt_cache:
+            check_continue()
+            stt_cache[cache_key] = gnani.stt(audio, language, model, **options)
+            checkpoint("transcript")
+        return stt_cache[cache_key]
+
     llm = LiveLLMClient(settings)
     workflow_llm = create_workflow_client(llm, settings)
     translator = create_translation_client(llm, settings)
@@ -655,6 +681,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             raise ValueError("Automatic source-language detection requires STT_MODEL=prisma-v3.0")
         stt_language = "indic-auto" if source_language == "auto" else source_language
         source_format = "codemix" if source_stt_model == "prisma-v3.0" else "verbatim"
+        resumed_term_fixes = checkpoint_state.get("term_fixes")
         if prior_clip is not None:
             source_lang = prior_report.get("source_language", source_language)
             raw_source = prior_clip.get("source_raw") or prior_clip.get("source_cleaned", "")
@@ -668,19 +695,25 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             }]
             term_sheet = TermSheet.model_validate(prior_report.get("term_sheet", {}))
             cleaned_rows = source_chunks
+        elif resumed_term_fixes:
+            source_lang = resumed_term_fixes["source_lang"]
+            term_sheet = TermSheet.model_validate(resumed_term_fixes["term_sheet"])
+            cleaned_rows = resumed_term_fixes["cleaned_rows"]
+            source_chunks = cleaned_rows
         else:
             boundaries = [(start + end) / 2 for start, end in source_silence_spans]
             time_ranges = targeted_silence_segments(duration, boundaries, hard_max=8.0)
             source_chunks = []
             for index, (start, end) in enumerate(time_ranges):
+                check_continue()
                 chunk_path = work / f"source_{index:02d}.wav"
                 run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-ac", "1", "-ar", "16000", str(chunk_path)])
-                response = gnani.stt(chunk_path.read_bytes(), stt_language, source_stt_model, format=source_format)
+                response = cached_stt(chunk_path.read_bytes(), stt_language, source_stt_model, format=source_format)
                 source_chunks.append({"start": start, "end": end, "raw": response["transcript"], "lang": response.get("detected_language_code", source_language)})
             def transcribe_range(start: float, end: float) -> dict:
                 chunk_path = work / f"source_join_{start:.3f}_{end:.3f}.wav"
                 run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-ac", "1", "-ar", "16000", str(chunk_path)])
-                return gnani.stt(chunk_path.read_bytes(), stt_language, source_stt_model, format=source_format)
+                return cached_stt(chunk_path.read_bytes(), stt_language, source_stt_model, format=source_format)
 
             source_chunks = merge_incomplete_chunks(source_chunks, transcribe_range, max_seconds=8.0)
             langs = [row["lang"] for row in source_chunks if row["lang"] != "unknown"]
@@ -720,7 +753,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     v25_path = work / f"source_v25_{index:02d}.wav"
                     run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(row["start"]), "-t", str(row["end"]-row["start"]), "-ac", "1", "-ar", "16000", str(v25_path)])
                     try:
-                        v25 = gnani.stt(v25_path.read_bytes(), row["lang"], "prisma-v2.5", format="verbatim")["transcript"]
+                        v25 = cached_stt(v25_path.read_bytes(), row["lang"], "prisma-v2.5", format="verbatim")["transcript"]
                         variants["prisma_v2_5"] = v25
                     except httpx.HTTPStatusError as exc:
                         comparison_errors.append(f"Speech recognition comparison unavailable: HTTP {exc.response.status_code}")
@@ -728,7 +761,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     keyed_chunk = work / f"source_keyterms_{index:02d}.wav"
                     run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(row["start"]), "-t", str(row["end"]-row["start"]), "-ac", "1", "-ar", "16000", str(keyed_chunk)])
                     try:
-                        hinted = gnani.stt(keyed_chunk.read_bytes(), stt_language, source_stt_model,
+                        hinted = cached_stt(keyed_chunk.read_bytes(), stt_language, source_stt_model,
                                            keyterms=keyterms, format=source_format)["transcript"]
                         variants["prisma_v3_keyterms"] = hinted
                     except httpx.HTTPStatusError as exc:
@@ -754,20 +787,25 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             for row in source_chunks:
                 row["cleaned"], row["cleanup_changes"] = clean_source_detail(workflow_llm, row["raw"], term_sheet, source_lang, source_context)
                 cleaned_rows.append(row)
-        for seed in seed_terms or []:
-            try:
-                validated = TermSheet.model_validate({"terms": [seed]}).terms[0]
-            except Exception:
-                continue
-            if validated.rule_type in {"mishearing", "protected"} and not any(
-                item.term.casefold() == validated.term.casefold() and item.rule_type == validated.rule_type
-                for item in term_sheet.terms
-            ):
-                term_sheet.terms.append(validated)
-        for row in cleaned_rows:
-            row["raw"] = apply_mishearing_maps(row["raw"], term_sheet)
-            row["cleaned"] = apply_mishearing_maps(row["cleaned"], term_sheet)
-        cleaned_rows = apply_speech_windows(cleaned_rows, source_silence_spans)
+        if not resumed_term_fixes:
+            for seed in seed_terms or []:
+                try:
+                    validated = TermSheet.model_validate({"terms": [seed]}).terms[0]
+                except Exception:
+                    continue
+                if validated.rule_type in {"mishearing", "protected"} and not any(
+                    item.term.casefold() == validated.term.casefold() and item.rule_type == validated.rule_type
+                    for item in term_sheet.terms
+                ):
+                    term_sheet.terms.append(validated)
+            for row in cleaned_rows:
+                row["raw"] = apply_mishearing_maps(row["raw"], term_sheet)
+                row["cleaned"] = apply_mishearing_maps(row["cleaned"], term_sheet)
+            cleaned_rows = apply_speech_windows(cleaned_rows, source_silence_spans)
+            checkpoint_state["term_fixes"] = {
+                "source_lang": source_lang, "term_sheet": term_sheet.model_dump(), "cleaned_rows": cleaned_rows,
+            }
+            checkpoint("term_fixes")
         reference_seconds = None
         if stock_voice:
             embedding = None
@@ -777,6 +815,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 raise ValueError("Voice reference must be 5–30 seconds for Gnani embedding extraction")
             embedding = speaker_embedding or gnani.make_embedding(reference.read_bytes())
         for target_lang in targets:
+            check_continue()
+            checkpoint_state["current_language"] = target_lang
             language_rows = []
             # Seeded from the measured raw-reference Hindi A/B line (88 chars / 4.894 s).
             measured_chars_per_second = 17.98 if target_lang == "hi-IN" else 12.0
@@ -813,8 +853,25 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     LOGGER.warning("Candidate selection failed (%s); first candidate needs human review", type(exc).__name__)
                     paragraph_selected_index, paragraph_selection_reason = 0, "Automatic selection was unavailable; review this candidate manually."
                     selection_needs_review = True
+            saved_language_clips = checkpoint_state.get("clips", {}).get(target_lang, {})
             for index, row in enumerate(cleaned_rows):
+                check_continue()
                 clip_index = only_clip_index if only_clip_index is not None else index
+                saved_clip = saved_language_clips.get(str(clip_index))
+                if saved_clip:
+                    candidate_path = output_dir / saved_clip["audio_key"]
+                    if candidate_path.is_file() and candidate_path.stat().st_size > 0:
+                        resumed_clip = dict(saved_clip["clip"])
+                        resumed_clip["audio_path"] = candidate_path
+                        if resumed_clip.get("withheld"):
+                            timeline_path = work / f"{target_lang}_{clip_index}_resumed_withheld.wav"
+                            run_command(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", f"{float(resumed_clip['slot_s']):.6f}", "-c:a", "pcm_s16le", str(timeline_path)])
+                            resumed_clip["timeline_audio_path"] = timeline_path
+                        else:
+                            resumed_clip["timeline_audio_path"] = candidate_path
+                        resumed_clip["timeline_audio_duration_s"] = duration_of(resumed_clip["timeline_audio_path"])
+                        language_rows.append(resumed_clip)
+                        continue
                 slot = row["end"] - row["start"]
                 spill_capacity_s = max(0.0, float(row.get("spill_end_s", row["end"])) - float(row["end"]))
                 fit_limit_s = timing_fit_limit(slot, spill_capacity_s)
@@ -1002,7 +1059,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                 if recovery_step:
                     LOGGER.info("Timing recovery for %s clip %s: %s", target_lang, clip_index + 1, recovery_step)
-                transcript = gnani.stt(sentence_audio.read_bytes(), target_lang, settings.verify_stt_model, format="transcribe")
+                transcript = cached_stt(sentence_audio.read_bytes(), target_lang, settings.verify_stt_model, format="transcribe")
                 audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
                 translation_checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
                 meaning_check_failed = False
@@ -1077,6 +1134,14 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     "timeline_audio_path": timeline_audio_path,
                     "timeline_audio_duration_s": duration_of(timeline_audio_path),
                 })
+                checkpoint_state.setdefault("clips", {}).setdefault(target_lang, {})[str(clip_index)] = {
+                    "audio_key": candidate_path.relative_to(output_dir).as_posix(),
+                    "clip": {key: value for key, value in language_rows[-1].items()
+                             if key not in {"audio_path", "timeline_audio_path", "timeline_audio_duration_s"}},
+                }
+                checkpoint_state["last_clip_index"] = clip_index
+                checkpoint("clip")
+            check_continue()
             final_path = output_dir / f"{video.stem}_{target_lang}_phase3d_ai-dubbed.mp4"
             if only_clip_index is not None:
                 report_path = final_path.with_suffix(".json")
@@ -1112,6 +1177,10 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             report_path = final_path.with_suffix(".json")
             atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
             atomic_write_text(final_path.with_suffix(".srt"), create_srt(language_rows))
+            checkpoint_state.setdefault("exports", {})[target_lang] = {
+                "mp4": final_path.name, "report": report_path.name, "srt": final_path.with_suffix(".srt").name,
+            }
+            checkpoint("export")
             all_outputs.append({"language": target_lang, "mp4": str(final_path), "report": str(report_path), "clips": language_rows, "term_sheet": term_sheet.model_dump()})
     return all_outputs
 
@@ -1261,3 +1330,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

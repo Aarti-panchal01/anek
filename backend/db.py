@@ -65,6 +65,7 @@ def initialize() -> None:
       voice_mode TEXT NOT NULL DEFAULT 'clone',
       stock_voice TEXT,
       error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+      checkpoint_json TEXT NOT NULL DEFAULT '{}',
       stage TEXT NOT NULL DEFAULT 'queued', done INTEGER NOT NULL DEFAULT 0,
       total INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -105,6 +106,8 @@ def initialize() -> None:
             db.execute("ALTER TABLE jobs ADD COLUMN voice_mode TEXT NOT NULL DEFAULT 'clone'")
         if "stock_voice" not in job_columns:
             db.execute("ALTER TABLE jobs ADD COLUMN stock_voice TEXT")
+        if "checkpoint_json" not in job_columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN checkpoint_json TEXT NOT NULL DEFAULT '{}' ")
         for table in ("terms", "global_terms"):
             columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
             for name, definition in (
