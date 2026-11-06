@@ -16,6 +16,7 @@ from backend.pipeline.phase3b import (
     merge_incomplete_chunks,
     revise_for_timing,
     shorter_timing_budget,
+    should_reuse_completed_clip,
     silence_chunks,
     targeted_silence_segments,
     transcript_sentences,
@@ -49,6 +50,12 @@ def test_neighbor_context_supports_merged_and_out_of_order_clip_rows():
         "Source: first\nTranslation: first done second",
         "Source: last short tail\nTranslation: last done first",
     ]
+
+
+def test_targeted_respeak_does_not_reuse_saved_clip_checkpoint_audio():
+    assert should_reuse_completed_clip(0, None)
+    assert should_reuse_completed_clip(0, 2)
+    assert not should_reuse_completed_clip(2, 2)
 
 
 def test_language_completion_invariant_preserves_short_final_clip_and_rejects_missing_translation():

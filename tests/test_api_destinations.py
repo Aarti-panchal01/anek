@@ -808,3 +808,60 @@ def test_delete_all_user_data_clears_files_and_database(monkeypatch):
         assert all(not (data_root / folder).exists() for folder in ("uploads", "exports", "voices"))
         with db.connect() as connection:
             assert connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0] == 0
+
+
+def _project_with_review_audio(data_root, *, overlap=False):
+    project = _resolve(app_module.create_project(app_module.ProjectCreate(
+        name="Review clip", source_lang="en-IN", target_langs=["hi-IN"],
+    )))
+    project_id = project["id"]
+    with db.connect() as connection:
+        connection.execute("UPDATE projects SET status='complete',duration_s=10 WHERE id=?", (project_id,))
+        connection.execute("INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)",
+                           ("review-clip-1", project_id, 0, 0, 2, "source"))
+        connection.execute("INSERT INTO dubs(id,clip_id,lang,translation,status,audio_path,duration_s) VALUES(?,?,?,?,?,?,?)",
+                           ("review-dub-1", "review-clip-1", "hi-IN", "अनुवाद", "yellow",
+                            str(data_root / "exports" / project_id / "clips" / "clip_001.wav"), 1.5))
+        if overlap:
+            connection.execute("INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)",
+                               ("review-clip-2", project_id, 1, 1, 3, "next"))
+            connection.execute("INSERT INTO dubs(id,clip_id,lang,translation,status,audio_path,duration_s) VALUES(?,?,?,?,?,?,?)",
+                               ("review-dub-2", "review-clip-2", "hi-IN", "अगला", "green",
+                                str(data_root / "exports" / project_id / "clips" / "clip_002.wav"), 1.5))
+    for index in (1, 2) if overlap else (1,):
+        path = data_root / "exports" / project_id / "clips" / f"clip_{index:03d}.wav"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test audio")
+    return project
+
+
+def test_user_can_verify_a_saved_audio_take(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        _project_with_review_audio(data_root)
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        assert result["human_verified"] is True
+        with db.connect() as connection:
+            row = connection.execute("SELECT status,reasons_json FROM dubs WHERE id='review-dub-1'").fetchone()
+        assert row["status"] == "green"
+        assert json.loads(row["reasons_json"]) == []
+
+
+def test_user_verification_rejects_overlapping_speech(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        _project_with_review_audio(data_root, overlap=True)
+        with pytest.raises(app_module.HTTPException, match="overlaps"):
+            _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+
+
+def test_edit_length_is_advisory_until_real_speech_duration_is_measured(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        text = "कौन सा head cover उन पर better लगेगा? इसलिए मैंने Ahead बनाया।"
+        assert len(text) > 32
+        result = _resolve(app_module.edit_dub("review-clip-1", "hi-IN", app_module.DubEdit(translation=text)))
+        assert result["status"] == "yellow"
+        assert not any("over_slot" in reason for reason in result["reasons"])
+        with db.connect() as connection:
+            row = connection.execute("SELECT translation,audio_path FROM dubs WHERE id='review-dub-1'").fetchone()
+        assert row["translation"] == text
+        assert row["audio_path"] is None

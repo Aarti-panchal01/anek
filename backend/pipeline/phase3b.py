@@ -544,6 +544,11 @@ def build_neighbor_context(rows: list[dict], translations: dict[int, str], index
     return context
 
 
+def should_reuse_completed_clip(clip_index: int, only_clip_index: int | None) -> bool:
+    """Keep checkpoint audio on resume, but never reuse the clip explicitly being re-spoken."""
+    return only_clip_index is None or clip_index != only_clip_index
+
+
 def select_candidate(client, source: str, candidates: list[str], target_lang: str, slot_s: float, cps: float) -> tuple[str, int, str]:
     time_limit_chars = max(1, int(slot_s * cps))
     response = prompt_json(
@@ -890,7 +895,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 check_continue()
                 clip_index = only_clip_index if only_clip_index is not None else index
                 saved_clip = saved_language_clips.get(str(clip_index))
-                if saved_clip:
+                if saved_clip and should_reuse_completed_clip(clip_index, only_clip_index):
                     candidate_path = output_dir / saved_clip["audio_key"]
                     if candidate_path.is_file() and candidate_path.stat().st_size > 0:
                         resumed_clip = dict(saved_clip["clip"])

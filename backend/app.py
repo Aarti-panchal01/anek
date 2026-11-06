@@ -1665,7 +1665,9 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
             raise HTTPException(404, "Clip not found")
         term_rows = connection.execute("SELECT * FROM terms WHERE project_id=?", (clip["project_id"],)).fetchall()
     sheet = TermSheet.model_validate({"terms": [term_row_payload(row) for row in term_rows]})
-    checks = run_checks(clip["src_text"], body.translation, lang, sheet, slot_seconds=clip["end_s"]-clip["start_s"])
+    # Character count is only a rough guide for Indic text and mixed-script names.
+    # The real pass/fail timing check happens against generated speech duration.
+    checks = run_checks(clip["src_text"], body.translation, lang, sheet)
     reasons = [f"{item['check']}: {item['detail']}" for item in checks]
     status = "red" if checks else "yellow"
     with db.connect() as connection:
@@ -1677,6 +1679,61 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
             (new_id(), clip_id, lang, body.translation, draft_translation, status, json.dumps(reasons, ensure_ascii=False)),
         )
     return {"status": status, "reasons": reasons, "human_edited": True}
+
+
+@app.post("/api/clips/{clip_id}/dubs/{lang}/verify")
+async def verify_dub_clip(clip_id: str, lang: str) -> dict:
+    """Mark a listened-to take as human verified, only when its audio is available and safe."""
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT d.id,d.status,d.reasons_json,d.audio_path,d.duration_s,c.project_id,c.idx,c.start_s,c.end_s,"
+            "p.status AS project_status,p.duration_s AS video_duration "
+            "FROM dubs d JOIN clips c ON c.id=d.clip_id JOIN projects p ON p.id=c.project_id "
+            "WHERE c.id=? AND d.lang=?", (clip_id, lang),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Dub not found")
+        if row["project_status"] == "processing":
+            raise HTTPException(409, "Wait for clip generation to finish before verifying it")
+        audio_path = Path(row["audio_path"] or "").resolve()
+        export_root = (DATA_ROOT / "exports" / row["project_id"]).resolve()
+        if not row["audio_path"] or not audio_path.is_relative_to(export_root) or not audio_path.is_file() or audio_path.stat().st_size == 0:
+            raise HTTPException(409, "Generate and listen to this clip's audio before verifying it")
+        reasons = json.loads(row["reasons_json"] or "[]")
+        if any("withheld" in str(reason).casefold() for reason in reasons):
+            raise HTTPException(409, "This clip's speech was withheld because it overlaps; regenerate it before verifying")
+        current_start = float(row["start_s"])
+        current_end = current_start + float(row["duration_s"] or 0)
+        if current_end > float(row["video_duration"] or row["end_s"]) + 0.05:
+            raise HTTPException(409, "This clip's audio extends past the video")
+        siblings = connection.execute(
+            "SELECT c.id,c.start_s,d.duration_s,d.audio_path FROM clips c "
+            "JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? AND c.id<>?",
+            (lang, row["project_id"], clip_id),
+        ).fetchall()
+        for sibling in siblings:
+            if not sibling["audio_path"] or not Path(sibling["audio_path"]).is_file():
+                continue
+            sibling_start = float(sibling["start_s"])
+            sibling_end = sibling_start + float(sibling["duration_s"] or 0)
+            if min(current_end, sibling_end) - max(current_start, sibling_start) > 0.01:
+                raise HTTPException(409, "This clip overlaps another clip's speech; regenerate it before verifying")
+        connection.execute("UPDATE dubs SET status='green',reasons_json='[]' WHERE id=?", (row["id"],))
+
+    report_path = _language_artifacts(row["project_id"], lang).get("report")
+    if report_path and report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            for clip in report.get("clips", []):
+                if int(clip.get("clip", -1)) == int(row["idx"]) + 1:
+                    clip["status"] = "green"
+                    clip["reasons"] = []
+                    clip["human_verified"] = True
+                    break
+            atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
+        except (OSError, ValueError, json.JSONDecodeError):
+            LOGGER.exception("Could not update review report after human verification for clip %s", clip_id)
+    return {"status": "green", "human_verified": True, "clip_id": clip_id, "lang": lang}
 
 
 @app.patch("/api/clips/{clip_id}/source")
