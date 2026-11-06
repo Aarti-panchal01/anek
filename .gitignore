@@ -1,4 +1,9 @@
 .env
+.env.local
+.env.*
+*.pem
+*.key
+!.env.example
 __pycache__/
 .pytest_cache/
 *.py[cod]
