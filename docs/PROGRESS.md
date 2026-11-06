@@ -1,142 +1,36 @@
 # Autonomous run progress
 
-## Tasks done
+## Completed work before Round 5
 
-- Already complete before this run: API URL prefix check (`bc0c3b9`); preview ffmpeg cap and fallback (`90bbb1d`); Range support (`ea6a5a7`); shared source transcription; timing recovery across ten languages (`7ad4dbd`).
-- Task 1, LLM provider swap: `20eb6a5` (pushed). Backend suite passed; frontend build passed.
-- Task 2, Timing and sync, all ten languages: `aeddca0` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
-- Task 3, Dubbed playback: `3c3b4c4` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
-- Task 4, Terms and edit persistence: `d063b83` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
-- Task 5, Attempt history: `585d67f` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
-- Task 6, Editor UX: `96d5902` (pushed). Backend suite (`python -m pytest tests -q`) passed; frontend build passed.
-- Production playback hotfix: `pending` — when ffprobe cannot read a dubbed MP4, `/media` serves the project's original upload; regression test added. Backend suite and frontend build passed.
-
-## Current task
-
-- Complete. Final backend suite (`python -m pytest tests -q`) and frontend production build passed. Follow-up deployment diagnosis found `/media` returning 500 when ffprobe rejected an existing dubbed MP4; hotfix above is ready to ship.
-
-## Next task
-
-- Deploy the production playback hotfix and confirm Railway's latest deployment is active.
-
-## Decisions
-
-- Preserve all user-facing model-name removal.
-- Do not print environment variable values.
-- The installed Sarvam SDK does not expose the requested 30B chat model; use the supported 105B conversations endpoint for rewrite/QA.
-- Keep user-facing provider/model names hidden. Keep the existing fallback chain with Gemini last.
-- Quota circuits open immediately for primary providers; the Gemini key pool may rotate within the current request before its model circuit opens.
-- Task 2 uses detected source silence for safe speech windows; 100ms tolerance is accepted only when it fits within that silence, preserving the no-overlap invariant. Speed-up is capped at 15%, and export duration tolerance is 50ms.
-- Task 3 uses the project `/media` MP4 for the main Dubbed toggle; the side-by-side Dubbed player is unmuted by default. Withheld status is shown alongside its clip time range.
-- Task 4 term rules default to project scope. The explicit “Save this rule to global term memory” option copies it to future projects. Protected spelling remains the canonical displayed term; language-specific spoken forms are used only for synthesis.
-- Task 5 stores attempt WAVs under the project's export directory and serves them through a clip-scoped endpoint. The first take has no previous audio; subsequent retries carry both versions.
-- Task 6 keeps attempts collapsed by default. Clicking a clip plays its timed range from the mixed dub, and the single-player mode is the default.
-- Current task: complete. Environment inventory was collected with variable names only.
-- Deployment diagnosis: the Railway deployment shown as Removed was superseded; the current service has a successful deployment, but production requests to `/api/projects/.../media` still returned 500 because `ffprobe` raised `CalledProcessError`. The UI consequently showed no dubbed video. The hotfix logs the failure and serves the original upload, preserving a visible video while dubbed media is unavailable.
-
-## Round 2: resilience
-
-### Tasks done
-
-- Task 1: `571b987` (pushed). Backend suite and frontend build passed. `/media` now rebuilds from a saved dub track, falls back to the browser-ready original, then returns a structured 409. Logs include failed path, byte size, and ffprobe stderr. UI displays the reason with Retry. Zero-byte, truncated, and exhausted-fallback tests added.
-- Task 2: `5b7576a` (pushed). Backend suite and frontend build passed. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
-- Task 3: `1b309d2` (pushed). Backend suite and frontend build passed. Jobs persist transcription cache, term fixes, clips per language, and exports to SQLite plus an atomic checkpoint file. Startup marks running work interrupted, Resume queues it, and SIGTERM stops the runner at the next checkpoint. Added restart/resume test proving a saved transcript and clip take are reused.
-- Task 4: `50d7e90` (pushed). Backend suite and frontend build passed. Project listings expose the latest job stage/error; no-clip jobs fail explicitly, and the editor provides Processing, Interrupted/Resume, and Failed/Retry states instead of an empty Review.
-- Task 5: `c5acef8` (pushed in `7d44139`). Backend suite (`python -m pytest tests -q`) passed; frontend build passed. Startup logs resolved timing values and enabled provider names, and names of Railway timing variables overriding defaults. Logging test confirms secrets and environment values are not emitted.
-- Task 6: `77cfb36` (pushed with this progress update). Backend suite (`python -m pytest tests -q`) passed; frontend build passed. Added a mock bilingual job smoke test that simulates shutdown after a durable Hindi clip, resumes Kannada without repeating the cached transcript, checks both playable media routes with ffprobe and duration tolerance, and asserts speech intervals do not overlap.
-
-### Current task
-
-- Complete: all six resilience tasks implemented, verified, and pushed to main.
-
-### Next task
-
-- Complete. No further tasks remain in this round.
-
-### Decisions
-
-- Resume this round from the reported production failure; retain the earlier implementation history above without redoing completed tasks.
-- The previous fallback hotfix `f97b1ee` avoided a 500 by serving the upload, but this round replaces that shortcut with the requested recovery order and explicit unavailable state.
-- Task 1 considers a media file available only when it is non-empty and ffprobe finds a video stream; failed candidates are logged with stderr and size.
-- Task 6 smoke test uses deterministic mock job execution at the pipeline boundary so it can exercise application checkpoint/resume, persisted clips, API media delivery, and ffprobe locally without calling paid providers; the media artifacts themselves are generated with local FFmpeg.
-
-## Round 3: README
-
-### Tasks done
-
-- Verified and replaced the root README against `pyproject.toml`, frontend lock/config, FastAPI, Dockerfile, Railway config, `.env.example`, and current pipeline/UI code. Corrected the local dev port, added complete Vercel and Railway variable tables, documented current timing, terms, checkpoints, status states, smoke coverage, and the API-prefix build check. Rewrote both Mermaid diagrams and updated completed roadmap items.
-- Checked current files and Git history for key patterns without printing values. The ignored local `.env` contains configured keys; no committed real-key pattern was identified. Test fixtures in `tests/test_llm_client.py` use mocked provider values.
-- Confirmed `.gitignore` ignores `.env` and `data/`.
-
-### Current task
-
-- Complete. README verification and the requested security search are done.
-
-### Next task
-
-- Complete Round 3b screenshot seeding and automated capture, update README image links, run checks, commit, and push.
-
-### Decisions
-
-- Do not invent screenshots. Preserve links and mark missing images until the automated capture task produces them.
-
-## Round 3b: screenshots
-
-### Current task
-
-- Complete. Screenshot seeding, automated capture, README links, backend tests, frontend build, commit, and push are done.
-
-### Next task
-
-- Complete. No further tasks remain in this round.
-
-### Decisions
-
-- Use a temporary `ANEK_DATA_DIR` and local deterministic demo fixtures. Do not commit demo video files or modify app behavior.
-- Use viewport 1440x900 at device scale factor 2. The six generated PNGs are each under 600 KB and were visually inspected.
-- Verification passed: `python -m pytest tests -q`; `cd frontend && npm run build` (including the API-prefix check).
-- The README includes links to all generated screenshots and notes that they use seeded demo data.
-- Main commit `28b80132b1c858c8e56bf4c24be347aa825f0845` contains the README, scripts, and screenshots.
-
-## Round 4: storage
-
-### Tasks done
-
-- Task 1: `b0e6efc` (pushed). Atomic writes, uploads, and media/export command failures normalize ENOSPC to a structured 507. The global JSON handler retains allowed CORS headers, upload temp files are removed, running project jobs are marked failed, and fetch errors shown in the UI are human-readable. Added disk-full atomic-write and upload/job/CORS cleanup tests. Backend suite and frontend build passed.
-- Task 2: Part A pending commit. Uploads are rejected before writing when free space is below six times the uploaded size. The configured 500 MB cap is shown in the UI and oversized selections are blocked. Preflight tests cover low space and oversized files.
-- Task 3: Part A pending commit. Added `GET /api/storage`, Usage page used/free display and an 80% warning, plus startup storage logging and a warning below 20% free.
-- Task 4: Part A pending commit. Project deletion removes upload and export folders plus related database rows. Startup removes orphaned `.tmp` and zero-byte files while preserving voice files and the database, and flags missing source files as `files_removed`. The review screen explains the state and offers a confirmed delete action. Successful exports remove per-clip WAVs, temporary mixes, and duplicate browser previews when no resumable job exists. Tests cover deletion, cleanup, and preservation for interrupted jobs.
-- Part A checks passed: `python -m pytest tests -q`; `cd frontend && npm run build`.
-
-### Current task
-
-- Part B complete. Enforced an 80% storage budget and a maximum of two finished projects, evicting only the oldest finished project and returning its name. Uploads are limited to 40 MB; the UI explains the limit and 720p compression. Uploads are atomically compressed to verified 720p H.264/AAC faststart working copies; originals are removed only after verification. Preview, processing, and export use the working copy. Successful export removes clip WAVs, temp mixes, duplicate previews, and generated track WAVs while preserving final dubbed MP4s and resume files. Exports expire after configurable `EXPORT_RETENTION_HOURS` (default 24), with expiry shown in project and Usage views. Added eviction, verified-copy retention, export expiry, and budget endpoint tests. Full backend suite and frontend build passed before push.
-
-### Next task
-
-- Part C: rewrite README and remove screenshot assets and tooling.
-
-### Decisions
-
-- Keep generated exports based on the original source video; any compressed working copy is for preview and processing only.
-- Keep automatic age-based cleanup disabled unless the user explicitly configures it.
+- Provider swap: `20eb6a5`.
+- Timing and sync: `aeddca0`.
+- Dubbed playback: `3c3b4c4`.
+- Terms and edit persistence: `d063b83`.
+- Attempt history: `585d67f`.
+- Editor UX: `96d5902`.
+- Resilience, checkpoints, media recovery and bilingual smoke coverage: `571b987`, `5b7576a`, `1b309d2`, `50d7e90`, `c5acef8`, `77cfb36`.
+- Round 4 storage handling: `b0e6efc` and `0a72d99`.
 
 ## Round 5: finish storage, small volume, README
 
-### Tasks done
+### Part A
 
-- Round 4 Task 1 is complete at `b0e6efc`; Part A is complete and pushed as `0a72d99`.
+- Complete and pushed as `0a72d99`. Finished upload preflight, storage visibility, deletion and cleanup, and missing-file state. Verified `.gitignore` patterns and confirmed the test key-looking strings are fake fixtures without printing values.
+- Backend tests and frontend build passed before push.
 
-### Current task
+### Part B
 
-- Part A: `0a72d99` (pushed). Backend suite and frontend build passed. Verified `.gitignore` ignores `.env.local`, `.env.*`, `*.pem`, and `*.key`, with `.env.example` exempt. `git ls-files` reports only the intentionally exempt `.env.example` among those patterns. The two key-looking test literals in `tests/test_llm_client.py` are clearly fake fixtures; their values were masked.
+- Complete and pushed as `58d05ed`. Added an 80% volume budget, a two-finished-project limit, oldest-finished eviction, a 40 MB cap, verified 720p H.264/AAC working copies, export cleanup and expiry (default 24 hours). Active and interrupted projects are not eligible for eviction. The compressed copy is used for preview, processing and export; the original is deleted only after verification.
+- Tests cover eviction ordering, verified-copy failure, export expiry, storage status and ENOSPC handling. Backend tests and frontend build passed before push.
+- Disk measurement used an FFmpeg-generated 20-second 720p test video with a sine tone. Original: 3,300,448 bytes. Compressed copy: 2,326,021 bytes. The mock project with two retained language outputs used 7,952,510 bytes before replacing the original and 6,978,103 bytes after, a 12.3% reduction.
 
-### Next task
+### Part C
 
-- Part B current: enforce the Railway storage budget, use a verified 720p working source, expire exports, and measure disk usage. Part C next: simplify the README and remove screenshot tooling.
+- Current task: simplify the root README and remove generated documentation imagery and capture tooling. Do not change app code. Run backend tests and frontend build before pushing.
 
 ### Decisions
 
-- Follow the requested push cadence: after Part A, Part B, and Part C. Run the backend suite and frontend build before each push.
-- Do not rerun or repeat already completed Round 4 Task 1; keep the prior ignored-file and fake-fixture findings.
-- The 20-second 720p mock measurement used FFmpeg testsrc plus a sine tone. Original source: 3,300,448 bytes; verified working copy: 2,326,021 bytes. For the two-language mock project, estimated disk use fell from 7,952,510 bytes to 6,978,103 bytes after replacing the original with the compressed source (12.3% reduction). Mock final dubbed files were retained for both languages.
+- Push after each of Parts A, B and C, not after individual subtasks.
+- Never delete voice files under `/data/voices` or the database file.
+- Automatic age-based project cleanup remains disabled. The only new setting is export retention, default 24 hours.
+- Earlier source-retention guidance is superseded: the verified compressed working copy is used for processing and export.

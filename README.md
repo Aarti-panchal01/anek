@@ -4,19 +4,15 @@
 
 **Speak once. India understands.**
 
-Dub a video into ten Indian languages in your own cloned voice, then review every clip before you export.
+[![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF)](https://anek-tau.vercel.app)
+[![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://github.com/Aarti-panchal01/anek)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)](pyproject.toml)
+[![Vercel](https://img.shields.io/badge/web-Vercel-000000)](https://anek-tau.vercel.app)
+[![Railway](https://img.shields.io/badge/api-Railway-0B0D0E)](https://railway.com)
 
-[![React](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF?logo=vite&logoColor=white)](https://anek-tau.vercel.app)
-[![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://anek-tau.vercel.app)
-[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![Vercel](https://img.shields.io/badge/web-Vercel-000000?logo=vercel&logoColor=white)](https://anek-tau.vercel.app)
-[![Railway](https://img.shields.io/badge/api-Railway-0B0D0E?logo=railway&logoColor=white)](https://railway.com)
-
-[Live app](https://anek-tau.vercel.app) | [Product spec](SPEC.md) | [Evaluation report](EVAL.md)
+[Live app](https://anek-tau.vercel.app) · [SPEC.md](SPEC.md) · [EVAL.md](EVAL.md)
 
 </div>
-
----
 
 ## Contents
 
@@ -25,6 +21,7 @@ Dub a video into ten Indian languages in your own cloned voice, then review ever
 - [Features](#features)
 - [How it works](#how-it-works)
 - [Architecture](#architecture)
+- [Request flow](#request-flow)
 - [How it is built](#how-it-is-built)
 - [Timing and sync](#timing-and-sync)
 - [Terms and edits](#terms-and-edits)
@@ -38,220 +35,192 @@ Dub a video into ten Indian languages in your own cloned voice, then review ever
 - [Limitations](#limitations)
 - [Roadmap](#roadmap)
 - [Author](#author)
-
----
+- [Credits](#credits)
 
 ## About
 
-Most dubbing tools stop at "translate and speak". The hard part comes after: a name gets mistranscribed, a number changes, a translated line runs longer than the original clip, or two clips talk over each other. Anek treats those as things to catch, not things to hope about.
-
-You upload a video of one speaker. Anek transcribes it, lets you fix names and terms, translates it, speaks each translation in a clone of your voice, fits every line into its original time slot, and marks each clip Green, Yellow or Red so you know exactly where to look before you export.
-
-Supported target languages: Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil and Telugu.
+Anek creates reviewed dubbed versions of a video in ten Indian languages: Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil and Telugu. It transcribes the source once, applies term rules, translates and voices each clip, checks timing and quality, then lets a person review the result before export.
 
 ## Demo
 
 Demo video coming soon.
 
-<!-- Add the demo video link or embed here once it is recorded. -->
+<!-- Demo video link goes here. -->
 
 ## Features
 
-- **Ten Indian languages** from one upload, in your own cloned voice.
-- **One transcription, many languages.** The source is transcribed once and shared across every target.
-- **Term memory.** Fix mishearings and protect names so a brand like "Anek" is never translated or mangled.
-- **Timing that fits.** Each spoken line is fitted to its clip with a fixed recovery order, and clips never overlap.
-- **Clip-by-clip review.** Edit the text, regenerate a clip, compare original and dubbed, and see why a clip was flagged.
-- **Resumable jobs.** A restart or crash does not lose the work. Jobs checkpoint and can be resumed.
-- **Browser-safe playback.** Video and media are served with HTTP Range support so seeking works.
+- Create dubbed tracks in ten target languages with a cloned or selected voice.
+- Review clips as Green, Yellow or Red, edit text and regenerate individual takes.
+- Use project and global term memory for names and phrases.
+- Resume interrupted jobs from saved checkpoints.
+- Play original and dubbed video with seeking and synchronized audio.
+- Export a mixed MP4 and review report for each language.
 
 ## How it works
 
 ```mermaid
 flowchart TD
-    A[Upload or record video] --> B[Voice consent recording]
-    B --> C[Voice setup]
-    A --> D[Extract audio with ffmpeg]
-    D --> E[Speech to text, once]
-    E --> F[Clean transcript and split into clips]
-    F --> G[Apply term rules]
-    G --> H{Source approved?}
-    H -- edit --> G
-    H -- yes --> I[Translate each clip per language]
-    I --> J[Speak each clip in the cloned voice]
-    J --> K[Fit speech into the clip slot]
-    K --> L[Quality checks per clip]
-    L --> M[Review studio: Green, Yellow, Red]
-    M -- edit or regenerate --> I
-    M -- approved --> N[Mix tracks and export MP4]
+    A[Upload video] --> B[Compress and verify 720p source]
+    B --> C[Record consent and set up voice]
+    C --> D[Transcribe source once]
+    D --> E[Apply source term rules]
+    E --> F[Translate clips for each language]
+    F --> G[Generate speech]
+    G --> H[Fit speech and check quality]
+    H --> I[Save clips and checkpoints]
+    I --> J[Review and edit]
+    J --> K[Mix and export]
 ```
 
-1. **Upload.** MP4, MOV or WebM, up to 120 seconds by default. A browser-safe preview is created with ffmpeg.
-2. **Consent and voice.** The speaker records a short consent sample, which is also used to set up the cloned voice.
-3. **Transcribe once.** Speech to text runs one time per project. The result is shared by every target language.
-4. **Fix terms.** Term rules correct known mishearings and protect names before any translation happens.
-5. **Translate.** Each clip is translated for each selected language.
-6. **Speak.** Each translation is synthesized in the cloned voice.
-7. **Fit.** Each take is fitted into its clip slot, with automatic recovery when it runs long.
-8. **Check.** Every clip gets automated checks for meaning, numbers, names, timing and transcript agreement.
-9. **Review.** You edit, regenerate or approve clips in the studio.
-10. **Export.** Tracks are mixed and muxed back into the video, one MP4 per language.
+1. Upload an MP4, MOV or WebM video, up to 40 MB and 120 seconds by default. The server creates and verifies a 720p working copy.
+2. Record speaker consent and configure the voice.
+3. Transcribe the source once and reuse it across selected languages.
+4. Apply mishearing and protected term rules before translation.
+5. Translate and synthesize each clip in each target language.
+6. Recover over-slot speech, run quality checks and save checkpoints.
+7. Review, edit or regenerate clips, then export the final mixed video.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    U[Browser] --> V[Vercel<br/>React and Vite app]
-    V -- "HTTPS /api" --> R[Railway<br/>FastAPI service]
-
-    subgraph Backend
-        R --> J[Job runner<br/>checkpoints and resume]
-        J --> P[Dubbing pipeline]
-        R --> M[Media routes<br/>Range support]
-        P --> T[Term memory]
-        P --> C[(Project store)]
-        P --> S[(Persistent volume<br/>uploads, takes, exports)]
-        P --> F[ffmpeg and ffprobe]
-        M --> S
-    end
-
-    P --> G[Gnani<br/>speech to text, text to speech, voice]
-    P --> SV[Sarvam<br/>translation and QA]
-    P --> L[Fallback LLM chain<br/>with circuit breakers]
+    Browser --> Vercel[React and Vite]
+    Vercel -->|HTTPS API| FastAPI
+    FastAPI --> Jobs[Job runner]
+    Jobs --> Pipeline[Dubbing pipeline]
+    Jobs --> Checkpoints[(SQLite and checkpoint files)]
+    Pipeline --> Terms[Term memory]
+    Pipeline --> Media[FFmpeg and ffprobe]
+    Pipeline --> Storage[(Persistent volume and 80 percent budget)]
+    FastAPI --> Storage
+    Pipeline --> Gnani[Gnani speech services]
+    Pipeline --> Sarvam[Sarvam translation and QA]
+    Pipeline --> Fallback[Fallback LLM chain]
 ```
 
-**Frontend.** A single page React app built with Vite. Every API and media URL goes through one `apiUrl()` helper that adds the `/api` prefix. A build step scans the source and fails if a project video, media or preview URL bypasses that helper.
+**Frontend.** React and TypeScript run in Vite. API and media URLs use the shared `apiUrl()` helper. A build check rejects project media URLs that bypass the `/api` prefix.
 
-**Backend.** A FastAPI service that owns projects, jobs, clip review state and media delivery. In the container it also serves the built frontend.
+**Backend.** FastAPI serves project, job, review and media endpoints. The container also serves the built frontend.
 
-**Pipeline.** Stages for transcription, term fixes, translation, synthesis, timing fit and quality checks. Each stage writes a checkpoint so a job can resume from where it stopped.
+**Pipeline.** The pipeline transcribes once, applies term rules, translates, synthesizes, fits speech, checks results and exports media. Checkpoints let jobs resume.
 
-**Providers.** Gnani handles speech recognition, synthesis and voice. Sarvam is the primary provider for translation and translation QA. A fallback LLM chain takes over when needed, and a circuit breaker skips any model that fails or runs out of quota for five minutes instead of retrying it on every clip.
+**Providers.** Gnani provides speech recognition, synthesis and voice services. Sarvam is primary for translation and QA. The existing LLM chain is fallback. Failed or quota-limited models are skipped by a five-minute circuit breaker.
 
-**Storage.** Uploads, generated takes, tracks and exports live on a persistent volume. Generated files are written atomically so a crash never leaves a half-written file behind.
+**Storage.** SQLite stores project and job records. A persistent volume stores uploads, working sources, generated clips and exports. Writes use temporary files, fsync and atomic rename. Storage is budgeted to 80 percent of the volume.
 
-### Request flow
+## Request flow
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser
+    participant User
+    participant Web as Frontend
     participant API as FastAPI
-    participant STT as Gnani speech to text
-    participant TR as Sarvam translation
-    participant TTS as Gnani speech synthesis
-    participant FF as ffmpeg
-
-    B->>API: Upload video
-    API->>FF: Build browser preview
-    API-->>B: Project created
-    B->>API: Consent and start
-    API->>STT: Transcribe once
-    STT-->>API: Transcript and segments
-    API->>API: Apply term rules
-    API->>TR: Translate clips per language
-    TR-->>API: Translations
-    API->>TTS: Speak each clip
-    TTS-->>API: Audio takes
-    API->>API: Fit to slot and run checks
-    API-->>B: Clips marked Green, Yellow or Red
-    B->>API: Edit or regenerate
-    B->>API: Export
-    API->>FF: Mix tracks and mux video
-    API-->>B: Dubbed MP4
+    participant Store as Checkpoint store
+    participant Speech as Gnani
+    participant Translate as Sarvam or fallback
+    participant Media as FFmpeg
+    User->>Web: Upload video and choose languages
+    Web->>API: Create project and upload
+    API->>Media: Compress and verify working copy
+    API->>Store: Save project and job state
+    Web->>API: Start dubbing job
+    API->>Speech: Transcribe source once
+    Speech-->>API: Transcript and segments
+    API->>Store: Save transcript checkpoint
+    loop Each clip and target language
+        API->>Translate: Fix terms and translate
+        Translate-->>API: Translation
+        API->>Speech: Synthesize clip
+        Speech-->>API: Audio take
+        API->>Media: Fit, mix and validate
+        API->>Store: Save clip checkpoint
+    end
+    API-->>Web: Reviewable clips and status
+    Web->>API: Request export
+    API->>Media: Build final mixed video
+    API-->>Web: Export ready with expiry time
 ```
 
 ## How it is built
 
-A few decisions shape the whole system.
+**Transcribe once, translate many.** A source transcript is shared across every target language to avoid duplicate recognition work.
 
-**Transcribe once, translate many.** Transcription is the slowest and most expensive step, and it does not depend on the target language. Running it once and sharing the result across all languages cuts both time and cost.
+**Fix source terms before translating.** Mishearing maps correct transcript variants before translation, so fixes apply consistently in every language.
 
-**Fix the source before translating.** If a brand name is misheard, translating first would copy the mistake into every language. Term rules run on the transcript before translation, so one fix covers all of them.
+**Check, do not trust.** Quality checks compare meaning, names, numbers and timing against generated results.
 
-**Check, do not trust.** Every translated clip is checked for meaning, numbers and names, and timing is measured from the real generated audio instead of estimated. Clips that fail are flagged for a person rather than passed through.
+**Recover before rejecting.** A long take gets a shorter translation attempt, controlled speed-up, pause trimming and safe silent-gap spill before it is withheld.
 
-**Recover before rejecting.** When a line runs long, Anek tries several fixes in order before it gives up on a clip. A clip is withheld only when nothing safe remains.
+**Fail safe and resume fast.** Durable checkpoints and atomic files keep work recoverable after a restart. A provider circuit breaker prevents repeatedly calling a failing model.
 
-**Fail safe, resume fast.** Hosting platforms restart containers. Jobs checkpoint after each stage, files are written atomically, and an interrupted job can resume without repeating paid work.
+**Keep API paths consistent.** Frontend requests use `apiUrl()`, and a build-time source scan enforces `/api` for project media and API URLs.
 
-**Keep the URL contract honest.** A missing `/api` prefix on a media URL once produced a blank player that looked like a codec bug. The frontend now builds all URLs through one helper and the build fails if that rule is broken.
-
-**Test without paying providers.** Mock modes for the speech and LLM providers let the whole pipeline run in tests, including an end to end smoke test that covers resume after a simulated crash.
+**Mock provider modes.** Test configuration can run the dubbing pipeline without paid provider requests. The backend suite includes a mock smoke test for Hindi and Kannada, media validation and job resume.
 
 ## Timing and sync
 
-Hindi, Kannada and most other Indian languages need more syllables than English for the same meaning, so a spoken line often runs longer than the original clip. Anek recovers in a fixed order.
-
 ```mermaid
 flowchart TD
-    A[Speak the translated line] --> B{Fits the slot?}
-    B -- yes --> Z[Keep it]
-    B -- no --> C[Ask for a shorter translation<br/>with a reduced character budget]
-    C --> D[Speak again]
-    D --> E{Fits?}
-    E -- yes --> Z
-    E -- no --> F[Speed up, up to 1.15x]
-    F --> G{Fits?}
-    G -- yes --> Z
-    G -- no --> H[Trim fixed pauses]
-    H --> I{Fits?}
-    I -- yes --> Z
-    I -- no --> K[Spill into the silent gap<br/>before the next speech]
-    K --> L{Fits without overlap?}
-    L -- yes --> Z
-    L -- no --> W[Withhold and mark Red]
+    A[Measure generated speech] --> B{Fits slot plus tolerance?}
+    B -->|Yes| K[Keep take]
+    B -->|No| C[Retry with shorter translation and reduced character budget]
+    C --> D{Fits?}
+    D -->|Yes| K
+    D -->|No| E[Speed up by at most 15 percent]
+    E --> F{Fits?}
+    F -->|Yes| K
+    F -->|No| G[Trim fixed pauses]
+    G --> H{Fits?}
+    H -->|Yes| K
+    H -->|No| I[Spill into detected silent gap]
+    I --> J{No overlap with speech?}
+    J -->|Yes| K
+    J -->|No| L[Withhold clip]
 ```
 
-Rules that always hold:
-
-- Speech starts at its source clip start time.
-- A small overrun of up to 100 ms is accepted when it fits in detected silence.
-- No two clips of speech overlap.
-- The final mixed dub duration matches the video within 50 ms, and this is checked.
-- Every recovery step is logged, so you can see why a clip was kept or withheld.
-
-This applies to all ten target languages.
+- The overrun tolerance is 100 ms and is bounded by detected silence.
+- Speech starts at its source slot start. Speech from clips must never overlap.
+- The maximum atempo speed-up is 15 percent.
+- Export duration must match the source video within 50 ms.
+- The same recovery rules apply to all ten target languages.
 
 ## Terms and edits
 
-Term rules can belong to one project or be saved to global memory for future projects.
+Term memory supports a mishearing map, protected terms and per-language spoken spellings. Mishearing variants are replaced in the source transcript before translation. Protected terms are substituted with placeholders, restored after translation and checked in every output. A missing protected term flags the clip.
 
-| Rule | What it does |
-| --- | --- |
-| Mishearing map | Replaces heard variants of a word with the correct one before translation. |
-| Protected term | Is never translated. A placeholder is used during translation, then restored and verified in every output. |
-| Spoken spelling | Sets how a protected term is written per language, so the voice says it correctly. |
-
-When you edit text in a clip, you can apply the change to all clips or save it to term memory. Edited clips are locked, so regenerating or re-running a job never overwrites what you wrote.
+Rules can be project-specific or saved to global memory for future projects. When editing a clip, users can apply a correction to all clips or save it to term memory. Edited clips are locked against automated overwrites.
 
 ## Reliability
 
 ```mermaid
 stateDiagram-v2
     [*] --> Processing
-    Processing --> Review: all stages done
-    Processing --> Failed: a stage fails
-    Processing --> Interrupted: server restarts
-    Interrupted --> Processing: Resume
-    Failed --> Processing: Retry
+    Processing --> Review: work completed
+    Processing --> Failed: unrecoverable error
+    Processing --> Interrupted: restart or shutdown
+    Interrupted --> Processing: resume from checkpoint
+    Failed --> Processing: retry
     Review --> [*]
 ```
 
-- **Checkpoints** are saved after transcription, term fixes, each clip and export.
-- **Resume** continues from the last checkpoint and does not repeat transcription or finished clips.
-- **Atomic writes** keep partial files from ever being served.
-- **Media fallback.** If a preview cannot be produced, the app falls back to the original upload and shows a clear reason instead of a blank player.
-- **Clear project states.** A project shows Processing with its stage, Interrupted with a Resume button, or Failed with a reason and a Retry button, never an empty Review page.
+- Checkpoints cover transcription, term fixes, each language clip and export.
+- Resume reuses completed work and does not repeat paid transcription.
+- Generated files are written atomically and partial temporary files are cleaned up.
+- Invalid media falls back to a rebuilt dub preview, then the browser preview, then a structured unavailable response with a retry action.
+- Missing project files show a Files removed state with a delete action.
+- Storage has an 80 percent budget and keeps at most two finished projects. When necessary, the oldest finished project is evicted; active and interrupted projects are preserved.
+- Temporary and zero-byte files are cleaned at startup. Export intermediates are removed after successful export, and exports expire after 24 hours by default.
+- Upload failures caused by full storage return a clear error instead of a partial file.
 
 ## Review states
 
 | State | Meaning |
 | --- | --- |
-| Green | Passed all automated checks. |
-| Yellow | Needs a look, for example a transcript mismatch or a missing phrase. |
-| Red | A hard failure or uncertain source, for example speech that still cannot fit its slot. |
+| Green | Automated checks passed. |
+| Yellow | Review is recommended, such as a transcript mismatch. |
+| Red | A hard check failed or speech cannot fit safely. |
 
-The studio has an Original and Dubbed toggle, optional side by side playback, per clip slot and character budget details, attempt history, text editing and regeneration.
+The review studio has an Original/Dubbed player toggle, optional side-by-side players, per-clip slot and speech lengths, a live character budget, edit and re-speak controls, saved state, undo and attempt history.
 
 ## Tech stack
 
@@ -259,39 +228,42 @@ The studio has an Original and Dubbed toggle, optional side by side playback, pe
 | --- | --- |
 | Frontend | React, TypeScript, Vite |
 | Backend | Python, FastAPI, Uvicorn |
-| Speech to text, speech and voice | Gnani |
-| Translation and QA | Sarvam, with a fallback LLM chain |
-| Media | ffmpeg and ffprobe |
-| Hosting | Vercel for the frontend, Railway for the backend |
-| Tests | pytest, plus a frontend build check |
+| Speech and voice | Gnani |
+| Translation and QA | Sarvam with fallback LLM providers |
+| Media | FFmpeg and ffprobe |
+| Hosting | Vercel and Railway |
+| Tests | pytest and frontend production build |
 
 ## Project structure
 
 ```text
 anek/
   backend/
-    app.py               FastAPI routes and job orchestration
-    atomic_files.py      Durable file writes
-    clients/             Speech and LLM provider clients
-    pipeline/            Transcription, translation, synthesis, timing
-    static/              Built frontend served by the container
+    app.py
+    atomic_files.py
+    config.py
+    db.py
+    clients/
+    pipeline/
+    static/
   frontend/
-    src/main.tsx         React app and apiUrl() helper
-    scripts/             Build-time URL prefix check
-    vercel.json          Vercel settings and SPA rewrite
-  docs/                  Project notes
-  scripts/               Helper scripts
-  tests/                 Backend tests
-  Dockerfile             Backend container
-  railway.toml           Railway build and health settings
-  pyproject.toml         Python package and test config
-  SPEC.md                Product spec
-  EVAL.md                Evaluation notes
+    src/
+    scripts/check-api-prefix.mjs
+    vercel.json
+  docs/PROGRESS.md
+  scripts/
+  tests/
+  Dockerfile
+  railway.toml
+  pyproject.toml
+  README.md
+  SPEC.md
+  EVAL.md
 ```
 
 ## Getting started
 
-You need Python 3.11 or newer, Node.js 20.19 or newer (or 22.12 or newer), and ffmpeg with ffprobe on your PATH.
+Requirements: Python 3.11 or newer, Node.js 20.19 or newer (or 22.12 or newer), and FFmpeg with ffprobe on the PATH. The backend container uses Python 3.12 and the Vercel frontend build uses Node 22.
 
 ```bash
 git clone https://github.com/Aarti-panchal01/anek.git
@@ -299,7 +271,7 @@ cd anek
 cp .env.example .env
 ```
 
-`.env.example` documents every setting, including a mock mode that runs the app without calling any paid provider. Add real keys only when you want live requests.
+The `.env.example` file documents every setting, including mock mode for local development and tests.
 
 Start the backend:
 
@@ -310,7 +282,7 @@ pip install -e ".[dev]"
 uvicorn backend.app:app --reload --port 8000
 ```
 
-Start the frontend in a second terminal:
+In a second terminal, start the frontend:
 
 ```bash
 cd frontend
@@ -318,51 +290,57 @@ npm ci
 npm run dev
 ```
 
-The Vite dev server proxies `/api` and `/health` to the backend on port 8000.
+The Vite development server proxies `/api` and `/health` to the backend on port 8000. Configure the frontend API base with the Vite API base setting when the backend is not on the local proxy.
 
 ## Testing
 
-```bash
-# backend
-python -m pytest tests -q
+Run the backend suite from the repository root:
 
-# frontend: URL prefix check, type check, production build
+```bash
+python -m pytest tests -q
+```
+
+Build the frontend from its directory:
+
+```bash
 cd frontend
 npm ci
 npm run build
 ```
 
-The backend suite covers the API routes, media validation and Range requests, the timing recovery across all ten languages, term rules, atomic writes, and job interruption and resume. It includes an end to end smoke test that runs Hindi and Kannada with mocked providers and local ffmpeg media.
+The build runs the API-prefix scan, TypeScript checks and Vite production build. The backend suite includes API, Range, timing, terms, atomic storage, restart/resume and bilingual mock smoke coverage.
 
 ## Deployment
 
-**Frontend on Vercel.** Set the Root Directory to `frontend`, the Framework Preset to Vite, the Build Command to `npm run build`, and the Output Directory to `dist`. `main` is the production branch.
+**Vercel.** Set Root Directory to `frontend`, Framework Preset to Vite, Build Command to `npm run build`, and Output Directory to `dist`. Deploy `main` as the production branch.
 
-**Backend on Railway.** `railway.toml` builds the root `Dockerfile`, which installs ffmpeg, serves the built frontend through FastAPI and starts Uvicorn. Mount a persistent volume for uploads, takes and exports. The health check is `/health`.
-
-Pushing to `main` redeploys both. Avoid pushing while a dub is running, because a redeploy restarts the backend container. Interrupted jobs can be resumed, but it is better not to interrupt them.
+**Railway.** Build from the repository root with the provided `Dockerfile`. Mount a persistent volume at `/data`; the app reads and writes project data there. The container serves on the platform-provided port, defaulting to 8080, and uses `/health` as the health check. Pushing to `main` triggers deployments. A backend restart interrupts active jobs, which can be resumed from the studio.
 
 ## Limitations
 
-- Voice cloning quality depends on the length and cleanliness of the reference recording.
-- Speech recognition can mishear unusual names. Use term rules to correct known variants.
-- One speaker per video.
-- Videos are limited to 120 seconds by default.
-- Original background sound is replaced, not mixed in. A short room tone sample can be restored.
+- Uploaded videos are compressed to a 720p low-bitrate working copy for preview, processing and export. The original is removed after the working copy passes verification.
+- Uploads are limited to 40 MB and videos to 120 seconds by default.
+- Storage use is capped at 80 percent of the mounted volume, with at most two finished projects retained. The oldest finished project may be removed to make room.
+- Exports expire after 24 hours by default. Download them before expiry.
+- Voice cloning quality depends on the reference recording. Speech recognition may still mishear uncommon names.
+- The current flow is designed for one speaker per video. Original background sound is replaced, not mixed under the dub.
 
 ## Roadmap
 
-- [x] Sarvam translation and QA with fallback providers and circuit breakers
-- [x] Timing recovery, silent gap spill and no overlap checks across ten languages
-- [x] Project and global term rules, protected terms and edit locking
-- [x] Checkpointed jobs, resume after restart and atomic file writes
-- [x] Single player toggle, clip editing, attempt history and media URL prefix check
-- [ ] Better voice clone quality and a reference audio quality check
-- [ ] Demo video
-- [ ] Multi speaker support
+- [x] Ten-language translation, voice generation and clip review.
+- [x] Timing recovery and overlap checks across ten languages.
+- [x] Project and global term rules with edit locks.
+- [x] Durable job checkpoints, resume and atomic file writes.
+- [x] Storage budgeting, verified working copies and export expiry.
+- [x] Main player, clip editor, attempt history and API-prefix build check.
+- [ ] Improve voice cloning quality and add a reference audio quality check.
+- [ ] Record a demo video.
+- [ ] Support multiple speakers.
 
 ## Author
 
 Built by [Aarti Panchal](https://aarti-panchal.site).
 
-Speech APIs by Gnani.
+## Credits
+
+Speech recognition, synthesis and voice services are provided by Gnani. Translation and language model services are provided by Sarvam and configured fallback providers.
