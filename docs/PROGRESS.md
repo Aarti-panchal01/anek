@@ -97,3 +97,22 @@
 - Verification passed: `python -m pytest tests -q`; `cd frontend && npm run build` (including the API-prefix check).
 - The README includes links to all generated screenshots and notes that they use seeded demo data.
 - Main commit `28b80132b1c858c8e56bf4c24be347aa825f0845` contains the README, scripts, and screenshots.
+
+## Round 4: storage
+
+### Tasks done
+
+- Task 1: pending commit. Atomic writes, uploads, and media/export command failures now normalize ENOSPC to a structured 507. The global JSON handler retains allowed CORS headers, upload temp files are removed, running project jobs are marked failed, and fetch errors shown in the UI are human-readable. Added disk-full atomic-write and upload/job/CORS cleanup tests. Backend suite and frontend build passed.
+
+### Current task
+
+- Task 2: preflight available disk space before accepting an upload and expose a maximum upload size.
+
+### Next task
+
+- Tasks 3 through 6, in order: storage visibility, cleanup, smaller working copies, and tests.
+
+### Decisions
+
+- Keep generated exports based on the original source video; any compressed working copy is for preview and processing only.
+- Keep automatic age-based cleanup disabled unless the user explicitly configures it.

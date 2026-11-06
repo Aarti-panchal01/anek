@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import errno
 import json
 import shutil
 import subprocess
@@ -9,8 +10,42 @@ from pathlib import Path
 from typing import Any
 
 
+class StorageFullError(OSError):
+    """Raised when an output could not be completed because storage is full."""
+
+    def __init__(self) -> None:
+        super().__init__(errno.ENOSPC, "Server storage is full")
+
+
+def is_storage_full(error: BaseException) -> bool:
+    if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+        return True
+    stderr = getattr(error, "stderr", "") or ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    return "no space left on device" in f"{error} {stderr}".lower()
+
+
+def _raise_storage_full(error: BaseException) -> None:
+    if is_storage_full(error):
+        raise StorageFullError() from error
+
+
 def _temporary_for(target: Path) -> Path:
     return target.with_name(f".{target.stem}.{uuid.uuid4().hex}.part{target.suffix}")
+
+
+def temporary_path(target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return _temporary_for(target)
+
+
+def commit_temporary(temporary: Path, target: Path) -> None:
+    try:
+        _sync_and_replace(temporary, target)
+    except OSError as error:
+        _raise_storage_full(error)
+        raise
 
 
 def _sync_and_replace(temporary: Path, target: Path) -> None:
@@ -22,14 +57,16 @@ def _sync_and_replace(temporary: Path, target: Path) -> None:
 
 
 def atomic_write_bytes(target: Path, data: bytes) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _temporary_for(target)
+    temporary = temporary_path(target)
     try:
         with temporary.open("wb") as output:
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
         _sync_and_replace(temporary, target)
+    except OSError as error:
+        _raise_storage_full(error)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -39,11 +76,13 @@ def atomic_write_text(target: Path, data: str, encoding: str = "utf-8") -> None:
 
 
 def atomic_copyfile(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _temporary_for(target)
+    temporary = temporary_path(target)
     try:
         shutil.copyfile(source, temporary)
         _sync_and_replace(temporary, target)
+    except OSError as error:
+        _raise_storage_full(error)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -51,8 +90,7 @@ def atomic_copyfile(source: Path, target: Path) -> None:
 def run_atomic_command(arguments: list[str], **options: Any) -> subprocess.CompletedProcess:
     """Run a file-producing command with its final output hidden until durable."""
     target = Path(arguments[-1])
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _temporary_for(target)
+    temporary = temporary_path(target)
     command = [*arguments[:-1], str(temporary)]
     try:
         completed = subprocess.run(command, **options)
@@ -60,6 +98,9 @@ def run_atomic_command(arguments: list[str], **options: Any) -> subprocess.Compl
             raise RuntimeError(f"Command did not produce a complete output: {target.name}")
         _sync_and_replace(temporary, target)
         return completed
+    except (OSError, subprocess.CalledProcessError) as error:
+        _raise_storage_full(error)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
 

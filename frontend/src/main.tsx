@@ -27,7 +27,9 @@ async function apiFetch(path: string, init?: RequestInit) {
   const headers = new Headers(init?.headers);
   const token = accessToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
-  const response = await fetch(`${API}${apiPath(path)}`, { ...init, headers });
+  let response: Response;
+  try { response = await fetch(`${API}${apiPath(path)}`, { ...init, headers }); }
+  catch { throw new Error('Could not reach the server. Check your connection and try again.'); }
   if (response.status === 401 && token) window.dispatchEvent(new Event('anek-auth-expired'));
   return response;
 }
@@ -38,7 +40,7 @@ const tidy = (text: string) => text.replace(/[-_]/g,' ').replace(/\b\w/g, m=>m.t
 function changedTextSpan(before:string,after:string){let start=0;while(start<before.length&&start<after.length&&before[start]===after[start])start++;let endBefore=before.length,endAfter=after.length;while(endBefore>start&&endAfter>start&&before[endBefore-1]===after[endAfter-1]){endBefore--;endAfter--;}return[before.slice(start,endBefore),after.slice(start,endAfter)];}
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await apiFetch(path, init);
-  if (!response.ok) { const body=await response.text(); let detail:unknown=body||response.statusText; try{detail=JSON.parse(body).detail||detail;}catch{/* plain text */} const message=typeof detail==='string'?detail:JSON.stringify(detail);throw new Error(`${response.status}: ${message}`); }
+  if (!response.ok) { const body=await response.text(); let detail:unknown=body||response.statusText; try{const payload=JSON.parse(body);detail=payload.message||payload.detail||detail;}catch{/* plain text */} const message=typeof detail==='string'?detail:JSON.stringify(detail);throw new Error(`${response.status}: ${message}`); }
   return response.json();
 }
 const json = (body: unknown): RequestInit => ({headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});

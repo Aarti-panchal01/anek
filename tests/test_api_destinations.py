@@ -102,6 +102,40 @@ def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypa
         assert conversions == [Path(project_row)]
 
 
+def test_upload_storage_failure_returns_507_marks_job_and_cleans_partial(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Full disk upload", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO jobs(id,project_id,kind,state,stage,total) VALUES(?,?,?,?,?,?)",
+                ("storage-job", project["id"], "dub", "running", "audio", 1),
+            )
+
+        def full_disk(_temporary, _target):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(app_module, "commit_temporary", full_disk)
+        monkeypatch.setattr(app_module, "origins", ["https://studio.example"])
+        response = TestClient(app_module.app, raise_server_exceptions=False).put(
+            f"/api/projects/{project['id']}/video",
+            files={"video": ("source.mp4", b"video bytes", "video/mp4")},
+            headers={"Origin": "https://studio.example"},
+        )
+
+        assert response.status_code == 507
+        assert response.json() == {"error": "storage_full", "message": "Server storage is full"}
+        assert response.headers["access-control-allow-origin"] == "https://studio.example"
+        with db.connect() as connection:
+            job = connection.execute("SELECT state,error FROM jobs WHERE id='storage-job'").fetchone()
+            saved_project = connection.execute("SELECT status FROM projects WHERE id=?", (project["id"],)).fetchone()
+        assert tuple(job) == ("failed", "Server storage is full")
+        assert saved_project["status"] == "failed"
+        upload_folder = data_root / "uploads" / project["id"]
+        assert list(upload_folder.iterdir()) == []
+
+
 def _make_media_project(data_root):
     project = _resolve(app_module.create_project(app_module.ProjectCreate(
         name="Media route test", source_lang="en-IN", target_langs=["hi-IN"],

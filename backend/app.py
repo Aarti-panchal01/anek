@@ -34,7 +34,11 @@ except ImportError:
     ratio = lambda left, right: SequenceMatcher(None, left, right).ratio() * 100
 
 from backend import db
-from backend.atomic_files import atomic_write_bytes, atomic_write_text, mark_invalid_media_for_regeneration, run_atomic_command
+from backend.atomic_files import (
+    StorageFullError, atomic_write_bytes, atomic_write_text, commit_temporary,
+    is_storage_full, mark_invalid_media_for_regeneration, run_atomic_command,
+    temporary_path,
+)
 from backend.brain.checks import run_checks
 from backend.clients.gnani import create_gnani_client
 from backend.clients.llm import clear_response_cache
@@ -143,6 +147,48 @@ if origins or settings.cors_origin_regex:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, error: Exception) -> JSONResponse:
+    """Keep API errors structured and let CORS middleware decorate the response."""
+    storage_full = is_storage_full(error)
+    if storage_full:
+        reason = "Server storage is full"
+        LOGGER.error("Storage full while handling %s %s", request.method, request.url.path)
+        match = re.search(r"/api/projects/([A-Za-z0-9_-]+)", request.url.path)
+        if match:
+            try:
+                with db.connect() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET state='failed',stage='failed',error=?,updated_at=CURRENT_TIMESTAMP "
+                        "WHERE project_id=? AND state='running'", (reason, match.group(1)),
+                    )
+                    connection.execute("UPDATE projects SET status='failed' WHERE id=?", (match.group(1),))
+            except Exception:
+                LOGGER.exception("Could not mark project failed after storage exhaustion")
+        return JSONResponse(
+            {"error": "storage_full", "message": reason}, status_code=507,
+            headers=_error_cors_headers(request),
+        )
+    LOGGER.exception("Unhandled API failure for %s %s", request.method, request.url.path)
+    return JSONResponse(
+        {"error": "internal_error", "message": "The server could not complete this request."},
+        status_code=500, headers=_error_cors_headers(request),
+    )
+
+
+def _error_cors_headers(request: Request) -> dict[str, str]:
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    allowed = origin in origins or "*" in origins
+    if not allowed and settings.cors_origin_regex:
+        try:
+            allowed = re.fullmatch(settings.cors_origin_regex, origin) is not None
+        except re.error:
+            allowed = False
+    return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if allowed else {}
 
 
 def enforce_ip_limit(request: Request, category: str) -> None:
@@ -686,14 +732,26 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     folder = DATA_ROOT / "uploads" / project_id
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"source{suffix}"
+    temporary = temporary_path(path)
     size = 0
-    with path.open("wb") as target:
-        while block := await video.read(1024 * 1024):
-            size += len(block)
-            if size > 500 * 1024 * 1024:
-                path.unlink(missing_ok=True)
-                raise HTTPException(413, "Video exceeds the 500 MB upload cap")
-            target.write(block)
+    try:
+        with temporary.open("wb") as target:
+            while block := await video.read(1024 * 1024):
+                size += len(block)
+                if size > 500 * 1024 * 1024:
+                    raise HTTPException(413, "Video exceeds the 500 MB upload cap")
+                target.write(block)
+        commit_temporary(temporary, path)
+    except HTTPException:
+        temporary.unlink(missing_ok=True)
+        raise
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        if is_storage_full(error):
+            raise StorageFullError() from error
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
     try:
         duration, has_video = probe_video(path)
     except Exception as error:
@@ -745,6 +803,8 @@ async def convert_browser_preview(request: Request, video: UploadFile = File(...
         raise
     except Exception as error:
         shutil.rmtree(folder, ignore_errors=True)
+        if is_storage_full(error):
+            raise StorageFullError() from error
         LOGGER.exception("Browser preview conversion failed")
         raise HTTPException(422, "This video could not be converted for preview on the server. The original upload is still usable; try a smaller MP4 if preview is required.") from error
 
@@ -757,6 +817,8 @@ async def project_video(project_id: str, request: Request):
     try:
         playable = browser_video_path(Path(project["video_path"]))
     except Exception as error:
+        if is_storage_full(error):
+            raise StorageFullError() from error
         LOGGER.exception("Project video preview conversion failed for project %s", project_id)
         raise HTTPException(422, "The uploaded video is saved, but this server could not prepare its preview. Try an H.264 MP4 export.") from error
     return media_response(playable, request)
@@ -1333,8 +1395,9 @@ async def run_job(job_id: str) -> None:
             connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (project["id"],))
     except Exception as error:
         LOGGER.exception("Dub job %s failed", job_id)
+        reason = "Server storage is full" if is_storage_full(error) else str(error)[:1000]
         with db.connect() as connection:
-            connection.execute("UPDATE jobs SET state='failed',stage='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (str(error)[:1000], job_id))
+            connection.execute("UPDATE jobs SET state='failed',stage='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (reason, job_id))
             connection.execute("UPDATE projects SET status='failed' WHERE id=?", (project["id"],))
 
 
@@ -1635,6 +1698,8 @@ async def export_project(request: Request, project_id: str, body: ExportRequest)
             run_atomic_command(["ffmpeg", "-y", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(wav_path)], check=True, capture_output=True)
             run_atomic_command(["ffmpeg", "-y", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_path)], check=True, capture_output=True)
         except (OSError, subprocess.SubprocessError) as error:
+            if is_storage_full(error):
+                raise StorageFullError() from error
             raise HTTPException(500, f"Audio-only export failed: {error}") from error
     result = _export_preflight(project_id, body.lang, body.formats)
     blockers = [check for check in result["checks"] if not check["passed"] and check["name"] != "red_clips"]

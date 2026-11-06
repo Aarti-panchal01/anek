@@ -60,3 +60,17 @@ def test_startup_scan_marks_empty_and_invalid_outputs(monkeypatch, tmp_path):
     assert set(marked) == {empty, truncated}
     assert (tmp_path / "empty.mp4.needs_regeneration").is_file()
     assert "invalid media" in (tmp_path / "truncated.wav.needs_regeneration").read_text()
+
+
+def test_atomic_write_converts_enospc_and_removes_temporary_file(monkeypatch, tmp_path):
+    target = tmp_path / "track.wav"
+
+    def full_disk(_fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(atomic_files.os, "fsync", full_disk)
+    with pytest.raises(atomic_files.StorageFullError, match="Server storage is full"):
+        atomic_files.atomic_write_bytes(target, b"audio")
+
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
