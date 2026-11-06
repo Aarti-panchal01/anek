@@ -520,6 +520,18 @@ def contains_neighbor_content(candidate: str, neighbor_texts: list[str], minimum
     return False
 
 
+def build_neighbor_context(rows: list[dict], translations: dict[int, str], index: int) -> list[str]:
+    """Build optional, index-aligned read-only context for the two adjacent clips."""
+    context = []
+    for neighbor_index in (index - 1, index + 1):
+        if not 0 <= neighbor_index < len(rows):
+            continue
+        translation = translations.get(neighbor_index)
+        if translation:
+            context.append(f"Source: {rows[neighbor_index].get('cleaned', '')}\nTranslation: {translation}")
+    return context
+
+
 def select_candidate(client, source: str, candidates: list[str], target_lang: str, slot_s: float, cps: float) -> tuple[str, int, str]:
     time_limit_chars = max(1, int(slot_s * cps))
     response = prompt_json(
@@ -858,26 +870,49 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 translation_rows.append({**source_row, "cleaned": masked_source})
                 protected_maps.append(mapping)
             full_source_paragraph = " ".join(row["cleaned"] for row in translation_rows)
+            saved_language_clips = checkpoint_state.get("clips", {}).get(target_lang, {})
+            saved_translations = checkpoint_state.setdefault("translations", {}).setdefault(target_lang, {})
             if only_clip_index is not None and translation_override:
-                paragraph_candidates = [[translation_override] for _ in cleaned_rows]
-                paragraph_selected_index, paragraph_selection_reason = 0, "Existing edited clip text retained for block regeneration."
+                translated_by_index = {i: saved_translations.get(str(i), row.get("translation"))
+                                       for i, row in enumerate(cleaned_rows)}
+                translated_by_index[only_clip_index] = translation_override
+                paragraph_selection_reason = "Existing clip translation retained for regeneration."
                 selection_needs_review = False
             else:
-                paragraph_candidates = paragraph_translation_candidates(
-                    translator, translation_rows, source_lang, target_lang, translation_sheet,
-                    content_type, translation_style, measured_chars_per_second,
-                )
-                try:
-                    paragraph_selected_index, paragraph_selection_reason = select_paragraph_candidate(
-                        translator, full_source_paragraph, paragraph_candidates, target_lang,
+                missing_indices = ([only_clip_index] if only_clip_index is not None else
+                                   [i for i in range(len(cleaned_rows))
+                                    if str(i) not in saved_translations and str(i) not in saved_language_clips])
+                translated_by_index = {int(i): value for i, value in saved_translations.items() if value}
+                for i, saved in saved_language_clips.items():
+                    translated_by_index[int(i)] = saved.get("clip", {}).get("translation", "")
+                if missing_indices:
+                    missing_rows = [translation_rows[i] for i in missing_indices]
+                    paragraph_candidates = paragraph_translation_candidates(
+                        translator, missing_rows, source_lang, target_lang, translation_sheet,
+                        content_type, translation_style, measured_chars_per_second,
                     )
+                    try:
+                        paragraph_selected_index, paragraph_selection_reason = select_paragraph_candidate(
+                            translator, " ".join(row["cleaned"] for row in missing_rows), paragraph_candidates, target_lang,
+                        )
+                        selection_needs_review = False
+                    except Exception as exc:
+                        LOGGER.warning("Candidate selection failed (%s); first candidate needs human review", type(exc).__name__)
+                        paragraph_selected_index, paragraph_selection_reason = 0, "Automatic selection was unavailable; review this candidate manually."
+                        selection_needs_review = True
+                    for local_index, original_index in enumerate(missing_indices):
+                        translated_by_index[original_index] = paragraph_candidates[paragraph_selected_index][local_index]
+                        saved_translations[str(original_index)] = translated_by_index[original_index]
+                    checkpoint("translation")
+                else:
+                    paragraph_selection_reason = "Translations restored from saved per-clip checkpoints."
                     selection_needs_review = False
-                except Exception as exc:
-                    LOGGER.warning("Candidate selection failed (%s); first candidate needs human review", type(exc).__name__)
-                    paragraph_selected_index, paragraph_selection_reason = 0, "Automatic selection was unavailable; review this candidate manually."
-                    selection_needs_review = True
-            saved_language_clips = checkpoint_state.get("clips", {}).get(target_lang, {})
-            for index, row in enumerate(cleaned_rows):
+            # Keep a complete index-aligned view even when completed clips are resumed.
+            for i in range(len(cleaned_rows)):
+                translated_by_index.setdefault(i, "")
+            row_indices = [only_clip_index] if only_clip_index is not None else range(len(cleaned_rows))
+            for index in row_indices:
+                row = cleaned_rows[index]
                 check_continue()
                 clip_index = only_clip_index if only_clip_index is not None else index
                 saved_clip = saved_language_clips.get(str(clip_index))
@@ -910,15 +945,9 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 spoken_seconds = 0.0
                 attempt_audio_dir = output_dir / "clips" / target_lang / "attempts"
                 attempt_audio_dir.mkdir(parents=True, exist_ok=True)
-                restored_candidates = [
-                    restore_protected_terms(candidate[index], protected_maps[index])
-                    for candidate in paragraph_candidates
-                ]
-                candidates = [candidate[0] for candidate in restored_candidates]
-                selected_index = paragraph_selected_index
+                selected = restore_protected_terms(translated_by_index[index], protected_maps[index])[0]
+                protected_missing = restore_protected_terms(translated_by_index[index], protected_maps[index])[1]
                 selection_reason = paragraph_selection_reason
-                selected = candidates[selected_index]
-                protected_missing = restored_candidates[selected_index][1]
                 if preserve_translation and translation_override:
                     selected = translation_override
                     protected_missing = [
@@ -958,13 +987,12 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     if spoken_seconds > fit_limit_s and synthesis_attempt < 2 and not preserve_translation:
                         duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
                         retune_instruction = "Paragraph-context retranslation after measured overrun."
-                        neighbor_context = []
-                        for neighbor_index in (index - 1, index + 1):
-                            if 0 <= neighbor_index < len(cleaned_rows):
-                                neighbor_context.append(
-                                    f"Source: {cleaned_rows[neighbor_index]['cleaned']}\n"
-                                    f"Translation: {candidates[neighbor_index]}"
-                                )
+                        try:
+                            neighbor_context = build_neighbor_context(cleaned_rows, translated_by_index, index)
+                        except Exception as exc:
+                            LOGGER.warning("Optional neighbor context unavailable for %s clip %s (%s); continuing without it",
+                                           target_lang, index + 1, type(exc).__name__)
+                            neighbor_context = []
                         revised = None
                         for _retry in range(3):
                             try:
@@ -980,10 +1008,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                             if contains_neighbor_content(revised, [
                                 cleaned_rows[n]['cleaned'] for n in (index - 1, index + 1)
                                 if 0 <= n < len(cleaned_rows)
-                            ] + [
-                                candidates[n] for n in (index - 1, index + 1)
-                                if 0 <= n < len(candidates)
-                            ]):
+                            ] + [translated_by_index[n] for n in (index - 1, index + 1)
+                                if 0 <= n < len(cleaned_rows) and translated_by_index.get(n)]):
                                 revised = None
                                 duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
                                 continue

@@ -9,6 +9,7 @@ from backend.config import LANGUAGES
 from backend.pipeline.phase3b import (
     apply_speech_windows,
     assert_timing_invariants,
+    build_neighbor_context,
     create_srt,
     contains_neighbor_content,
     merge_incomplete_chunks,
@@ -24,6 +25,29 @@ from backend.pipeline.phase3b import (
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
 from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons, synthesize_sentence_list
+
+
+@pytest.mark.parametrize("target_lang", ["hi-IN", "kn-IN"])
+@pytest.mark.parametrize("clip_count", [1, 2, 4, 5])
+def test_neighbor_context_is_index_safe_for_clip_counts_and_completion_order(target_lang, clip_count):
+    rows = [{"cleaned": f"source {i}"} for i in range(clip_count)]
+    # Deliberately insert completion out of order and leave a later clip pending.
+    translations = {i: f"{target_lang} translation {i}" for i in reversed(range(max(0, clip_count - 1)))}
+    for index in range(clip_count):
+        context = build_neighbor_context(rows, translations, index)
+        expected_indices = [n for n in (index - 1, index + 1) if 0 <= n < clip_count and n in translations]
+        assert len(context) == len(expected_indices)
+        assert all(f"source {n}" in item and f"translation {n}" in item for n, item in zip(expected_indices, context))
+
+
+def test_neighbor_context_supports_merged_and_out_of_order_clip_rows():
+    # A merged row is still one timing index; chronological index, not finish order, defines adjacency.
+    rows = [{"cleaned": "first"}, {"cleaned": "merged second and third"}, {"cleaned": "last short tail"}]
+    translations = {2: "last done first", 0: "first done second", 1: "merged done last"}
+    assert build_neighbor_context(rows, translations, 1) == [
+        "Source: first\nTranslation: first done second",
+        "Source: last short tail\nTranslation: last done first",
+    ]
 
 
 def test_silence_chunks_prefer_detected_pause_boundaries_and_stay_below_hard_limit():

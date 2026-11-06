@@ -1759,11 +1759,12 @@ async def run_job(job_id: str) -> None:
             with db.connect() as connection:
                 clip = connection.execute("SELECT * FROM clips WHERE id=? AND project_id=?", (job["clip_id"], project["id"])).fetchone()
                 dub = connection.execute("SELECT translation,human_edited FROM dubs WHERE clip_id=? AND lang=?", (job["clip_id"], job["lang"])).fetchone()
-            if clip is None or dub is None:
-                raise ValueError("The selected clip translation is no longer available for regeneration")
+            if clip is None:
+                raise ValueError("The selected source clip is no longer available for regeneration")
             targeted_clip_index = int(clip["idx"])
-            translation_override = dub["translation"]
-            preserve_translation = bool(dub["human_edited"])
+            # Missing translations are regenerated from the saved source clip below.
+            translation_override = dub["translation"] if dub else None
+            preserve_translation = bool(dub and dub["human_edited"])
         targets = ([job["lang"]] if job["kind"] in {"regenerate", "regenerate_clip"} and job["lang"] else json.loads(project["target_langs_json"]))
         completed = set()
         with db.connect() as connection:
