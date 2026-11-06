@@ -599,8 +599,8 @@ def term_row_payload(row) -> dict:
 
 def persist_generated_dub(connection, clip_id: str, lang: str, clip: dict) -> None:
     connection.execute(
-        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json,audio_path,duration_s) VALUES(?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=CASE WHEN dubs.human_edited=1 THEN dubs.translation ELSE excluded.translation END,draft_translation=CASE WHEN dubs.human_edited=1 THEN dubs.draft_translation ELSE excluded.draft_translation END,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,audio_path=excluded.audio_path,duration_s=excluded.duration_s,updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json,audio_path,duration_s,audio_stale) VALUES(?,?,?,?,?,?,?,?,?,?,0) "
+        "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=CASE WHEN dubs.human_edited=1 THEN dubs.translation ELSE excluded.translation END,draft_translation=CASE WHEN dubs.human_edited=1 THEN dubs.draft_translation ELSE excluded.draft_translation END,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,audio_path=excluded.audio_path,duration_s=excluded.duration_s,audio_stale=0,updated_at=CURRENT_TIMESTAMP",
         (new_id(), clip_id, lang, clip["translation"], clip["translation"], clip["status"],
          json.dumps(clip["reasons"], ensure_ascii=False), json.dumps(clip.get("translation_synthesis_attempts", [])),
          str(clip["audio_path"]), clip.get("final_audio_duration_s")),
@@ -918,6 +918,7 @@ async def project_summary(project_id: str) -> dict:
                   **{key: int(counts[key] or 0) for key in ("green", "yellow", "red")}},
         "language_status": language_status,
         "jobs": [dict(row) for row in jobs],
+        "active_job": next((dict(row) for row in jobs if row["state"] in {"pending", "running"}), None),
     }
 
 
@@ -1586,7 +1587,7 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
     project_row(project_id)
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT c.*,d.translation,d.draft_translation,d.status,d.reasons_json,d.attempts_json,d.audio_path,d.human_edited "
+            "SELECT c.*,d.translation,d.draft_translation,d.status,d.reasons_json,d.attempts_json,d.audio_path,d.audio_stale,d.human_edited "
             "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
             (lang, project_id),
         ).fetchall()
@@ -1603,7 +1604,9 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         item = dict(row)
         audio_path = item.pop("audio_path", None)
         audio_present = bool(audio_path and Path(audio_path).is_file())
-        item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio" if audio_present else None
+        audio_version = Path(audio_path).stat().st_mtime_ns if audio_present else ""
+        item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio?v={audio_version}" if audio_present else None
+        item["audio_stale"] = bool(item.get("audio_stale", False))
         item["audio_removed"] = bool(audio_path and not audio_present)
         attempts = json.loads(row["attempts_json"] or "[]")
         attempt_root = (DATA_ROOT / "exports" / project_id).resolve()
@@ -1699,11 +1702,14 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
     reasons = [f"{item['check']}: {item['detail']}" for item in checks]
     status = "red" if checks else "yellow"
     with db.connect() as connection:
-        existing = connection.execute("SELECT draft_translation,translation FROM dubs WHERE clip_id=? AND lang=?", (clip_id, lang)).fetchone()
+        existing = connection.execute("SELECT draft_translation,translation,status,reasons_json,human_edited,audio_stale FROM dubs WHERE clip_id=? AND lang=?", (clip_id, lang)).fetchone()
+        if existing and existing["translation"] == body.translation:
+            return {"status": existing["status"], "reasons": json.loads(existing["reasons_json"] or "[]"),
+                    "human_edited": bool(existing["human_edited"]), "audio_stale": bool(existing["audio_stale"])}
         draft_translation = (existing["draft_translation"] or existing["translation"]) if existing else body.translation
         connection.execute(
-            "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,human_edited,audio_path,duration_s) VALUES(?,?,?,?,?,?,?,1,NULL,NULL) "
-            "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,human_edited=1,audio_path=NULL,duration_s=NULL,updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,human_edited,audio_path,duration_s,audio_stale) VALUES(?,?,?,?,?,?,?,1,NULL,NULL,1) "
+            "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,human_edited=1,audio_stale=1,updated_at=CURRENT_TIMESTAMP",
             (new_id(), clip_id, lang, body.translation, draft_translation, status, json.dumps(reasons, ensure_ascii=False)),
         )
     return {"status": status, "reasons": reasons, "human_edited": True}
@@ -1714,15 +1720,21 @@ async def verify_dub_clip(clip_id: str, lang: str) -> dict:
     """Mark a listened-to take as human verified, only when its audio is available and safe."""
     with db.connect() as connection:
         row = connection.execute(
-            "SELECT d.id,d.status,d.reasons_json,d.audio_path,d.duration_s,c.project_id,c.idx,c.start_s,c.end_s,"
+            "SELECT d.id,d.status,d.reasons_json,d.audio_path,d.audio_stale,d.duration_s,c.project_id,c.idx,c.start_s,c.end_s,"
             "p.status AS project_status,p.duration_s AS video_duration "
             "FROM dubs d JOIN clips c ON c.id=d.clip_id JOIN projects p ON p.id=c.project_id "
             "WHERE c.id=? AND d.lang=?", (clip_id, lang),
         ).fetchone()
         if row is None:
             raise HTTPException(404, "Dub not found")
-        if row["project_status"] == "processing":
-            raise HTTPException(409, "Wait for clip generation to finish before verifying it")
+        active_job = connection.execute(
+            "SELECT kind,clip_id,state FROM jobs WHERE project_id=? AND state IN ('pending','running') ORDER BY created_at DESC LIMIT 1",
+            (row["project_id"],),
+        ).fetchone()
+        if active_job and (active_job["kind"] != "regenerate_clip" or active_job["clip_id"] == clip_id):
+            raise HTTPException(409, "Wait for this clip's new audio to finish before verifying it")
+        if row["audio_stale"]:
+            raise HTTPException(409, "The saved translation has no matching generated audio yet. Re-speak this clip before verifying it")
         audio_path = Path(row["audio_path"] or "").resolve()
         export_root = (DATA_ROOT / "exports" / row["project_id"]).resolve()
         if not row["audio_path"] or not audio_path.is_relative_to(export_root) or not audio_path.is_file() or audio_path.stat().st_size == 0:
@@ -2069,7 +2081,7 @@ async def project_events(project_id: str):
             with db.connect() as connection:
                 row = connection.execute("SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
             if row:
-                payload = {"project_id": project_id, "lang": row["lang"], "stage": row["stage"], "done": row["done"], "total": row["total"], "message": row["error"] or row["stage"]}
+                payload = {"project_id": project_id, "lang": row["lang"], "stage": row["stage"], "done": row["done"], "total": row["total"], "message": row["error"] or row["stage"], "kind": row["kind"], "clip_id": row["clip_id"], "state": row["state"]}
                 serialized = json.dumps(payload)
                 if serialized != last:
                     yield f"data: {serialized}\n\n"

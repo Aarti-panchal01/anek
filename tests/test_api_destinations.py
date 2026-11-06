@@ -862,6 +862,7 @@ def test_edit_length_is_advisory_until_real_speech_duration_is_measured(monkeypa
         assert result["status"] == "yellow"
         assert not any("over_slot" in reason for reason in result["reasons"])
         with db.connect() as connection:
-            row = connection.execute("SELECT translation,audio_path FROM dubs WHERE id='review-dub-1'").fetchone()
+            row = connection.execute("SELECT translation,audio_path,audio_stale FROM dubs WHERE id='review-dub-1'").fetchone()
         assert row["translation"] == text
-        assert row["audio_path"] is None
+        assert row["audio_path"] is not None
+        assert row["audio_stale"] == 1
