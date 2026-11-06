@@ -40,7 +40,7 @@ from backend.clients.gnani import create_gnani_client
 from backend.clients.llm import clear_response_cache
 from backend.brain.termsheet import TermSheet
 from backend.config import LANGUAGES, get_settings
-from backend.pipeline.phase3b import run_quality_pass
+from backend.pipeline.phase3b import MAX_ATEMPO_SPEEDUP, OVERRUN_TOLERANCE_S, run_quality_pass
 
 settings = get_settings()
 LOGGER = logging.getLogger(__name__)
@@ -58,6 +58,39 @@ async def schedule_job(job_id: str) -> None:
     task = asyncio.create_task(run_job(job_id))
     _active_job_tasks.add(task)
     task.add_done_callback(_active_job_tasks.discard)
+
+
+def log_runtime_configuration(config=settings, environment: dict[str, str] | None = None) -> None:
+    env = os.environ if environment is None else environment
+    LOGGER.info(
+        "Effective timing config FIT_TOLERANCE=%.3f MAX_STRETCH=%.3f SILENT_GAP_SPILL=enabled "
+        "OVERRUN_TOLERANCE_S=%.3f SPEEDUP_CAP=%.2fx",
+        config.fit_tolerance, config.max_stretch, OVERRUN_TOLERANCE_S, MAX_ATEMPO_SPEEDUP,
+    )
+    providers = []
+    if config.gnani_mock:
+        providers.append("Gnani (mock)")
+    elif config.gnani_api_key:
+        providers.append("Gnani")
+    if config.llm_mock:
+        providers.append("LLM (mock)")
+    else:
+        if config.sarvam_api_key:
+            providers.append("Sarvam")
+        if config.groq_api_keys:
+            providers.append("Groq")
+        elif config.llm_api_key:
+            providers.append("Primary LLM")
+        if config.llm_2_api_keys or config.llm_2_api_key:
+            providers.append("Gemini")
+    LOGGER.info("Enabled providers: %s", ", ".join(providers) if providers else "none")
+    overrides = [name for name in ("FIT_TOLERANCE", "MAX_STRETCH") if name in env]
+    railway = any(name in env for name in ("RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "RAILWAY_SERVICE_ID"))
+    if railway:
+        message = f"Railway timing environment overrides code defaults: {', '.join(overrides)}" if overrides else "Railway timing environment overrides code defaults: none"
+        (LOGGER.warning if overrides else LOGGER.info)(message)
+    elif overrides:
+        LOGGER.info("Timing environment overrides code defaults: %s", ", ".join(overrides))
 app = FastAPI(title=settings.app_name)
 DATA_ROOT = Path(settings.anek_data_dir)
 CONSENT_PHRASES = [
@@ -392,6 +425,7 @@ def estimated_job_credits(duration_s: float, language_count: int) -> int:
 async def startup() -> None:
     _shutdown_requested.clear()
     db.initialize()
+    log_runtime_configuration()
     mark_invalid_media_for_regeneration(DATA_ROOT / "exports", LOGGER)
     with db.connect() as connection:
         interrupted = connection.execute("SELECT DISTINCT project_id FROM jobs WHERE state='running'").fetchall()
