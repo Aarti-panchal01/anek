@@ -33,6 +33,7 @@ except ImportError:
     ratio = lambda left, right: SequenceMatcher(None, left, right).ratio() * 100
 
 from backend import db
+from backend.atomic_files import atomic_write_bytes, mark_invalid_media_for_regeneration, run_atomic_command
 from backend.brain.checks import run_checks
 from backend.clients.gnani import create_gnani_client
 from backend.clients.llm import clear_response_cache
@@ -260,26 +261,17 @@ def browser_video_path(source: Path) -> Path:
     is_mp4 = source.suffix.lower() == ".mp4"
     if is_mp4 and video_codec == "h264" and audio_codec in {None, "aac"} and mp4_has_faststart(source):
         return source
-    temporary = source.parent / "browser.part.mp4"
     try:
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-                 # Bound both dimensions. A width-only cap leaves portrait phone
-                 # footage (for example 1440x2560) almost full resolution and can
-                 # exhaust the small memory budget available to the preview worker.
-                 "-vf", "fps=24,scale=w='min(720,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                 "-threads", "1", "-threads:v", "1", "-filter_threads", "1",
-                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
-                 "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(temporary)],
-                check=True, capture_output=True, timeout=120,
-            )
-            temporary.replace(browser_copy)
-        except Exception:
-            LOGGER.exception("Browser preview conversion failed; serving the original upload")
-            return source
-    finally:
-        temporary.unlink(missing_ok=True)
+        run_atomic_command(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+             "-vf", "fps=24,scale=w='min(720,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+             "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
+             "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k",
+             "-movflags", "+faststart", str(browser_copy)], check=True, capture_output=True, timeout=120,
+        )
+    except Exception:
+        LOGGER.exception("Browser preview conversion failed; serving the original upload")
+        return source
     return browser_copy
 
 
@@ -329,19 +321,13 @@ def browser_dubbed_video_path(source: Path) -> Path:
     audio_codec = next((row.get("codec_name") for row in streams if row.get("codec_type") == "audio"), None)
     if video_codec == "h264" and audio_codec in {None, "aac"} and mp4_has_faststart(source):
         return source
-    temporary = source.with_name(f"{source.stem}.browser.part.mp4")
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-             "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-             "-threads", "1", "-threads:v", "1", "-filter_threads", "1",
-             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-movflags", "+faststart", str(temporary)],
-            check=True, capture_output=True, timeout=180,
-        )
-        temporary.replace(browser_copy)
-    finally:
-        temporary.unlink(missing_ok=True)
+    run_atomic_command(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+         "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+         "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
+         "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+         str(browser_copy)], check=True, capture_output=True, timeout=180,
+    )
     return browser_copy
 
 
@@ -390,6 +376,7 @@ def estimated_job_credits(duration_s: float, language_count: int) -> int:
 @app.on_event("startup")
 async def startup() -> None:
     db.initialize()
+    mark_invalid_media_for_regeneration(DATA_ROOT / "exports", LOGGER)
     with db.connect() as connection:
         connection.execute("UPDATE jobs SET state='pending', stage='resuming' WHERE state='running'")
         pending = connection.execute("SELECT id FROM jobs WHERE state='pending'").fetchall()
@@ -849,9 +836,9 @@ async def create_voice(
     with tempfile.TemporaryDirectory(dir=voice_dir, prefix="convert-") as folder:
         source = Path(folder) / safe_upload_name(consent_audio.filename)
         consent_wav = Path(folder) / "consent.wav"
-        source.write_bytes(consent_bytes)
+        atomic_write_bytes(source, consent_bytes)
         try:
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-threads", "1", "-i", str(source), "-ac", "1", "-ar", "16000", str(consent_wav)], check=True, capture_output=True)
+            run_atomic_command(["ffmpeg", "-y", "-v", "error", "-threads", "1", "-i", str(source), "-ac", "1", "-ar", "16000", str(consent_wav)], check=True, capture_output=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as error:
             LOGGER.exception("Consent recording conversion failed")
             raise HTTPException(422, "We could not read the consent recording. Please allow microphone access and record the phrase again.") from error
@@ -859,14 +846,14 @@ async def create_voice(
         reference_wav = Path(folder) / "reference.wav"
         if reference_audio:
             reference_source = Path(folder) / safe_upload_name(reference_audio.filename)
-            reference_source.write_bytes(await reference_audio.read())
+            atomic_write_bytes(reference_source, await reference_audio.read())
             reference_input = str(reference_source)
             audio_map = []
         else:
             reference_input = str(project["video_path"])
             audio_map = ["-map", "0:a:0", "-vn"]
         try:
-            subprocess.run(
+            run_atomic_command(
                 ["ffmpeg", "-y", "-v", "error", "-threads", "1", "-i", reference_input, *audio_map,
                  "-t", "30", "-ac", "1", "-ar", "24000", str(reference_wav)],
                 check=True, capture_output=True,
@@ -912,7 +899,7 @@ async def create_voice(
         LOGGER.exception("Gnani voice embedding request failed")
         raise HTTPException(502, "Gnani could not create the voice model right now. Your consent was verified; please retry in a moment.") from error
     try:
-        reference_path.write_bytes(reference_bytes)
+        atomic_write_bytes(reference_path, reference_bytes)
         with db.connect() as connection:
             connection.execute(
                 "INSERT INTO voices(id,session_id,label,embedding_json,consent_phrase,consent_ok,reference_path) VALUES(?,?,?,?,?,1,?)",
@@ -1511,8 +1498,8 @@ async def export_project(request: Request, project_id: str, body: ExportRequest)
             raise HTTPException(409, "Audio-only export needs an existing dubbed MP4")
         wav_path, mp3_path = mp4.with_suffix(".wav"), mp4.with_suffix(".mp3")
         try:
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(wav_path)], check=True, capture_output=True)
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_path)], check=True, capture_output=True)
+            run_atomic_command(["ffmpeg", "-y", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(wav_path)], check=True, capture_output=True)
+            run_atomic_command(["ffmpeg", "-y", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_path)], check=True, capture_output=True)
         except (OSError, subprocess.SubprocessError) as error:
             raise HTTPException(500, f"Audio-only export failed: {error}") from error
     result = _export_preflight(project_id, body.lang, body.formats)

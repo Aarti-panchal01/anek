@@ -38,17 +38,18 @@
 
 ### Tasks done
 
-- Task 1: implementation complete and verified (backend suite passed; frontend build passed); commit/push is in progress. `/media` now rebuilds from a saved dub track, falls back to the browser-ready original, then returns a structured 409. Logs include failed path, byte size, and ffprobe stderr. UI displays the reason with Retry. Zero-byte, truncated, and exhausted-fallback tests added.
+- Task 1: `571b987` (pushed). Backend suite and frontend build passed. `/media` now rebuilds from a saved dub track, falls back to the browser-ready original, then returns a structured 409. Logs include failed path, byte size, and ffprobe stderr. UI displays the reason with Retry. Zero-byte, truncated, and exhausted-fallback tests added.
 
 ### Current task
 
-- Task 1: commit and push the verified recovery behavior; then begin atomic generated-file writes.
+- Task 2: implementation complete and verified (backend suite passed; frontend build passed); commit/push is in progress. Atomic output helpers cover both pipeline phases, saved tracks/takes, browser and audio exports. Startup marks zero-byte or invalid audio/video artifacts with `.needs_regeneration` sidecars. Atomic helper tests verify temp-file visibility, failure cleanup, and startup markers.
 
 ### Next task
 
-- Task 2: atomic writes and startup validation for generated outputs.
+- Task 2: commit/push the verified atomic output changes; then persist job checkpoints and resume after restarts.
 
 ### Decisions
 
 - Resume this round from the reported production failure; retain the earlier implementation history above without redoing completed tasks.
 - The previous fallback hotfix `f97b1ee` avoided a 500 by serving the upload, but this round replaces that shortcut with the requested recovery order and explicit unavailable state.
+- Task 1 considers a media file available only when it is non-empty and ffprobe finds a video stream; failed candidates are logged with stderr and size.

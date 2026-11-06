@@ -8,6 +8,7 @@ import tempfile
 import wave
 from pathlib import Path
 
+from backend.atomic_files import atomic_write_bytes, atomic_write_text, run_atomic_command
 from backend.brain.autocorrect import translate_with_autocorrect, combine_audio_verification
 from backend.brain.termsheet import extract_termsheet
 from backend.pipeline.phase3b import back_translate, meaning_check_reasons
@@ -19,7 +20,8 @@ from backend.verify.report import build_report
 
 
 def run_command(arguments: list[str]) -> str:
-    result = subprocess.run(arguments, check=True, capture_output=True, text=True)
+    runner = run_atomic_command if Path(arguments[0]).name.lower().startswith("ffmpeg") else subprocess.run
+    result = runner(arguments, check=True, capture_output=True, text=True)
     return result.stdout
 
 
@@ -120,7 +122,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
             translated = translation_result["translation"]
             speech = gnani.synth(translated, embedding)
             speech_path = work_dir / f"dub_{index:02d}.wav"
-            speech_path.write_bytes(speech)
+            atomic_write_bytes(speech_path, speech)
             audio_duration = probe_duration(speech_path)
             slot_duration = row["end_s"] - row["start_s"]
             if audio_duration > slot_duration * settings.fit_tolerance:
@@ -191,12 +193,12 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
             ]
         )
         srt_path = output_path.with_suffix(".srt")
-        srt_path.write_text(create_srt(results), encoding="utf-8")
+        atomic_write_text(srt_path, create_srt(results))
         clean_results = [{key: value for key, value in row.items() if key != "audio_path"} for row in results]
         report = build_report("hi-IN", clean_results, settings)
         report.update({"source_language": source_lang, "export_label": "AI dubbed"})
         report_path = output_path.with_suffix(".json")
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
         if abs(probe_duration(output_path) - duration) > 0.1:
             raise RuntimeError("Export duration self-check failed")
         return {"output": output_path, "srt": srt_path, "report": report_path, "clips": clean_results}

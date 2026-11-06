@@ -16,6 +16,8 @@ import httpx
 
 LOGGER = logging.getLogger(__name__)
 
+from backend.atomic_files import atomic_copyfile, atomic_write_bytes, atomic_write_text, run_atomic_command
+
 from backend.brain.checks import run_checks
 from backend.brain.termsheet import (
     TermSheet, apply_mishearing_maps, apply_spoken_forms, extract_termsheet,
@@ -40,7 +42,8 @@ EXPORT_DURATION_TOLERANCE_S = 0.05
 
 
 def run_command(args: list[str], capture: bool = True) -> str:
-    result = subprocess.run(args, check=True, capture_output=capture, text=True)
+    runner = run_atomic_command if Path(args[0]).name.lower().startswith("ffmpeg") else subprocess.run
+    result = runner(args, check=True, capture_output=capture, text=True)
     return result.stdout if capture else ""
 
 
@@ -534,7 +537,7 @@ def synthesize_sentence(client, text: str, embedding: dict | None, target: Path,
                         target_lang: str, stock_voice: str | None = None) -> float:
     audio = (client.synth_stock(text, stock_voice, target_lang)
              if stock_voice else client.synth(text, embedding or {}))
-    target.write_bytes(audio)
+    atomic_write_bytes(target, audio)
     return duration_of(target)
 
 
@@ -854,7 +857,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                         last_sentence_prefix, target_lang, stock_voice,
                     )
                     attempt_audio = attempt_audio_dir / f"clip_{clip_index + 1:03d}_attempt_{synthesis_attempt + 1:02d}.wav"
-                    shutil.copyfile(sentence_audio, attempt_audio)
+                    atomic_copyfile(sentence_audio, attempt_audio)
                     previous_attempt = synthesis_history[-1] if synthesis_history else None
                     synthesis_history.append({
                         "attempt": synthesis_attempt + 1,
@@ -968,7 +971,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                 clip_audio_dir = output_dir / "clips" / target_lang
                 clip_audio_dir.mkdir(parents=True, exist_ok=True)
                 candidate_path = clip_audio_dir / f"clip_{clip_index + 1:03d}.wav"
-                shutil.copyfile(sentence_audio, candidate_path)
+                atomic_copyfile(sentence_audio, candidate_path)
                 if recovery_step in {"speed-up", "fixed-pause trim"}:
                     previous_attempt = synthesis_history[-1] if synthesis_history else None
                     synthesis_history.append({
@@ -1107,8 +1110,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             report.update({"source_language": source_lang, "content_type": content_type, **voice_report_metadata(stock_voice, reference_seconds), "room_tone": {"mixed": room_tone_path is not None, "span": room_tone_span, "mix_level_db": -30 if room_tone_path else None}, "audio_tracks": {name: path.name for name, path in track_files.items()}, "segment_fit_policy": {"translation_scope": "full paragraph with aligned source spans", "target_range_s": [3, 8], "hard_max_s": 8, "timing_anchor": "source start time", "overrun_tolerance_s": OVERRUN_TOLERANCE_S, "retry_under_slot_ratio": 0.75, "max_speed_change": MAX_ATEMPO_SPEEDUP, "overflow_policy": "shorter translation, up to 15% speed-up, fixed-pause trim, then spill into detected silent gaps; withhold only if speech would overlap", "sentence_pause_s": 0.16}})
             report["term_sheet"] = term_sheet.model_dump()
             report_path = final_path.with_suffix(".json")
-            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-            final_path.with_suffix(".srt").write_text(create_srt(language_rows), encoding="utf-8")
+            atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
+            atomic_write_text(final_path.with_suffix(".srt"), create_srt(language_rows))
             all_outputs.append({"language": target_lang, "mp4": str(final_path), "report": str(report_path), "clips": language_rows, "term_sheet": term_sheet.model_dump()})
     return all_outputs
 
@@ -1182,7 +1185,7 @@ def mux_outputs(video: Path, clips: list[dict], output: Path, duration: float, w
     output_dir = output_dir or output.parent
     source_track = output_dir / f"{output.stem}_source-track.wav"
     if source_wav is not None:
-        shutil.copyfile(source_wav, source_track)
+        atomic_copyfile(source_wav, source_track)
     inputs = []
     graph = []
     labels = []
