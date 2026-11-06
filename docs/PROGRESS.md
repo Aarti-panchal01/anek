@@ -84,11 +84,11 @@
 
 ### Current task
 
-- Complete. Screenshot seeding, automated capture, README links, backend tests, and frontend build are done. Commit and push are the remaining actions.
+- Complete. Screenshot seeding, automated capture, README links, backend tests, frontend build, commit, and push are done.
 
 ### Next task
 
-- Commit the completed README and screenshot documentation work, then push to main.
+- Complete. No further tasks remain in this round.
 
 ### Decisions
 
@@ -96,3 +96,4 @@
 - Use viewport 1440x900 at device scale factor 2. The six generated PNGs are each under 600 KB and were visually inspected.
 - Verification passed: `python -m pytest tests -q`; `cd frontend && npm run build` (including the API-prefix check).
 - The README includes links to all generated screenshots and notes that they use seeded demo data.
+- Main commit `28b80132b1c858c8e56bf4c24be347aa825f0845` contains the README, scripts, and screenshots.
