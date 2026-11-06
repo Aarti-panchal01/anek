@@ -57,7 +57,7 @@ def apply_mishearing_maps(text: str, termsheet: TermSheet | dict | None) -> str:
     """Replace heard variants with canonical terms before source translation."""
     sheet = termsheet if isinstance(termsheet, TermSheet) else TermSheet.model_validate(termsheet or {})
     for term in sheet.terms:
-        if term.rule_type != "mishearing":
+        if term.rule_type != "mishearing" and not (term.locked and term.heard_variants):
             continue
         for variant in sorted(term.heard_variants, key=len, reverse=True):
             if variant.strip():

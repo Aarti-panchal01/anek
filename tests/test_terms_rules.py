@@ -18,6 +18,20 @@ def test_mishearing_map_rewrites_heard_variants_to_canonical_term():
     assert apply_mishearing_maps("I heard a head and ek sir", sheet) == "I heard Anek and Anek"
 
 
+def test_fix_everywhere_rule_can_correct_a_phrase_and_protect_the_canonical_term():
+    sheet = TermSheet.model_validate({"terms": [{
+        "term": "Anek", "type": "brand", "treatment": "keep", "locked": True,
+        "rule_type": "mishearing", "heard_variants": ["built a head", "built ahead", "a head"],
+    }]})
+    corrected = apply_mishearing_maps("I built ahead and saw a head", sheet)
+    masked, placeholders = mask_protected_terms(corrected, sheet)
+    restored, missing = restore_protected_terms(masked, placeholders)
+    assert corrected == "I Anek and saw Anek"
+    assert "Anek" not in masked
+    assert restored == corrected
+    assert missing == []
+
+
 def test_protected_placeholder_round_trip_and_missing_term_detection():
     sheet = TermSheet.model_validate({"terms": [{
         "term": "Anek", "type": "brand", "treatment": "keep", "locked": True,

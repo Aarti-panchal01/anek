@@ -676,6 +676,10 @@ def test_clip_api_surfaces_raw_transcript_and_prisma_disagreements(monkeypatch):
                 "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status) VALUES(?,?,?,?,?,?)",
                 ("dub-review", "clip-review", "hi-IN", "अनुवाद", "अनुवाद", "yellow"),
             )
+            connection.execute(
+                "UPDATE dubs SET audio_path=?,reasons_json=? WHERE id=?",
+                (str(data_root / "exports" / "expired.wav"), json.dumps(["Dub speech still exceeds its safe slot; withheld."]), "dub-review"),
+            )
         export_dir = data_root / "exports" / project["id"]
         export_dir.mkdir(parents=True)
         (export_dir / "review_hi-IN_phase3d.json").write_text(json.dumps({"clips": [{
@@ -688,6 +692,55 @@ def test_clip_api_surfaces_raw_transcript_and_prisma_disagreements(monkeypatch):
         assert clips[0]["src_text"] == "Cleaned source"
         assert clips[0]["source_raw"] == "Raw Prisma transcript"
         assert clips[0]["stt_review"]["disagreements"][0]["alternative_transcript"] == "Alternate transcript"
+        assert clips[0]["audio_url"] is None
+        assert clips[0]["audio_removed"] is True
+        assert clips[0]["reason_code"] == "too_long_for_slot"
+        assert clips[0]["reason_text"] == "Speech is too long for its time slot."
+        assert clips[0]["fix_action"] == "Shorten the translation"
+
+
+def test_source_fix_updates_saved_clip_and_report_for_regeneration(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Source correction", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO clips(id,project_id,idx,start_s,end_s,src_text) VALUES(?,?,?,?,?,?)",
+                ("clip-source-edit", project["id"], 0, 0, 4, "a head"),
+            )
+            connection.execute(
+                "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status) VALUES(?,?,?,?,?,?)",
+                ("dub-source-edit", "clip-source-edit", "hi-IN", "एक सिर", "एक सिर", "green"),
+            )
+        export_dir = data_root / "exports" / project["id"]
+        export_dir.mkdir(parents=True)
+        report_path = export_dir / "review_hi-IN_phase3d_ai-dubbed.json"
+        report_path.write_text(json.dumps({"clips": [{"clip": 1, "source_cleaned": "a head"}]}), encoding="utf-8")
+        response = _resolve(app_module.edit_clip_source("clip-source-edit", app_module.SourceEdit(source_text="Anek")))
+        assert response["status"] == "updated"
+        with db.connect() as connection:
+            clip = connection.execute("SELECT src_text FROM clips WHERE id=?", ("clip-source-edit",)).fetchone()
+            dub = connection.execute("SELECT status,reasons_json FROM dubs WHERE id=?", ("dub-source-edit",)).fetchone()
+        assert clip["src_text"] == "Anek"
+        assert dub["status"] == "yellow"
+        assert "re-speak" in dub["reasons_json"]
+        assert json.loads(report_path.read_text(encoding="utf-8"))["clips"][0]["source_cleaned"] == "Anek"
+
+
+def test_audio_tracks_report_when_saved_track_files_are_missing(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Missing track", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        export_dir = data_root / "exports" / project["id"]
+        export_dir.mkdir(parents=True)
+        (export_dir / "review_hi-IN_phase3d_ai-dubbed.json").write_text(
+            json.dumps({"audio_tracks": {"dubbed": "missing.wav", "source": "source.wav"}}), encoding="utf-8",
+        )
+        tracks = _resolve(app_module.project_audio_tracks(project["id"], "hi-IN"))
+        assert tracks["audio_removed"] is True
+        assert tracks["tracks"]["dubbed"] is None
 
 
 def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypatch):

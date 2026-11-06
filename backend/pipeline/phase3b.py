@@ -211,15 +211,20 @@ def targeted_silence_segments(
     return result
 
 
-def merge_incomplete_chunks(chunks: list[dict], transcribe, max_seconds: float = 8.0) -> list[dict]:
-    """Join silence cuts that leave an ASR segment mid-sentence, then re-transcribe."""
+def merge_incomplete_chunks(chunks: list[dict], transcribe, max_seconds: float = 8.0,
+                            min_seconds: float = 5.0) -> list[dict]:
+    """Join mid-sentence cuts and short adjacent spans when they fit one clip."""
     merged: list[dict] = []
     for row in chunks:
         merged.append(row)
-        while len(merged) > 1 and not re.search(r"[.!?।॥][\"'’”)]*$", merged[-2]["raw"].strip()):
+        while len(merged) > 1 and (
+            not re.search(r"[.!?।॥][\"'’”)]*$", merged[-2]["raw"].strip())
+            or merged[-2]["end"] - merged[-2]["start"] < min_seconds
+        ):
             left, right = merged[-2], merged[-1]
             if right["end"] - left["start"] > max_seconds:
-                left["cut_mid_sentence"] = True
+                if not re.search(r"[.!?।॥][\"'’”)]*$", left["raw"].strip()):
+                    left["cut_mid_sentence"] = True
                 break
             joined = transcribe(left["start"], right["end"])
             merged[-2:] = [{
@@ -474,27 +479,45 @@ def select_paragraph_candidate(client, source: str, candidates: list[list[str]],
 
 def revise_for_timing(client, paragraph: str, source: str, current: str, target_lang: str,
                       slot_s: float, chars_per_second: float, mode: str,
-                      target_character_budget: int | None = None) -> str:
+                      target_character_budget: int | None = None,
+                      neighbor_context: list[str] | None = None) -> str:
     instruction = (
         "Make this target-language segment more concise while preserving every meaning and nuance. Do not omit facts, "
         "change agents or actions, or alter speech act."
         if mode == "shorter" else
         "Use the available slot for a fuller natural translation, preserving the entire source meaning, fillers, and nuance. Do not add facts."
     )
+    budget = (max(1, int(target_character_budget)) if target_character_budget is not None
+              else max(32, round(slot_s * chars_per_second)))
     result = prompt_json(
         client,
-        instruction + " The full paragraph is context; rewrite only the named segment. Use natural spoken target-language text and no untranslated English clause. Return JSON with translation.",
-        {"full_source_paragraph": paragraph, "source_segment": source, "current_translation": current,
+        instruction + " Translate ONLY source_segment. Neighbor spans and their translations are read-only context; never translate, copy, or include any of their content. The character budget is strict: the returned translation must not exceed it. Use natural spoken target-language text and no untranslated English clause. Return JSON with translation.",
+        {"neighbor_context_read_only": neighbor_context or [], "source_segment": source, "current_translation": current,
          "target_language": target_lang, "slot_seconds": round(slot_s, 3),
-         "target_character_budget": (
-             max(1, int(target_character_budget)) if target_character_budget is not None
-             else max(32, round(slot_s * chars_per_second))
-         ), "revision_mode": mode},
+         "target_character_budget": budget, "revision_mode": mode},
     )
     translated = result.get("translation")
     if not isinstance(translated, str) or not translated.strip():
         raise ValueError("Timing revision returned no translation")
-    return translated.strip()
+    translated = translated.strip()
+    if len(translated) > budget:
+        raise ValueError(f"Timing revision exceeded its strict {budget}-character budget")
+    return translated
+
+
+def contains_neighbor_content(candidate: str, neighbor_texts: list[str], minimum_words: int = 4) -> bool:
+    """Reject a retry that copies a distinctive phrase from an adjacent clip."""
+    tokenize = lambda text: re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)
+    output = tokenize(candidate)
+    if len(output) < minimum_words:
+        return False
+    output_ngrams = {tuple(output[i:i + minimum_words]) for i in range(len(output) - minimum_words + 1)}
+    for neighbor in neighbor_texts:
+        words = tokenize(neighbor)
+        if any(tuple(words[i:i + minimum_words]) in output_ngrams
+               for i in range(max(0, len(words) - minimum_words + 1))):
+            return True
+    return False
 
 
 def select_candidate(client, source: str, candidates: list[str], target_lang: str, slot_s: float, cps: float) -> tuple[str, int, str]:
@@ -935,13 +958,37 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     if spoken_seconds > fit_limit_s and synthesis_attempt < 2 and not preserve_translation:
                         duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
                         retune_instruction = "Paragraph-context retranslation after measured overrun."
-                        try:
-                            revised = revise_for_timing(
-                                translator, full_source_paragraph, row["cleaned"], selected,
-                                target_lang, slot, measured_chars_per_second, "shorter",
-                                target_character_budget=duration_budget_chars,
-                            )
-                        except (ValueError, KeyError, TypeError):
+                        neighbor_context = []
+                        for neighbor_index in (index - 1, index + 1):
+                            if 0 <= neighbor_index < len(cleaned_rows):
+                                neighbor_context.append(
+                                    f"Source: {cleaned_rows[neighbor_index]['cleaned']}\n"
+                                    f"Translation: {candidates[neighbor_index]}"
+                                )
+                        revised = None
+                        for _retry in range(3):
+                            try:
+                                revised = revise_for_timing(
+                                    translator, "", row["cleaned"], selected,
+                                    target_lang, slot, measured_chars_per_second, "shorter",
+                                    target_character_budget=duration_budget_chars,
+                                    neighbor_context=neighbor_context,
+                                )
+                            except (ValueError, KeyError, TypeError):
+                                duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
+                                continue
+                            if contains_neighbor_content(revised, [
+                                cleaned_rows[n]['cleaned'] for n in (index - 1, index + 1)
+                                if 0 <= n < len(cleaned_rows)
+                            ] + [
+                                candidates[n] for n in (index - 1, index + 1)
+                                if 0 <= n < len(candidates)
+                            ]):
+                                revised = None
+                                duration_budget_chars = shorter_timing_budget(duration_budget_chars, selected)
+                                continue
+                            break
+                        if revised is None:
                             timing_revision_rejected = True
                             break
                         if run_checks(row["cleaned"], revised, target_lang, clip_terms, max_chars=1000):

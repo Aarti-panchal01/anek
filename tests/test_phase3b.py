@@ -10,6 +10,7 @@ from backend.pipeline.phase3b import (
     apply_speech_windows,
     assert_timing_invariants,
     create_srt,
+    contains_neighbor_content,
     merge_incomplete_chunks,
     revise_for_timing,
     shorter_timing_budget,
@@ -122,6 +123,18 @@ def test_mid_sentence_merge_does_not_cross_the_twelve_second_hard_cap():
     assert all(row["end"] - row["start"] <= 12 for row in result)
 
 
+def test_short_completed_clip_merges_into_following_span_with_consistent_timing():
+    chunks = [
+        {"start": 0.0, "end": 3.9, "raw": "This is one short sentence.", "lang": "en-IN"},
+        {"start": 3.9, "end": 7.4, "raw": "Here is the next sentence.", "lang": "en-IN"},
+    ]
+    merged = merge_incomplete_chunks(
+        chunks, lambda start, end: {"transcript": "This is one short sentence. Here is the next sentence."},
+    )
+    assert len(merged) == 1
+    assert (merged[0]["start"], merged[0]["end"]) == (0.0, 7.4)
+
+
 def test_uncertain_noun_is_kept_while_clear_grammar_cleanup_is_applied():
     client = MockLLMClient([{"cleaned_text": "That's why I built an app and wonder which wig might look better.", "changes": []}])
     cleaned, changes = clean_source_detail(
@@ -175,6 +188,23 @@ def test_over_slot_retry_budget_and_pause_trim_are_language_agnostic(target_lang
     assert revised == "A concise translation."
     assert translator.payload["target_character_budget"] == reduced_budget
     assert translator.payload["target_language"] == target_lang
+    assert translator.payload["source_segment"] == "Source sentence."
+    assert "full_source_paragraph" not in translator.payload
+
+    class OverBudgetTranslator:
+        def chat_json(self, messages):
+            return {"translation": "x" * (reduced_budget + 1)}
+
+    with pytest.raises(ValueError, match="strict"):
+        revise_for_timing(
+            OverBudgetTranslator(), "", "Source sentence.", current,
+            target_lang, 2.0, 12.0, "shorter", target_character_budget=reduced_budget,
+            neighbor_context=["Source: next sentence. Translation: अगला वाक्य।"],
+        )
+    assert contains_neighbor_content(
+        "यह चुनाव अधिक व्यक्तिगत और आसान लगे", ["यह चुनाव अधिक व्यक्तिगत और आसान लगे"],
+    )
+    assert not contains_neighbor_content("यह एक नया संक्षिप्त वाक्य है", ["अगला विषय यहां शुरू होता है"])
 
     for index in range(2):
         with wave.open(str(tmp_path / f"{target_lang}_sentence_{index:02d}.wav"), "wb") as audio:

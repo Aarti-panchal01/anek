@@ -536,6 +536,10 @@ class DubEdit(BaseModel):
     translation: str
 
 
+class SourceEdit(BaseModel):
+    source_text: str = Field(min_length=1, max_length=5000)
+
+
 class StartJob(BaseModel):
     voice_id: str | None = None
     voice_mode: str = "clone"
@@ -1556,13 +1560,19 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
     for row in rows:
         item = dict(row)
         audio_path = item.pop("audio_path", None)
-        item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio" if audio_path and Path(audio_path).is_file() else None
+        audio_present = bool(audio_path and Path(audio_path).is_file())
+        item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio" if audio_present else None
+        item["audio_removed"] = bool(audio_path and not audio_present)
         attempts = json.loads(row["attempts_json"] or "[]")
+        attempt_root = (DATA_ROOT / "exports" / project_id).resolve()
         for index, attempt in enumerate(attempts):
             old_key = attempt.pop("old_audio_key", None)
             new_key = attempt.pop("new_audio_key", None)
-            attempt["old_audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/attempts/{index}/previous" if old_key else None
-            attempt["new_audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/attempts/{index}/updated" if new_key else None
+            def attempt_exists(key: str | None) -> bool:
+                path = (attempt_root / key).resolve() if key else None
+                return bool(path and path.is_relative_to(attempt_root) and path.is_file())
+            attempt["old_audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/attempts/{index}/previous" if attempt_exists(old_key) else None
+            attempt["new_audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/attempts/{index}/updated" if attempt_exists(new_key) else None
         item.update({
             "reasons": json.loads(row["reasons_json"] or "[]"),
             "attempts": attempts,
@@ -1573,6 +1583,21 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
             "duration_budget_chars": review_by_clip.get(int(row["idx"]), {}).get("duration_budget_chars"),
             "withheld": bool(review_by_clip.get(int(row["idx"]), {}).get("withheld", False)),
         })
+        reason_texts = item["reasons"]
+        reason_blob = " ".join(reason_texts).casefold()
+        if "withheld" in reason_blob or "exceeds its safe slot" in reason_blob or "slot" in reason_blob and "speech" in reason_blob:
+            reason_code, reason_text, fix_action = "too_long_for_slot", "Speech is too long for its time slot.", "Shorten the translation"
+        elif "number" in reason_blob or "name" in reason_blob or "term missing" in reason_blob:
+            reason_code, reason_text, fix_action = "number_or_name_missing", "A number or name may be missing.", "Check the translation"
+        elif "disagree" in reason_blob:
+            reason_code, reason_text, fix_action = "transcript_models_disagree", "The transcript checks do not agree.", "Review the source text"
+        elif "transcript" in reason_blob or "uncertain source" in reason_blob or "source cleanup" in reason_blob:
+            reason_code, reason_text, fix_action = "source_looks_wrong", "The source transcript may be wrong.", "Fix the source text"
+        elif "meaning" in reason_blob:
+            reason_code, reason_text, fix_action = "source_looks_wrong", "The source meaning needs review.", "Fix the source text"
+        else:
+            reason_code, reason_text, fix_action = "review_needed", "This clip needs a quick review.", "Review this clip"
+        item.update({"reason_code": reason_code, "reason_text": reason_text, "fix_action": fix_action})
         item.pop("attempts_json", None)
         item.pop("reasons_json", None)
         result.append(item)
@@ -1638,6 +1663,34 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
             (new_id(), clip_id, lang, body.translation, draft_translation, status, json.dumps(reasons, ensure_ascii=False)),
         )
     return {"status": status, "reasons": reasons, "human_edited": True}
+
+
+@app.patch("/api/clips/{clip_id}/source")
+async def edit_clip_source(clip_id: str, body: SourceEdit) -> dict:
+    source_text = body.source_text.strip()
+    if not source_text:
+        raise HTTPException(422, "Source text cannot be empty")
+    with db.connect() as connection:
+        clip = connection.execute("SELECT project_id,idx FROM clips WHERE id=?", (clip_id,)).fetchone()
+        if clip is None:
+            raise HTTPException(404, "Clip not found")
+        connection.execute("UPDATE clips SET src_text=? WHERE id=?", (source_text, clip_id))
+        connection.execute(
+            "UPDATE dubs SET status='yellow',reasons_json=?,updated_at=CURRENT_TIMESTAMP WHERE clip_id=?",
+            (json.dumps(["Source text changed; re-speak this clip to update its translation."], ensure_ascii=False), clip_id),
+        )
+    output_dir = DATA_ROOT / "exports" / clip["project_id"]
+    for report_path in output_dir.glob("*_phase3d_ai-dubbed.json"):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            for report_clip in report.get("clips", []):
+                if int(report_clip.get("clip", -1)) == int(clip["idx"]) + 1:
+                    report_clip["source_cleaned"] = source_text
+                    report_clip["source_raw"] = source_text
+            atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
+        except (OSError, ValueError, TypeError):
+            LOGGER.warning("Could not update source text in report %s", report_path)
+    return {"source_text": source_text, "status": "updated"}
 
 
 async def run_job(job_id: str) -> None:
@@ -2304,7 +2357,17 @@ async def project_audio_tracks(project_id: str, lang: str) -> dict:
         artifact = f"track-{kind}"
         path = _track_artifact_path(project_id, lang, kind)
         tracks[kind] = f"/api/projects/{project_id}/downloads/{artifact}?lang={lang}" if path else None
-    return {"language": lang, "tracks": tracks, "mix_policy": "Dubbed and quiet room tone are mixed into the MP4; source audio is available separately and is not mixed under the dub."}
+    expected_tracks = set()
+    report_path = _language_artifacts(project_id, lang).get("report")
+    if report_path:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            expected_tracks = set((report.get("audio_tracks") or {}).keys())
+        except (OSError, ValueError, TypeError):
+            pass
+    audio_removed = any(kind in expected_tracks and not tracks.get(kind) for kind in tracks)
+    return {"language": lang, "tracks": tracks, "audio_removed": audio_removed,
+            "mix_policy": "Dubbed and quiet room tone are mixed into the MP4; source audio is available separately and is not mixed under the dub."}
 
 
 @app.delete("/api/projects/{project_id}")

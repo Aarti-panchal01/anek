@@ -121,3 +121,19 @@ Exact ffprobe outputs:
   "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "5.013000"}
 }
 ```
+
+## Round 9: red clips and clean review studio
+
+- Tasks done: Part A complete; Part B implementation and visual checks complete, awaiting its dedicated checkpoint push.
+- Current task: commit and push the Part A backend and regression-test checkpoint.
+- Next task: commit the Part B review-studio UI and mobile overflow fix after repeating full backend tests and frontend build.
+- Decisions: follow the attached Base44 screenshots for layout only; retain Anek branding. Do not touch /data/voices or the database file. Validate and push once after each part.
+- Step 1 done: timing rewrites now submit only the active source segment, label neighboring source and translation as read-only context, enforce the actual character limit on returned text, and reject copied four-word phrases from neighboring source/translation. Added parametrized regression coverage for all 10 target languages. `python -m pytest tests/test_phase3b.py -q` passed (32 tests).
+- Current task: finish Part A remaining clip segmentation, term rule actions, missing-audio UX, and plain-language red reasons.
+- Step 2 done: clips under five seconds now merge with the next adjacent span when the combined range stays within the clip cap; incomplete sentence cuts still merge and timing bounds remain unchanged. Added a timing regression test. `python -m pytest tests/test_phase3b.py -q` passed (33 tests).
+- Step 3 done: source correction now saves into the clip and language reports, marks the dub for re-speech, and can create a case-insensitive mishearing phrase rule for the project or global memory. API responses distinguish missing take files and include a plain-language reason and suggested action. Added source/API regression coverage.
+- Step 4 done: review cards now collapse to one-line rows with only the active clip expanded; source and translation editing, single “Save & re-speak”, plain-language reason/action, number/name chips, collapsed takes/pronunciation/details, and audio-removed recovery are in place. Header utilities moved into More; audio layers are collapsed and only show when tracks exist. Local Playwright mock screenshots were captured and viewed for verified, review, red, and side-by-side states. The valid WAV fixture displayed a 2-second duration, the player showed video content instead of black, and no `∅` or `over_slot` text appeared.
+- Part A validation: `python -m pytest tests -q` passed; `cd frontend && npm run build` passed (API prefix check, TypeScript, Vite build).
+- Part B visual validation: Playwright mock captures for verified, review, red, side-by-side, and 375px mobile layouts. The mobile pass found an intrinsic grid overflow (527px content at a 365px viewport); CSS now constrains the review grid and its children. Re-run after the final build.
+- Current task: create the Part A checkpoint commit and push; then separately commit/push the Part B UI and mobile fix.
+
