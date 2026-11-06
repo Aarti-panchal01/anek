@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from difflib import SequenceMatcher
 
@@ -50,6 +51,7 @@ settings = get_settings()
 LOGGER = logging.getLogger(__name__)
 _shutdown_requested = threading.Event()
 _active_job_tasks: set[asyncio.Task] = set()
+_storage_maintenance_task: asyncio.Task | None = None
 
 
 class JobInterrupted(Exception):
@@ -97,8 +99,10 @@ def log_runtime_configuration(config=settings, environment: dict[str, str] | Non
         LOGGER.info("Timing environment overrides code defaults: %s", ", ".join(overrides))
 app = FastAPI(title=settings.app_name)
 DATA_ROOT = Path(settings.anek_data_dir)
-MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 UPLOAD_WORKING_COPY_MULTIPLIER = 6
+STORAGE_BUDGET_FRACTION = 0.80
+MAX_FINISHED_PROJECTS = 2
 CONSENT_PHRASES = [
     "Today I am recording my voice for an AI dubbing test.",
     "I consent to use this recording to create my own voice model.",
@@ -156,7 +160,7 @@ async def handle_unexpected_error(request: Request, error: Exception) -> JSONRes
     """Keep API errors structured and let CORS middleware decorate the response."""
     storage_full = is_storage_full(error)
     if storage_full:
-        reason = "Server storage is full"
+        reason = getattr(error, "message", "Server storage is full")
         LOGGER.error("Storage full while handling %s %s", request.method, request.url.path)
         match = re.search(r"/api/projects/([A-Za-z0-9_-]+)", request.url.path)
         if match:
@@ -201,6 +205,75 @@ def preflight_upload_space(size_bytes: int) -> None:
     required_bytes = size_bytes * UPLOAD_WORKING_COPY_MULTIPLIER
     if free_bytes < required_bytes:
         raise StorageFullError()
+
+
+def create_720p_working_copy(source: Path, output: Path) -> float:
+    run_atomic_command(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+         "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+         "-threads", "1", "-threads:v", "1", "-filter_threads", "1", "-c:v", "libx264",
+         "-preset", "ultrafast", "-b:v", "900k", "-maxrate", "1000k", "-bufsize", "1800k",
+         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(output)],
+        check=True, capture_output=True, timeout=180,
+    )
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt", "-of", "json", str(output)],
+        check=True, capture_output=True, text=True,
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    video = next((row for row in streams if row.get("codec_type") == "video"), None)
+    audio = next((row for row in streams if row.get("codec_type") == "audio"), None)
+    valid = bool(video and video.get("codec_name") == "h264" and video.get("pix_fmt") == "yuv420p"
+                 and int(video.get("width", 0)) <= 1280 and int(video.get("height", 0)) <= 720
+                 and (audio is None or audio.get("codec_name") == "aac"))
+    duration, has_video = probe_video(output)
+    if not valid or not has_video or duration <= 0:
+        output.unlink(missing_ok=True)
+        raise RuntimeError("The compressed working copy failed media verification")
+    return duration
+
+
+def _delete_project_data(project_id: str) -> dict:
+    project = project_row(project_id)
+    data_root = DATA_ROOT.resolve()
+    for folder in (DATA_ROOT / "uploads" / project_id, DATA_ROOT / "exports" / project_id):
+        resolved = folder.resolve()
+        if resolved.is_relative_to(data_root) and resolved != data_root:
+            if resolved.is_dir():
+                shutil.rmtree(resolved)
+            if resolved.exists():
+                raise HTTPException(500, "Could not remove all project files")
+    with db.connect() as connection:
+        connection.execute("DELETE FROM dubs WHERE clip_id IN (SELECT id FROM clips WHERE project_id=?)", (project_id,))
+        connection.execute("DELETE FROM clips WHERE project_id=?", (project_id,))
+        connection.execute("DELETE FROM terms WHERE project_id=?", (project_id,))
+        connection.execute("DELETE FROM export_events WHERE project_id=?", (project_id,))
+        connection.execute("DELETE FROM credit_ledger WHERE project_id=?", (project_id,))
+        connection.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
+        connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    return {"id": project_id, "name": project["name"]}
+
+
+def ensure_storage_room(project_id: str, upload_size: int) -> list[dict[str, str]]:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    required = max(0, upload_size) * UPLOAD_WORKING_COPY_MULTIPLIER
+    evicted: list[dict[str, str]] = []
+    while True:
+        disk = shutil.disk_usage(DATA_ROOT)
+        budget = int(disk.total * STORAGE_BUDGET_FRACTION)
+        with db.connect() as connection:
+            finished = connection.execute(
+                "SELECT id,name FROM projects WHERE status='complete' AND id<>? ORDER BY created_at ASC,id ASC",
+                (project_id,),
+            ).fetchall()
+        over_budget = disk.used + required > budget or disk.free < required
+        over_project_count = len(finished) >= MAX_FINISHED_PROJECTS
+        if not over_budget and not over_project_count:
+            return evicted
+        if not finished:
+            raise StorageFullError("Not enough storage for this video. Delete a project and try again.")
+        oldest = finished[0]
+        evicted.append(_delete_project_data(oldest["id"]))
 
 
 def cleanup_orphaned_files(root: Path) -> list[Path]:
@@ -252,6 +325,10 @@ def cleanup_project_intermediates(project_id: str) -> list[Path]:
     if work_dir.is_dir():
         removed.extend(path for path in work_dir.rglob("*") if path.is_file())
         shutil.rmtree(work_dir, ignore_errors=True)
+    if export_dir.is_dir():
+        for path in export_dir.glob("track-*.wav"):
+            path.unlink(missing_ok=True)
+            removed.append(path)
     preview = DATA_ROOT / "uploads" / project_id / "browser.mp4"
     if preview.is_file():
         preview.unlink(missing_ok=True)
@@ -265,6 +342,61 @@ def cleanup_project_intermediates(project_id: str) -> list[Path]:
                 (project_id,),
             )
     return removed
+
+
+def _utc_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def project_export_expiry(project_id: str) -> datetime | None:
+    with db.connect() as connection:
+        latest = connection.execute(
+            "SELECT lang,MAX(created_at) AS created_at FROM export_events WHERE project_id=? GROUP BY lang",
+            (project_id,),
+        ).fetchall()
+    expiries = [
+        _utc_datetime(row["created_at"]) + timedelta(hours=settings.export_retention_hours)
+        for row in latest if row["created_at"]
+    ]
+    return min(expiries) if expiries else None
+
+
+def cleanup_expired_exports(now: datetime | None = None) -> list[Path]:
+    current = now or datetime.now(timezone.utc)
+    expired: list[Path] = []
+    with db.connect() as connection:
+        latest = connection.execute(
+            "SELECT project_id,lang,MAX(created_at) AS created_at FROM export_events GROUP BY project_id,lang"
+        ).fetchall()
+    for row in latest:
+        if not row["created_at"] or _utc_datetime(row["created_at"]) + timedelta(hours=settings.export_retention_hours) > current:
+            continue
+        folder = DATA_ROOT / "exports" / row["project_id"]
+        if folder.is_dir():
+            for path in folder.rglob("*"):
+                if path.is_file() and f"_{row['lang']}" in path.name:
+                    try:
+                        path.unlink()
+                        expired.append(path)
+                    except OSError:
+                        LOGGER.exception("Could not remove expired export path=%s", path)
+        with db.connect() as connection:
+            connection.execute("DELETE FROM export_events WHERE project_id=? AND lang=?", (row["project_id"], row["lang"]))
+            connection.execute(
+                "UPDATE dubs SET audio_path=NULL WHERE lang=? AND clip_id IN (SELECT id FROM clips WHERE project_id=?)",
+                (row["lang"], row["project_id"]),
+            )
+    return expired
+
+
+async def storage_maintenance_loop() -> None:
+    while not _shutdown_requested.is_set():
+        try:
+            await asyncio.to_thread(cleanup_expired_exports)
+        except Exception:
+            LOGGER.exception("Export expiry cleanup failed")
+        await asyncio.sleep(3600)
 
 
 def enforce_ip_limit(request: Request, category: str) -> None:
@@ -545,6 +677,7 @@ def estimated_job_credits(duration_s: float, language_count: int) -> int:
 
 @app.on_event("startup")
 async def startup() -> None:
+    global _storage_maintenance_task
     _shutdown_requested.clear()
     db.initialize()
     log_runtime_configuration()
@@ -570,11 +703,16 @@ async def startup() -> None:
         pending = connection.execute("SELECT id FROM jobs WHERE state='pending'").fetchall()
     for item in pending:
         await schedule_job(item["id"])
+    cleanup_expired_exports()
+    _storage_maintenance_task = asyncio.create_task(storage_maintenance_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     _shutdown_requested.set()
+    if _storage_maintenance_task:
+        _storage_maintenance_task.cancel()
+        await asyncio.gather(_storage_maintenance_task, return_exceptions=True)
     if _active_job_tasks:
         await asyncio.wait(tuple(_active_job_tasks), timeout=25)
 
@@ -588,12 +726,16 @@ async def health() -> dict:
 async def storage_status() -> dict:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(DATA_ROOT)
+    budget = int(usage.total * STORAGE_BUDGET_FRACTION)
     return {
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,
         "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
         "free_percent": round(usage.free / usage.total * 100, 1) if usage.total else 0,
+        "budget_bytes": budget,
+        "budget_percent": STORAGE_BUDGET_FRACTION * 100,
+        "export_retention_hours": settings.export_retention_hours,
     }
 
 
@@ -626,6 +768,7 @@ async def get_config() -> dict:
         "languages": {code: LANGUAGES[code] for code in settings.enabled_langs if code in LANGUAGES},
         "max_video_seconds": settings.max_video_seconds,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "export_retention_hours": settings.export_retention_hours,
         "daily_credit_limit": settings.gnani_daily_limit,
         "used_daily_credits": int(used),
         "remaining_daily_credits": max(0, settings.gnani_daily_limit - int(used)),
@@ -786,7 +929,10 @@ async def list_projects() -> list[dict]:
             "FROM projects p LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE project_id=p.id ORDER BY created_at DESC LIMIT 1) "
             "ORDER BY p.created_at DESC"
         ).fetchall()
-    return [{**dict(row), "target_langs": json.loads(row["target_langs_json"])} for row in rows]
+    return [{
+        **dict(row), "target_langs": json.loads(row["target_langs_json"]),
+        "export_expires_at": (expiry.isoformat() if (expiry := project_export_expiry(row["id"])) else None),
+    } for row in rows]
 
 
 @app.get("/api/projects/summary")
@@ -833,8 +979,11 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if suffix not in {".mp4", ".mov", ".webm"}:
         raise HTTPException(415, "Upload an MP4, MOV, or WebM video")
     upload_size = getattr(video, "size", None)
+    evicted_projects: list[dict[str, str]] = []
     if upload_size is not None:
-        preflight_upload_space(upload_size)
+        if upload_size > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
+        evicted_projects.extend(ensure_storage_room(project_id, upload_size))
     folder = DATA_ROOT / "uploads" / project_id
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"source{suffix}"
@@ -847,7 +996,7 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
                 if upload_size is None:
-                    preflight_upload_space(size)
+                    evicted_projects.extend(ensure_storage_room(project_id, size))
                 target.write(block)
         commit_temporary(temporary, path)
     except HTTPException:
@@ -871,11 +1020,25 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if duration > settings.max_video_seconds:
         path.unlink(missing_ok=True)
         raise HTTPException(413, f"Video is {duration:.1f}s; maximum is {settings.max_video_seconds}s")
-    # Preview transcoding is lazy: upload should not fail if a constrained host
-    # cannot afford a second full video encode.
+    working_copy = folder / "source-720p.mp4"
+    try:
+        working_duration = create_720p_working_copy(path, working_copy)
+        if abs(working_duration - duration) > 0.1:
+            raise RuntimeError("The compressed working copy changed the source duration")
+    except Exception as error:
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='failed' WHERE id=?",
+                               (str(path), duration, project_id))
+        if is_storage_full(error):
+            raise StorageFullError(getattr(error, "message", "Server storage is full")) from error
+        raise HTTPException(422, "The server could not create a verified 720p working copy. The original upload is retained; delete the project to reclaim its space.") from error
+    # Keep the original untouched until FFmpeg and ffprobe have verified the working copy.
+    path.unlink()
+    path = working_copy
     with db.connect() as connection:
         connection.execute("UPDATE projects SET video_path=?,duration_s=?,status='uploaded' WHERE id=?", (str(path), duration, project_id))
-    return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id}
+    return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id,
+            "evicted_projects": evicted_projects}
 
 
 @app.post("/api/media/browser-preview")
@@ -1508,7 +1671,7 @@ async def run_job(job_id: str) -> None:
             connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (project["id"],))
     except Exception as error:
         LOGGER.exception("Dub job %s failed", job_id)
-        reason = "Server storage is full" if is_storage_full(error) else str(error)[:1000]
+        reason = getattr(error, "message", "Server storage is full") if is_storage_full(error) else str(error)[:1000]
         with db.connect() as connection:
             connection.execute("UPDATE jobs SET state='failed',stage='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (reason, job_id))
             connection.execute("UPDATE projects SET status='failed' WHERE id=?", (project["id"],))
@@ -2036,28 +2199,7 @@ async def project_audio_tracks(project_id: str, lang: str) -> dict:
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str) -> dict:
-    project = project_row(project_id)
-    if project.get("video_path"):
-        source = Path(project["video_path"]).resolve()
-        upload_dir = (DATA_ROOT / "uploads" / project_id).resolve()
-        if source.is_relative_to(upload_dir):
-            source.unlink(missing_ok=True)
-    data_root = DATA_ROOT.resolve()
-    for folder in (DATA_ROOT / "uploads" / project_id, DATA_ROOT / "exports" / project_id):
-        resolved = folder.resolve()
-        if resolved.is_relative_to(data_root) and resolved != data_root:
-            if resolved.is_dir():
-                shutil.rmtree(resolved)
-            if resolved.exists():
-                raise HTTPException(500, f"Could not remove all project files in {resolved.name}")
-    with db.connect() as connection:
-        connection.execute("DELETE FROM dubs WHERE clip_id IN (SELECT id FROM clips WHERE project_id=?)", (project_id,))
-        connection.execute("DELETE FROM clips WHERE project_id=?", (project_id,))
-        connection.execute("DELETE FROM terms WHERE project_id=?", (project_id,))
-        connection.execute("DELETE FROM export_events WHERE project_id=?", (project_id,))
-        connection.execute("DELETE FROM credit_ledger WHERE project_id=?", (project_id,))
-        connection.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
-        connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    _delete_project_data(project_id)
     return {"deleted": True}
 
 

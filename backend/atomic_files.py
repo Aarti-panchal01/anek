@@ -13,8 +13,12 @@ from typing import Any
 class StorageFullError(OSError):
     """Raised when an output could not be completed because storage is full."""
 
-    def __init__(self) -> None:
-        super().__init__(errno.ENOSPC, "Server storage is full")
+    def __init__(self, message: str = "Server storage is full") -> None:
+        super().__init__(errno.ENOSPC, message)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def is_storage_full(error: BaseException) -> bool:

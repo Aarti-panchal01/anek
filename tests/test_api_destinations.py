@@ -31,6 +31,12 @@ def _resolve(coroutine):
     raise AssertionError("endpoint unexpectedly performed asynchronous I/O")
 
 
+def _roomy_disk(monkeypatch):
+    monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
+        "Usage", (), {"total": 10**12, "used": 10**9, "free": 10**12 - 10**9},
+    )())
+
+
 def test_settings_and_usage_are_derived_from_config_and_database(monkeypatch):
     with _sandbox(monkeypatch) as (database, _):
         settings = _resolve(app_module.read_settings())
@@ -67,8 +73,9 @@ def test_project_list_includes_latest_job_status_stage_and_error(monkeypatch):
         assert result["job_error"] == "ASR failed"
 
 
-def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypatch):
+def test_video_upload_uses_verified_720p_copy_and_preview_conversion_is_deferred(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
+        _roomy_disk(monkeypatch)
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Playable video", source_lang="en-IN", target_langs=["hi-IN"],
         )))
@@ -76,6 +83,10 @@ def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypa
         browser_copy.parent.mkdir(parents=True, exist_ok=True)
         browser_copy.write_bytes(b"h264 preview")
         monkeypatch.setattr(app_module, "probe_video", lambda path: (20.0, True))
+        def make_working_copy(source, output):
+            output.write_bytes(b"verified 720p h264 aac")
+            return 20.0
+        monkeypatch.setattr(app_module, "create_720p_working_copy", make_working_copy)
         conversions = []
         monkeypatch.setattr(app_module, "browser_video_path", lambda path: conversions.append(path) or browser_copy)
         class Upload:
@@ -89,21 +100,42 @@ def test_video_upload_keeps_original_and_preview_conversion_is_deferred(monkeypa
 
         result = _resolve(app_module.upload_video(project["id"], upload))
         assert conversions == []
-        assert Path(project_row := app_module.project_row(project["id"])["video_path"]).read_bytes() == b"original hevc bytes"
+        assert Path(project_row := app_module.project_row(project["id"])["video_path"]).read_bytes() == b"verified 720p h264 aac"
         response = _resolve(app_module.project_video(project["id"], app_module.Request({
             "type": "http", "method": "GET", "path": "/", "headers": [],
         })))
 
         assert result["filename"] == "source.mov"
-        assert (browser_copy.parent / "source.mov").read_bytes() == b"original hevc bytes"
+        assert not (browser_copy.parent / "source.mov").exists()
+        assert result["evicted_projects"] == []
+        assert Path(project_row).name == "source-720p.mp4"
         assert Path(response.path) == browser_copy
         assert response.media_type == "video/mp4"
         assert "attachment" not in response.headers.get("content-disposition", "")
         assert conversions == [Path(project_row)]
 
 
+def test_original_upload_is_kept_when_working_copy_verification_fails(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        _roomy_disk(monkeypatch)
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Failed working copy", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        monkeypatch.setattr(app_module, "probe_video", lambda path: (20.0, True))
+        monkeypatch.setattr(app_module, "create_720p_working_copy", lambda *_: (_ for _ in ()).throw(RuntimeError("bad copy")))
+        class Upload:
+            filename = "source.mp4"
+            blocks = [b"original", b""]
+            async def read(self, size): return self.blocks.pop(0)
+        with pytest.raises(Exception, match="verified 720p"):
+            _resolve(app_module.upload_video(project["id"], Upload()))
+        assert (data_root / "uploads" / project["id"] / "source.mp4").read_bytes() == b"original"
+        assert app_module.project_row(project["id"])["status"] == "failed"
+
+
 def test_upload_storage_failure_returns_507_marks_job_and_cleans_partial(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
+        _roomy_disk(monkeypatch)
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Full disk upload", source_lang="en-IN", target_langs=["hi-IN"],
         )))
@@ -141,7 +173,9 @@ def test_upload_preflight_requires_six_times_file_size_before_writing(monkeypatc
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Preflight", source_lang="en-IN", target_langs=["hi-IN"],
         )))
-        monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 65})())
+        monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
+            "Usage", (), {"total": 1000, "used": 900, "free": 65},
+        )())
         response = TestClient(app_module.app, raise_server_exceptions=False).put(
             f"/api/projects/{project['id']}/video",
             files={"video": ("source.mp4", b"0123456789abcdef", "video/mp4")},
@@ -165,6 +199,27 @@ def test_upload_preflight_rejects_files_over_the_configured_limit(monkeypatch):
         assert "upload limit" in response.json()["detail"]
 
 
+def test_storage_eviction_removes_oldest_finished_only(monkeypatch):
+    with _sandbox(monkeypatch):
+        _roomy_disk(monkeypatch)
+        ids = []
+        for name in ("old", "new", "running", "incoming"):
+            project = _resolve(app_module.create_project(app_module.ProjectCreate(
+                name=name, source_lang="en-IN", target_langs=["hi-IN"],
+            )))
+            ids.append(project["id"])
+        with db.connect() as connection:
+            connection.execute("UPDATE projects SET status='complete',created_at='2020-01-01' WHERE id=?", (ids[0],))
+            connection.execute("UPDATE projects SET status='complete',created_at='2021-01-01' WHERE id=?", (ids[1],))
+            connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (ids[2],))
+        removed = app_module.ensure_storage_room(ids[3], 1)
+        assert removed == [{"id": ids[0], "name": "old"}]
+        with db.connect() as connection:
+            remaining = {row["id"] for row in connection.execute("SELECT id FROM projects")}
+        assert ids[0] not in remaining
+        assert {ids[1], ids[2], ids[3]} <= remaining
+
+
 def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
     with _sandbox(monkeypatch):
         monkeypatch.setattr(app_module.shutil, "disk_usage", lambda _path: type(
@@ -173,7 +228,31 @@ def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
         assert _resolve(app_module.storage_status()) == {
             "total_bytes": 1000, "used_bytes": 750, "free_bytes": 250,
             "used_percent": 75.0, "free_percent": 25.0,
+            "budget_bytes": 800, "budget_percent": 80.0, "export_retention_hours": 24,
         }
+
+
+def test_expired_exports_are_removed_after_configured_retention(monkeypatch):
+    from datetime import datetime, timezone
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Expiring export", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        folder = data_root / "exports" / project["id"]
+        folder.mkdir(parents=True)
+        final = folder / "sample_hi-IN_ai-dubbed.mp4"
+        final.write_bytes(b"final")
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO export_events(id,project_id,lang,formats_json,unresolved_red_json,created_at) VALUES(?,?,?,?,?,?)",
+                ("old-export", project["id"], "hi-IN", '["mp4"]', '[]', "2020-01-01T00:00:00+00:00"),
+            )
+        expired = app_module.cleanup_expired_exports(datetime(2020, 1, 2, tzinfo=timezone.utc))
+        assert expired == [final]
+        assert not final.exists()
+        with db.connect() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM export_events WHERE id='old-export'").fetchone()[0] == 0
+        assert app_module.project_export_expiry(project["id"]) is None
 
 
 def test_startup_cleanup_removes_orphans_but_preserves_voice_and_database(monkeypatch):

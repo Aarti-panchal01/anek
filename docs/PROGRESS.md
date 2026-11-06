@@ -110,7 +110,7 @@
 
 ### Current task
 
-- Part A complete. Part B: small-volume storage budget, eviction, compressed working source, 24-hour export expiry, and measured disk use.
+- Part B complete. Enforced an 80% storage budget and a maximum of two finished projects, evicting only the oldest finished project and returning its name. Uploads are limited to 40 MB; the UI explains the limit and 720p compression. Uploads are atomically compressed to verified 720p H.264/AAC faststart working copies; originals are removed only after verification. Preview, processing, and export use the working copy. Successful export removes clip WAVs, temp mixes, duplicate previews, and generated track WAVs while preserving final dubbed MP4s and resume files. Exports expire after configurable `EXPORT_RETENTION_HOURS` (default 24), with expiry shown in project and Usage views. Added eviction, verified-copy retention, export expiry, and budget endpoint tests. Full backend suite and frontend build passed before push.
 
 ### Next task
 
@@ -125,17 +125,18 @@
 
 ### Tasks done
 
-- Round 4 Task 1 is complete at `b0e6efc`; Part A code and tests are complete, pending the Part A commit and push.
+- Round 4 Task 1 is complete at `b0e6efc`; Part A is complete and pushed as `0a72d99`.
 
 ### Current task
 
-- Part A: complete; checks passed. Verified `.gitignore` ignores `.env.local`, `.env.*`, `*.pem`, and `*.key`, with `.env.example` exempt. `git ls-files` reports only the intentionally exempt `.env.example` among those patterns. The two key-looking test literals in `tests/test_llm_client.py` are clearly fake fixtures; their values were masked.
+- Part A: `0a72d99` (pushed). Backend suite and frontend build passed. Verified `.gitignore` ignores `.env.local`, `.env.*`, `*.pem`, and `*.key`, with `.env.example` exempt. `git ls-files` reports only the intentionally exempt `.env.example` among those patterns. The two key-looking test literals in `tests/test_llm_client.py` are clearly fake fixtures; their values were masked.
 
 ### Next task
 
-- Part B: enforce the Railway storage budget, use a verified 720p working source, expire exports, and measure disk usage. Part C: simplify the README and remove screenshot tooling.
+- Part B current: enforce the Railway storage budget, use a verified 720p working source, expire exports, and measure disk usage. Part C next: simplify the README and remove screenshot tooling.
 
 ### Decisions
 
 - Follow the requested push cadence: after Part A, Part B, and Part C. Run the backend suite and frontend build before each push.
 - Do not rerun or repeat already completed Round 4 Task 1; keep the prior ignored-file and fake-fixture findings.
+- The 20-second 720p mock measurement used FFmpeg testsrc plus a sine tone. Original source: 3,300,448 bytes; verified working copy: 2,326,021 bytes. For the two-language mock project, estimated disk use fell from 7,952,510 bytes to 6,978,103 bytes after replacing the original with the compressed source (12.3% reduction). Mock final dubbed files were retained for both languages.

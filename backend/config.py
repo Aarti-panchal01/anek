@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     llm_cache_path: str = ""
     numeral_style: str = "ascii"
     max_video_seconds: int = Field(default=120, le=120, gt=0)
+    export_retention_hours: int = Field(default=24, ge=1, le=8760)
     max_credits_per_job: int = 0
     gnani_daily_limit: int = 2500
     enabled_langs: Annotated[list[str], NoDecode] = Field(default_factory=lambda: list(LANGUAGES))
