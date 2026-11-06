@@ -1185,8 +1185,8 @@ async def project_video(project_id: str, request: Request):
     project = project_row(project_id)
     if not project["video_path"]:
         raise HTTPException(404, "Project video not found")
-    if project.get("preview_status") == "pending":
-        return JSONResponse({"preview_status": "pending"}, status_code=202, headers={"Retry-After": "2"})
+    # A browser preview is prepared asynchronously. Keep the uploaded original
+    # playable while that work runs instead of making the player wait on a 202.
     primary = project.get("preview_path") if project.get("preview_status") == "ready" else project.get("original_video_path") or project["video_path"]
     fallback = project.get("original_video_path") or project["video_path"]
     failures = []
@@ -1224,9 +1224,11 @@ async def project_thumbnail(project_id: str):
     if poster.is_file() and poster.stat().st_size > 0:
         return FileResponse(poster, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
     try:
+        duration = float(project.get("duration_s") or 0)
+        seek_s = min(max(duration * 0.15, 0.25), 3.0)
         await asyncio.to_thread(
             run_atomic_command,
-            ["ffmpeg", "-y", "-v", "error", "-ss", "0.25", "-i", str(source), "-frames:v", "1", "-q:v", "4", "-an", str(poster)],
+            ["ffmpeg", "-y", "-v", "error", "-ss", f"{seek_s:.3f}", "-i", str(source), "-frames:v", "1", "-q:v", "4", "-an", str(poster)],
             check=True, capture_output=True, timeout=45,
         )
         return FileResponse(poster, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
