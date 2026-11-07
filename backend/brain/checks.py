@@ -38,6 +38,27 @@ def _contains_term(translation: str, expected: str, canonical: str, target_lang:
     return any(re.sub(r"[^\w]", "", candidate.casefold(), flags=re.UNICODE) in haystack for candidate in candidates if candidate)
 
 
+def latin_letter_share(translation: str, target_lang: str, termsheet: TermSheet | dict | None = None) -> float:
+    """Fraction of unprotected letters that are Latin in a native-script target."""
+    if target_lang == "en-IN":
+        return 0.0
+    text = translation
+    if termsheet:
+        sheet = termsheet if isinstance(termsheet, TermSheet) else TermSheet.model_validate(termsheet)
+        for term in sheet.terms:
+            if term.treatment == "keep" or term.locked:
+                for spelling in (term.term, term.targets.get(target_lang, ""), term.spoken_forms.get(target_lang, "")):
+                    if spelling:
+                        text = re.sub(re.escape(spelling), " ", text, flags=re.IGNORECASE)
+    # Numbers and common unit symbols are not evidence of mixed-script prose.
+    text = re.sub(r"(?<!\w)[\d०-९೦-೯]+(?:[.,/][\d०-९೦-೯]+)*(?!\w)", " ", text)
+    text = re.sub(r"(?i)\b(?:km|cm|mm|kg|mg|ml|mph|m/s|s|hr|hrs|°c|°f)\b", " ", text)
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return 0.0
+    return sum("LATIN" in __import__("unicodedata").name(char, "") for char in letters) / len(letters)
+
+
 def run_checks(
     source: str,
     translation: str,

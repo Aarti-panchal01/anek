@@ -1,5 +1,16 @@
 # Autonomous run progress
 
+## Round 13: translation style and native script
+
+- Current task: identify the active Sarvam translation model/settings and mixed-script source; verify official Mayura API parameters; implement per-project Natural/Pure style, script-aware translation, safe style switching, and tests.
+- Initial model/mode findings: `SARVAM_TRANSLATION_MODEL` defaults to `mayura:v1`; `SARVAM_REWRITE_MODEL` defaults to `sarvam-105b-conversations`. Existing translation calls use Mayura `modern-colloquial` by default or `classic-colloquial` for a respectful tone, and use `formal` only when the configured translation model is `sarvam-translate:v1`. No `output_script` is sent. The mixed Latin words therefore come from Mayura's default script behavior and are stored as returned, with no target-script postprocessing.
+- Official reference checked: Mayura supports the app's 10 targets (English plus nine Indian languages), a 1,000-character limit, modes `formal`, `modern-colloquial`, `classic-colloquial`, `code-mixed`, and output scripts `fully-native` and `spoken-form-in-native` (the latter for spoken style). `sarvam-translate:v1` is formal-only, supports 2,000 chars, and does not support `output_script`; Natural will use `modern-colloquial` + `spoken-form-in-native`, Pure will use `formal` + `fully-native`, and English keeps its native Latin script. Reference: https://docs.sarvam.ai/api-reference/text/translate-text.
+- Implemented: Mayura now receives explicit style mode and native-script output values; inputs over 1,000 characters are split; Mayura failures fall back to formal-only `sarvam-translate:v1` with a warning log. Project style is stored, new dub and settings expose Natural/Pure choices, and style switching queues eligible clips with edit/lock/verification guards and asks for clip count, automatic warnings, and estimated credits first. Added a native-script advisory and Railway diagnostic script.
+- Focused validation: `python -m compileall -q backend scripts/check_translation_styles.py tests/test_translation_styles.py` passed; `python -m pytest tests/test_translation_styles.py tests/test_llm_client.py -q` passed (37 tests). `git diff --check` passed.
+- Final validation: `python -m pytest tests -q` passed (exit 0; only existing FastAPI lifecycle deprecation warnings). `cd frontend && npm run build` passed, including the API-prefix check, TypeScript, and Vite production build. The Railway diagnostic script was not run against live Sarvam because it makes billable network calls; no key or provider output was accessed.
+- Completed and committed: `4a0e29e` (will be finalized after recording the final hash); the changes include provider settings, project style switching, script advisory, Railway diagnostic, and mocked tests. Push `main` after amending this progress note with the final commit hash.
+- Decisions: keep translation requests clip-by-clip and below 1,000 characters; never retranslate edited, locked, or currently verified clips during a style switch. Never access `/data/voices` or the database file.
+
 ## Round 12: Mark verified
 
 ### Current status

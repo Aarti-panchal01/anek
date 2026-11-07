@@ -48,6 +48,7 @@ from backend.pipeline.phase3b import (
     MAX_ATEMPO_SPEEDUP, OVERRUN_TOLERANCE_S, prepare_language_retry_checkpoint, run_quality_pass,
 )
 from backend.pipeline.timing import schedule_language
+from backend.translation_style import eligible_style_switch_rows, style_switch_eligible
 
 settings = get_settings()
 LOGGER = logging.getLogger(__name__)
@@ -510,6 +511,12 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source_lang: str = "auto"
     target_langs: list[str]
+    translation_style: str = "natural"
+
+
+class TranslationStyleChange(BaseModel):
+    style: str
+    confirm: bool = False
 
 
 class AccessLogin(BaseModel):
@@ -550,7 +557,7 @@ class StartJob(BaseModel):
     voice_mode: str = "clone"
     stock_voice: str | None = None
     content_type: str = "explainer"
-    translation_style: str = "neutral"
+    translation_style: str = "natural"
 
 
 class StockVoicePreview(BaseModel):
@@ -1131,13 +1138,72 @@ async def create_project(body: ProjectCreate) -> dict:
         raise HTTPException(422, "Choose at least one enabled target language")
     if body.source_lang != "auto" and body.source_lang not in LANGUAGES:
         raise HTTPException(422, "Unsupported source language")
+    if body.translation_style not in {"natural", "pure"}:
+        raise HTTPException(422, "Translation style must be natural or pure")
     project_id = new_id()
     with db.connect() as connection:
         connection.execute(
-            "INSERT INTO projects(id,name,source_lang,target_langs_json) VALUES(?,?,?,?)",
-            (project_id, body.name, body.source_lang, json.dumps(body.target_langs)),
+            "INSERT INTO projects(id,name,source_lang,target_langs_json,translation_style) VALUES(?,?,?,?,?)",
+            (project_id, body.name, body.source_lang, json.dumps(body.target_langs), body.translation_style),
         )
-    return {"id": project_id, "name": body.name, "status": "created"}
+    return {"id": project_id, "name": body.name, "status": "created", "translation_style": body.translation_style}
+
+
+@app.post("/api/projects/{project_id}/translation-style/preview")
+async def preview_translation_style(project_id: str, body: TranslationStyleChange) -> dict:
+    project = project_row(project_id)
+    if body.style not in {"natural", "pure"}:
+        raise HTTPException(422, "Translation style must be natural or pure")
+    with db.connect() as connection:
+        rows = connection.execute(
+            "SELECT d.lang,d.human_edited,d.timing_locked,d.user_verified,d.status,d.reasons_json FROM clips c JOIN dubs d ON d.clip_id=c.id WHERE c.project_id=?",
+            (project_id,),
+        ).fetchall()
+        clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project_id,)).fetchone()[0]
+        latest = connection.execute(
+            "SELECT j.voice_id,j.content_type,j.voice_mode,j.stock_voice FROM jobs j LEFT JOIN voices v ON v.id=j.voice_id WHERE j.project_id=? AND ((j.voice_mode='clone' AND v.consent_ok=1) OR j.voice_mode='stock') ORDER BY j.rowid DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    eligible = eligible_style_switch_rows(rows)
+    warnings = sum(1 for row in eligible if row["status"] in {"yellow", "red"} or json.loads(row["reasons_json"] or "[]"))
+    credits = estimated_job_credits(float(project.get("duration_s") or 0) * len(eligible) / max(1, clip_count), 1)
+    return {"style": body.style, "current_style": project.get("translation_style") or "natural", "eligible_clips": len(eligible),
+            "automatic_warnings": warnings, "estimated_credits": credits, "can_change": bool(latest),
+            "languages": sorted({row["lang"] for row in eligible})}
+
+
+@app.post("/api/projects/{project_id}/translation-style", status_code=202)
+async def change_translation_style(request: Request, project_id: str, body: TranslationStyleChange, background: BackgroundTasks) -> dict:
+    enforce_ip_limit(request, "jobs")
+    preview = await preview_translation_style(project_id, body)
+    if not body.confirm:
+        raise HTTPException(409, {"error": "confirmation_required", **preview})
+    if not preview["can_change"]:
+        raise HTTPException(409, "A completed voice job is required before changing translation style")
+    if settings.max_credits_per_job and preview["estimated_credits"] > settings.max_credits_per_job:
+        raise HTTPException(429, f"Estimated style change cost {preview['estimated_credits']} exceeds the per-job safety cap")
+    with db.connect() as connection:
+        if connection.execute("SELECT 1 FROM jobs WHERE project_id=? AND state IN ('pending','running') LIMIT 1", (project_id,)).fetchone():
+            raise HTTPException(409, "Wait for the current project job to finish before changing style")
+        latest = connection.execute("SELECT * FROM jobs WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (project_id,)).fetchone()
+        used_today = connection.execute("SELECT COALESCE(SUM(est_credits),0) FROM credit_ledger WHERE date(created_at)=date('now')").fetchone()[0]
+        if used_today + preview["estimated_credits"] > settings.gnani_daily_limit:
+            raise HTTPException(429, "Daily Gnani safety cap reached; try again tomorrow")
+        rows = connection.execute("SELECT c.idx,d.lang,d.human_edited,d.timing_locked,d.user_verified FROM clips c JOIN dubs d ON d.clip_id=c.id WHERE c.project_id=?", (project_id,)).fetchall()
+        grouped: dict[str, list[int]] = {}
+        for row in rows:
+            if style_switch_eligible(row):
+                grouped.setdefault(row["lang"], []).append(int(row["idx"]))
+        job_id = new_id()
+        checkpoint = json.dumps({"style_clip_indices": grouped})
+        connection.execute(
+            "INSERT INTO jobs(id,project_id,kind,voice_id,content_type,translation_style,voice_mode,stock_voice,state,stage,total,checkpoint_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, project_id, "style_switch", latest["voice_id"], latest["content_type"], body.style, latest["voice_mode"], latest["stock_voice"], "pending", "queued", sum(map(len, grouped.values())), checkpoint),
+        )
+        connection.execute("UPDATE projects SET translation_style=?,status='processing' WHERE id=?", (body.style, project_id))
+        connection.execute("INSERT INTO credit_ledger(id,project_id,kind,units,est_credits) VALUES(?,?,?,?,?)", (new_id(), project_id, "translation-style-estimate", len(rows), preview["estimated_credits"]))
+    background.add_task(schedule_job, job_id)
+    return {"job_id": job_id, "state": "pending", **preview}
 
 
 @app.put("/api/projects/{project_id}/video")
@@ -2082,6 +2148,7 @@ async def run_job(job_id: str) -> None:
 
     try:
         targeted_clip_index = None
+        targeted_style_indices: dict[str, list[int]] = checkpoint_state.get("style_clip_indices", {})
         translation_override = None
         preserve_translation = False
         if job["kind"] == "regenerate_clip":
@@ -2123,7 +2190,7 @@ async def run_job(job_id: str) -> None:
         seed_terms = project_terms + global_terms
         pending_targets = [
             lang for lang in targets
-            if job["kind"] in {"regenerate", "regenerate_clip"}
+            if job["kind"] in {"regenerate", "regenerate_clip", "style_switch"}
             or lang not in completed
             or not list(output_dir.glob(f"*_{lang}*.json"))
         ]
@@ -2154,16 +2221,29 @@ async def run_job(job_id: str) -> None:
                             checkpoint_state, target_lang,
                             {int(row["idx"]): row["translation"] for row in saved_rows},
                         )
-                    language_results = await asyncio.to_thread(
-                        run_quality_pass,
-                        Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, [target_lang],
-                        output_dir, settings, job["content_type"], job["translation_style"], embedding,
-                        project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
-                        only_clip_index=targeted_clip_index, translation_override=translation_override,
-                        preserve_translation=preserve_translation, resume_state=checkpoint_state,
-                        checkpoint_callback=save_checkpoint, continue_check=check_continue,
-                    )
-                    results.extend(language_results)
+                    style_indices = targeted_style_indices.get(target_lang) if job["kind"] == "style_switch" else None
+                    clip_indices = style_indices if style_indices is not None else [targeted_clip_index]
+                    for clip_index in clip_indices:
+                        if job["kind"] == "style_switch":
+                            with db.connect() as connection:
+                                current = connection.execute(
+                                    "SELECT d.human_edited,d.timing_locked,d.user_verified FROM clips c JOIN dubs d ON d.clip_id=c.id WHERE c.project_id=? AND c.idx=? AND d.lang=?",
+                                    (project["id"], clip_index, target_lang),
+                                ).fetchone()
+                            if not current or not style_switch_eligible(current):
+                                continue
+                            checkpoint_state.get("translations", {}).get(target_lang, {}).pop(str(clip_index), None)
+                            checkpoint_state.get("clips", {}).get(target_lang, {}).pop(str(clip_index), None)
+                        language_results = await asyncio.to_thread(
+                            run_quality_pass,
+                            Path(project["video_path"]), Path(voice["reference_path"]) if voice else None, [target_lang],
+                            output_dir, settings, job["content_type"], job["translation_style"], embedding,
+                            project["source_lang"], seed_terms, job["stock_voice"] if job["voice_mode"] == "stock" else None,
+                            only_clip_index=clip_index, translation_override=translation_override,
+                            preserve_translation=preserve_translation, resume_state=checkpoint_state,
+                            checkpoint_callback=save_checkpoint, continue_check=check_continue,
+                        )
+                        results.extend(language_results)
                     language_errors.pop(target_lang, None)
                 except JobInterrupted:
                     raise
@@ -2187,6 +2267,8 @@ async def run_job(job_id: str) -> None:
                                 (new_id(), project["id"], term["term"], term["type"], term["treatment"], int(term["locked"]), json.dumps(term["targets"], ensure_ascii=False), "brain", term.get("rule_type", "protected"), json.dumps(term.get("heard_variants", []), ensure_ascii=False), json.dumps(term.get("spoken_forms", {}), ensure_ascii=False)),
                             )
                     for clip in result["clips"]:
+                        if job["kind"] == "style_switch" and int(clip["clip"]) - 1 not in targeted_style_indices.get(lang, []):
+                            continue
                         row = connection.execute("SELECT id FROM clips WHERE project_id=? AND idx=?", (project["id"], clip["clip"]-1)).fetchone()
                         clip_id = row["id"] if row else new_id()
                         if not row:
@@ -2233,6 +2315,8 @@ async def start_job(request: Request, project_id: str, body: StartJob, backgroun
         raise HTTPException(409, "Upload a video first")
     if body.voice_mode not in {"clone", "stock"}:
         raise HTTPException(422, "Choose clone or stock voice mode")
+    if body.translation_style not in {"natural", "pure"}:
+        raise HTTPException(422, "Translation style must be natural or pure")
     if body.voice_mode == "stock" and body.stock_voice not in STOCK_VOICES:
         raise HTTPException(422, "Choose an available Timbre stock voice")
     with db.connect() as connection:
@@ -2249,6 +2333,7 @@ async def start_job(request: Request, project_id: str, body: StartJob, backgroun
         job_id = new_id()
         connection.execute("INSERT INTO jobs(id,project_id,kind,voice_id,content_type,translation_style,voice_mode,stock_voice,state,stage,total) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (job_id, project_id, "dub", body.voice_id if body.voice_mode == "clone" else None, body.content_type, body.translation_style, body.voice_mode, body.stock_voice if body.voice_mode == "stock" else None, "pending", "queued", len(json.loads(project["target_langs_json"]))))
         connection.execute("UPDATE projects SET status='processing' WHERE id=?", (project_id,))
+        connection.execute("UPDATE projects SET translation_style=? WHERE id=?", (body.translation_style, project_id))
         connection.execute("INSERT INTO credit_ledger(id,project_id,kind,units,est_credits) VALUES(?,?,?,?,?)", (new_id(), project_id, "dub-job-estimate", 1, credits))
     background.add_task(schedule_job, job_id)
     return {"job_id": job_id, "state": "pending"}

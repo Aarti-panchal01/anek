@@ -19,7 +19,7 @@ LOGGER = logging.getLogger(__name__)
 
 from backend.atomic_files import atomic_copyfile, atomic_write_bytes, atomic_write_text, run_atomic_command
 
-from backend.brain.checks import run_checks
+from backend.brain.checks import latin_letter_share, run_checks
 from backend.brain.termsheet import (
     TermSheet, apply_mishearing_maps, apply_spoken_forms, extract_termsheet,
     mask_protected_terms, restore_protected_terms,
@@ -48,6 +48,10 @@ SENTENCE_ENDINGS = r".!?।॥。！？؟։"
 
 def translation_style_instruction(style: str, target_lang: str) -> str:
     """Keep everyday translation in the target language unless English is requested."""
+    if style == "pure":
+        return "Use formal spoken phrasing and native script. Translate ordinary English loanwords into natural target-script spellings. Preserve approved brand/person names and terms from the term sheet exactly as instructed."
+    if style == "natural":
+        return "Use modern-colloquial spoken phrasing in the target script. Render English loanwords in the target script where natural; preserve approved brand/person names and terms from the term sheet exactly as instructed."
     if style == "keep_technical":
         return "Translate ordinary words and place names into the target language; keep only established technical terms and approved brand/person names in English."
     if style == "formal":
@@ -368,6 +372,8 @@ def translation_candidates(
     duration_budget: dict | None = None,
 ) -> list[str]:
     tone = {
+        "pure": "clear formal spoken register",
+        "natural": "modern-colloquial spoken target-language speech",
         "formal": "clear, respectful formal spoken register",
         "colloquial": "everyday casual spoken language",
         "marketing": "energetic and persuasive spoken language",
@@ -381,6 +387,7 @@ def translation_candidates(
             "target_language": target_lang,
             "content_type": content_type,
             "tone": tone,
+            "translation_style": translation_style,
             "translation_style_instruction": style_instruction,
             "max_chars": max_chars,
             "terms": terms.model_dump(),
@@ -448,6 +455,8 @@ def paragraph_translation_candidates(
 ) -> list[list[str]]:
     """Translate the complete transcript in one context-rich request, preserving timed spans."""
     tone = {
+        "pure": "clear formal spoken register",
+        "natural": "modern-colloquial spoken target-language speech",
         "formal": "clear, respectful spoken register",
         "colloquial": "everyday casual spoken language",
         "marketing": "energetic and persuasive spoken language",
@@ -460,6 +469,7 @@ def paragraph_translation_candidates(
         "target_language": target_lang,
         "content_type": content_type,
         "tone": tone,
+        "translation_style": translation_style,
         "translation_style_instruction": style_instruction,
         "term_sheet": terms.model_dump(),
         "full_source_paragraph": " ".join(row["cleaned"] for row in rows),
@@ -1231,6 +1241,10 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     meaning = {"back_translation": "", "meaning_preserved": None}
                     meaning_check_failed = True
                 reasons = list(audio_flag["reasons"])
+                if translation_style == "natural":
+                    latin_share = latin_letter_share(selected, target_lang, clip_terms)
+                    if latin_share >= 0.05:
+                        reasons.append(f"Native-script advisory: {latin_share:.1%} of unprotected letters are Latin.")
                 if translation_checks:
                     reasons.append("Translation checks flagged this clip; edit and review it before approval.")
                 if protected_missing:

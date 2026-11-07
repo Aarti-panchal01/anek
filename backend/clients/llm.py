@@ -132,6 +132,21 @@ class MockLLMClient:
         return {"ok": True, "mock": True}
 
 
+def _split_at_character_limit(text: str, limit: int) -> list[str]:
+    """Split provider input without losing text, preferring whitespace boundaries."""
+    remaining = text.strip()
+    parts: list[str] = []
+    while len(remaining) > limit:
+        cut = remaining.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts or [""]
+
+
 class SarvamTranslationClient:
     """Sarvam Translate/Mayura for translations and Sarvam chat for structured QA."""
 
@@ -178,32 +193,54 @@ class SarvamTranslationClient:
             target = payload.get("target_language")
             if target not in LANGUAGES:
                 raise UnsupportedLanguageError(f"Unsupported target language: {target}")
+            style = str(payload.get("translation_style", "natural")).casefold()
             tone = str(payload.get("tone", "")).casefold()
-            mode = "classic-colloquial" if "respectful" in tone else "modern-colloquial"
+            mode = "formal" if style == "pure" else ("classic-colloquial" if "respectful" in tone else "modern-colloquial")
             if self.translation_model == "sarvam-translate:v1":
                 mode = "formal"
+            output_script = "fully-native" if style == "pure" else "spoken-form-in-native"
             translations = []
+            used_models: list[str] = []
             for span in spans:
                 source_language = payload.get("source_language") or "auto"
                 if source_language == target:
                     translations.append(str(span.get("source_text", "")).strip())
                     continue
                 try:
-                    result = _provider_call(lambda span=span: self.client.text.translate(
-                        input=span["source_text"],
-                        source_language_code=source_language,
-                        target_language_code=target,
-                        model=self.translation_model,
-                        mode=mode,
-                        request_options={"timeout_in_seconds": 60, "max_retries": 0},
-                    ))
+                    source_parts = _split_at_character_limit(str(span.get("source_text", "")), 1000)
+                    translated_parts = []
+                    for source_part in source_parts:
+                        translate_options = dict(
+                            input=source_part,
+                            source_language_code=source_language,
+                            target_language_code=target,
+                            model=self.translation_model,
+                            mode=mode,
+                            request_options={"timeout_in_seconds": 60, "max_retries": 0},
+                        )
+                        if self.translation_model == "mayura:v1" and target != "en-IN":
+                            translate_options["output_script"] = output_script
+                        try:
+                            result = _provider_call(lambda: self.client.text.translate(**translate_options))
+                        except ProviderError:
+                            if self.translation_model != "mayura:v1":
+                                raise
+                            translate_options.update(model="sarvam-translate:v1", mode="formal")
+                            translate_options.pop("output_script", None)
+                            LOGGER.warning("Mayura translation failed; using sarvam-translate:v1 formal fallback")
+                            # A failed Mayura request opens its circuit. The separately
+                            # configured formal fallback is still attempted once.
+                            result = self.client.text.translate(**translate_options)
+                        translated = getattr(result, "translated_text", None)
+                        if not isinstance(translated, str) or not translated.strip():
+                            raise ProviderError("Sarvam translation returned no text")
+                        translated_parts.append(translated.strip())
+                        if translate_options["model"] not in used_models:
+                            used_models.append(translate_options["model"])
                 except ProviderError:
                     raise
-                translated = getattr(result, "translated_text", None)
-                if not isinstance(translated, str) or not translated.strip():
-                    raise ProviderError("Sarvam translation returned no text")
-                translations.append(translated.strip())
-            self.models_used.append(self.translation_model)
+                translations.append(" ".join(translated_parts))
+            self.models_used.extend(model for model in used_models if model not in self.models_used)
             return {"candidates": [{"translations": translations, "review_notes": []} for _ in range(3)]}
         return self._chat_json(messages)
 

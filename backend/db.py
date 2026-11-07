@@ -29,7 +29,8 @@ def initialize() -> None:
     CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, source_lang TEXT NOT NULL,
       target_langs_json TEXT NOT NULL, video_path TEXT, duration_s REAL,
-      status TEXT NOT NULL DEFAULT 'created', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      status TEXT NOT NULL DEFAULT 'created', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      translation_style TEXT NOT NULL DEFAULT 'natural'
     );
     CREATE TABLE IF NOT EXISTS voices (
       id TEXT PRIMARY KEY, session_id TEXT NOT NULL, label TEXT NOT NULL,
@@ -103,6 +104,7 @@ def initialize() -> None:
         db.executescript(schema)
         project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
         for name, definition in (
+            ("translation_style", "TEXT NOT NULL DEFAULT 'natural'"),
             ("original_video_path", "TEXT"),
             ("preview_path", "TEXT"),
             ("preview_status", "TEXT NOT NULL DEFAULT 'pending'"),
