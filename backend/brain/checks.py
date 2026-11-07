@@ -23,6 +23,21 @@ def _is_target_script(char: str, lang: str) -> bool:
     return script_range is not None and script_range[0] <= ord(char) <= script_range[1]
 
 
+_TERM_ALIASES = {
+    "india": {"hi-IN": ("भारत", "इंडिया"), "kn-IN": ("ಭಾರತ", "ಇಂಡಿಯಾ")},
+    "hemisphere": {
+        "hi-IN": ("गोलार्ध", "हेमिस्फीयर", "हेमिस्फियर"),
+        "kn-IN": ("ಗೋಳಾರ್ಧ", "ಅರ್ಧಗೋಳ", "ಹೆಮಿಸ್ಫಿಯರ್"),
+    },
+}
+
+
+def _contains_term(translation: str, expected: str, canonical: str, target_lang: str) -> bool:
+    haystack = re.sub(r"[^\w]", "", translation.casefold(), flags=re.UNICODE)
+    candidates = (expected, canonical, *_TERM_ALIASES.get(canonical.casefold(), {}).get(target_lang, ()))
+    return any(re.sub(r"[^\w]", "", candidate.casefold(), flags=re.UNICODE) in haystack for candidate in candidates if candidate)
+
+
 def run_checks(
     source: str,
     translation: str,
@@ -39,11 +54,11 @@ def run_checks(
         for term in sheet.terms:
             expected = term.targets.get(target_lang, term.term)
             if term.locked or term.treatment == "keep":
-                if expected not in translation:
+                if not _contains_term(translation, expected, term.term, target_lang):
                     failures.append({"check": "term_missing", "detail": expected})
-            elif term.treatment == "transliterate" and expected not in translation:
+            elif term.treatment == "transliterate" and not _contains_term(translation, expected, term.term, target_lang):
                 failures.append({"check": "term_form_missing", "detail": expected})
-            elif term.treatment == "translate" and term.targets.get(target_lang) and expected not in translation:
+            elif term.treatment == "translate" and term.targets.get(target_lang) and not _contains_term(translation, expected, term.term, target_lang):
                 failures.append({"check": "term_translation_missing", "detail": expected})
     if target_lang != "en-IN" and translation:
         script_text = translation

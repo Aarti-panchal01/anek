@@ -1,5 +1,20 @@
 # Autonomous run progress
 
+## Round 12: Mark verified
+
+### Current status
+
+- Current task: Round 12 complete; validate, commit, and push the tested verification fix.
+- Required validation before the single push: `python -m pytest tests -q` and `cd frontend && npm run build`.
+- Reproduction finding: local Playwright showed a browser exception, `p.verify is not a function`, because `ReviewPage` did not pass `verify` and `unverify` callbacks into `ClipRow`; clicking the button sent no request and displayed no user-facing error. Therefore the direct cause was a missing UI callback (with a silent browser-side failure), not automatic rejection or a provider/audio check. Separately, the endpoint response did not include the updated clip/counts, and Balance timing cleared approval for any nonzero move. A backend test exposed the response contract gap; the corrected small-move fixture passes.
+- Completed implementation: persist `auto_status` separately from user approval; only a matching text/take/rounded-placement fingerprint counts as Verified; verification returns the updated clip and counts without provider/audio checks; edits clear approval, small balance moves retain it and large moves report cleared clips. Added optimistic UI updates, explicit Undo, Verify all confirmation, advisory check display, and Hindi/Kannada number/name transliteration coverage.
+- Reproduction: the browser raised `p.verify is not a function`; the callback was missing from the `ClipRow` props, so clicking Mark verified sent no request. The automatic-flag warning also remained visible after approval because the API did not return the effective user-approved clip state, while Balance timing invalidated approval on any move.
+- Final local Playwright: with mock providers and a temporary data directory, verified Hindi clips 2, 1, and 3 sequentially. Each request was POST with `{confirm_override:false,note:null}` and returned HTTP 200 with the updated clip and counts. UI reached 3 verified, persisted after reload and Balance timing, and opened export with no warning (export endpoints were mocked; a real artifact was not generated in this UI check).
+- Final backend validation: `python -m pytest tests -q` passed (all tests; four existing FastAPI lifecycle deprecation warnings).
+- Final frontend validation: `cd frontend && npm run build` passed (API-prefix check, TypeScript, Vite production build). The build updates the tracked frontend bundle under `backend/static`.
+- Next: commit this completed Round 12 change set and push `main` once.
+- Decisions: keep automatic checks advisory after a human approval; do not alter translation, timing scheduling, or TTS generation except to preserve approval across sub-0.5-second balance moves. Never touch `/data/voices` or the database file.
+
 ## Completed work before Round 5
 
 - Provider swap: `20eb6a5`.

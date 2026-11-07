@@ -10,6 +10,23 @@ from fastapi.testclient import TestClient
 from backend import db
 from backend import app as app_module
 from backend.pipeline import phase3b
+from backend.brain.checks import run_checks
+from backend.brain.numbers import compare_numbers
+
+
+@pytest.mark.parametrize("lang,translation", [
+    ("hi-IN", "तो हमने दो चीज़ें study की हैं। इंडिया northeastern हेमिस्फीयर में स्थित है, उसके साथ ही,"),
+    ("kn-IN", "ನಾವು ಎರಡು ವಿಷಯಗಳನ್ನು ಅಧ್ಯಯನ ಮಾಡಿದ್ದೇವೆ. ಇಂಡಿಯಾ ಈಶಾನ್ಯ ಗೋಳಾರ್ಧದಲ್ಲಿದೆ, ಅದರೊಂದಿಗೆ,"),
+])
+def test_number_and_name_checks_accept_script_transliterations(lang, translation):
+    source = "So we have studied two things. India is located on the northeastern hemisphere, along with it,"
+    terms = {"terms": [
+        {"term": "India", "type": "place", "treatment": "keep", "locked": True},
+        {"term": "hemisphere", "type": "jargon", "treatment": "keep", "locked": True},
+    ]}
+    failures = run_checks(source, translation, lang, terms)
+    assert not [failure for failure in failures if failure["check"] in {"number_missing", "term_missing"}]
+    assert compare_numbers(source, translation) == []
 
 
 @contextmanager
@@ -840,6 +857,12 @@ def test_user_can_verify_a_saved_audio_take(monkeypatch):
         _project_with_review_audio(data_root)
         result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
         assert result["human_verified"] is True
+        assert result["clip"]["user_verified"] is True
+        assert result["clip"]["status"] == "green"
+        assert result["clip"]["verified_at"]
+        assert result["clip"]["auto_status"] == "yellow"
+        assert result["counts"]["green"] == 1
+        assert result["counts"]["yellow"] == 0
         with db.connect() as connection:
             row = connection.execute("SELECT status,reasons_json FROM dubs WHERE id='review-dub-1'").fetchone()
         assert row["status"] == "yellow"
@@ -861,6 +884,109 @@ def test_human_verification_updates_clip_and_project_counts_and_can_be_undone(mo
         clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
         assert clips[0]["status"] == "yellow"
         assert clips[0]["user_verified"] is False
+
+
+def test_verify_decision_returns_updated_clip_and_counts_even_with_automatic_flags(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE dubs SET reasons_json=? WHERE id=?",
+                (json.dumps(["A number or name may be missing."]), "review-dub-1"),
+            )
+        client = TestClient(app_module.app)
+        response = client.post("/api/clips/review-clip-1/dubs/hi-IN/verify")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["clip"]["status"] == "green"
+        assert payload["clip"]["user_verified"] is True
+        assert payload["clip"]["auto_status"] == "yellow"
+        assert payload["counts"]["green"] == 1
+        assert payload["counts"]["yellow"] == 0
+        assert payload["human_verified"] is True
+
+
+def test_user_verification_survives_small_balance_timing_move(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        client = TestClient(app_module.app)
+        assert client.post("/api/clips/review-clip-1/dubs/hi-IN/verify").status_code == 200
+        monkeypatch.setattr(
+            app_module,
+            "schedule_language",
+            lambda rows, duration, **kwargs: {
+                "valid": True,
+                "placements": [{"id": "review-clip-1", "start_s": 0.2, "end_s": 2.0, "timing_offset_s": 0.2, "speedup": 1.0}],
+                "errors": [],
+            },
+        )
+        monkeypatch.setattr(app_module, "_render_scheduled_track", lambda *args, **kwargs: data_root / "track.wav")
+        balanced = _resolve(app_module.balance_project_timing(project["id"], app_module.BalanceRequest(lang="hi-IN")))
+        assert balanced["valid"] is True
+        refreshed = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN").json()[0]
+        assert refreshed["user_verified"] is True
+        assert refreshed["status"] == "green"
+        assert balanced["verification_cleared_clips"] == []
+
+
+def test_user_verification_clears_after_large_balance_move(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        client = TestClient(app_module.app)
+        assert client.post("/api/clips/review-clip-1/dubs/hi-IN/verify").status_code == 200
+        monkeypatch.setattr(app_module, "schedule_language", lambda rows, duration, **kwargs: {
+            "valid": True,
+            "placements": [{"id": "review-clip-1", "start_s": 0.6, "end_s": 2.0, "timing_offset_s": 0.6, "speedup": 1.0}],
+            "errors": [],
+        })
+        monkeypatch.setattr(app_module, "_render_scheduled_track", lambda *args, **kwargs: data_root / "track.wav")
+        result = _resolve(app_module.balance_project_timing(project["id"], app_module.BalanceRequest(lang="hi-IN")))
+        assert result["verification_cleared_clips"] == ["review-clip-1"]
+        clip = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN").json()[0]
+        assert clip["user_verified"] is False
+
+
+def test_user_verification_clears_when_translation_changes(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        _project_with_review_audio(data_root)
+        client = TestClient(app_module.app)
+        assert client.post("/api/clips/review-clip-1/dubs/hi-IN/verify").status_code == 200
+        edited = client.patch("/api/clips/review-clip-1/dubs/hi-IN", json={"translation": "बदला हुआ अनुवाद"})
+        assert edited.status_code == 200
+        # The edit response intentionally stays compact; query through the fixture's project id.
+        with db.connect() as connection:
+            project_id = connection.execute("SELECT project_id FROM clips WHERE id='review-clip-1'").fetchone()[0]
+        clip = client.get(f"/api/projects/{project_id}/clips?lang=hi-IN").json()[0]
+        assert clip["user_verified"] is False
+        assert clip["status"] != "green"
+        assert clip["reason_text"] == "Text changed, verify again."
+
+
+def test_changing_selected_take_invalidates_user_verification(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        client = TestClient(app_module.app)
+        assert client.post("/api/clips/review-clip-1/dubs/hi-IN/verify").status_code == 200
+        with db.connect() as connection:
+            connection.execute("UPDATE dubs SET selected_take_id='new-take' WHERE id='review-dub-1'")
+        clip = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN").json()[0]
+        assert clip["user_verified"] is False
+        assert clip["status"] == "yellow"
+
+
+def test_red_fit_requires_explicit_verify_anyway_override(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute("UPDATE dubs SET status='red',auto_status='red',reasons_json=? WHERE id='review-dub-1'", (json.dumps(["Speech still overlaps the next clip; withheld"]),))
+        client = TestClient(app_module.app)
+        blocked = client.post("/api/clips/review-clip-1/dubs/hi-IN/verify")
+        assert blocked.status_code == 409
+        approved = client.post("/api/clips/review-clip-1/dubs/hi-IN/verify", json={"confirm_override": True})
+        assert approved.status_code == 200
+        assert approved.json()["clip"]["status"] == "green"
+        assert approved.json()["clip"]["verify_override"] is True
+        assert approved.json()["verify_override_note"]
 
 
 def test_human_verification_survives_preview_artifact_rebuild(monkeypatch):
@@ -948,7 +1074,7 @@ def test_manual_verification_uses_dubbed_video_when_audio_artifacts_are_missing(
         assert after["user_verified"] is True
 
 
-def test_manual_verification_overrides_automatic_flags_without_confirmation(monkeypatch):
+def test_manual_verification_ignores_advisory_automatic_flags(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root)
         with db.connect() as connection:
@@ -957,7 +1083,7 @@ def test_manual_verification_overrides_automatic_flags_without_confirmation(monk
         response = client.post("/api/clips/review-clip-1/dubs/hi-IN/verify")
         assert response.status_code == 200
         assert response.json()["human_verified"] is True
-        assert response.json()["verify_override"] is True
+        assert response.json()["verify_override"] is False
         refreshed = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN")
         assert refreshed.status_code == 200
         assert refreshed.json()[0]["status"] == "green"

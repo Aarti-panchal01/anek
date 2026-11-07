@@ -533,6 +533,7 @@ class DubEdit(BaseModel):
 
 class VerifyDecision(BaseModel):
     confirm_override: bool = False
+    note: str | None = None
 
 
 class BalanceRequest(BaseModel):
@@ -608,12 +609,14 @@ def term_row_payload(row) -> dict:
 
 
 def persist_generated_dub(connection, clip_id: str, lang: str, clip: dict) -> None:
+    dub_id = new_id()
+    take_id = new_id()
     connection.execute(
-        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,attempts_json,audio_path,duration_s,audio_stale,user_verified,verified_fingerprint,verify_override) VALUES(?,?,?,?,?,?,?,?,?,?,0,0,NULL,0) "
-        "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=CASE WHEN dubs.human_edited=1 THEN dubs.translation ELSE excluded.translation END,draft_translation=CASE WHEN dubs.human_edited=1 THEN dubs.draft_translation ELSE excluded.draft_translation END,status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,audio_path=excluded.audio_path,duration_s=excluded.duration_s,audio_stale=0,user_verified=0,verified_fingerprint=NULL,verify_override=0,updated_at=CURRENT_TIMESTAMP",
-        (new_id(), clip_id, lang, clip["translation"], clip["translation"], clip["status"],
+        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,auto_status,reasons_json,attempts_json,audio_path,duration_s,audio_stale,user_verified,verified_fingerprint,verified_at,verify_override,verify_override_note,selected_take_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0,NULL,NULL,0,NULL,?) "
+        "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=CASE WHEN dubs.human_edited=1 THEN dubs.translation ELSE excluded.translation END,draft_translation=CASE WHEN dubs.human_edited=1 THEN dubs.draft_translation ELSE excluded.draft_translation END,status=excluded.status,auto_status=excluded.status,reasons_json=excluded.reasons_json,attempts_json=excluded.attempts_json,audio_path=excluded.audio_path,duration_s=excluded.duration_s,audio_stale=0,user_verified=0,verified_fingerprint=NULL,verified_at=NULL,verify_override=0,verify_override_note=NULL,selected_take_id=excluded.selected_take_id,updated_at=CURRENT_TIMESTAMP",
+        (dub_id, clip_id, lang, clip["translation"], clip["translation"], clip["status"], clip["status"],
          json.dumps(clip["reasons"], ensure_ascii=False), json.dumps(clip.get("translation_synthesis_attempts", [])),
-         str(clip["audio_path"]), clip.get("final_audio_duration_s")),
+         str(clip["audio_path"]), clip.get("final_audio_duration_s"), take_id),
     )
 
 
@@ -625,22 +628,16 @@ def project_row(project_id: str):
     return dict(result)
 
 
-def verification_fingerprint(row: dict | object, audio_path: Path) -> str:
-    """Bind a human decision to the exact text, take, placement and fit settings."""
-    path = Path(audio_path)
-    stat = path.stat()
+def verification_fingerprint(row: dict | object) -> str:
+    """Bind approval only to its text, selected take, and coarse timeline placement."""
+    offset = float(row["timing_offset_s"] or 0)
+    keys = set(row.keys())
+    take_id = (row["selected_take_id"] if "selected_take_id" in keys else None) or (row["dub_id"] if "dub_id" in keys else row["id"])
     value = {
         "translation": row["translation"],
-        "take_id": row["id"],
-        "audio_size": stat.st_size,
-        "audio_mtime_ns": stat.st_mtime_ns,
-        "duration_s": round(float(row["duration_s"] or 0), 6),
-        "start_s": round(float(row["start_s"]), 6),
-        "end_s": round(float(row["end_s"]), 6),
-        "timing_offset_s": round(float(row["timing_offset_s"] or 0), 6),
-        "fit_tolerance": float(settings.fit_tolerance),
-        "max_stretch": float(settings.max_stretch),
-        "speedup_cap": float(MAX_ATEMPO_SPEEDUP),
+        "take_id": take_id,
+        "start_s": round(float(row["start_s"]) + offset, 1),
+        "end_s": round(float(row["end_s"]) + offset, 1),
     }
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -929,7 +926,7 @@ async def project_summary(project_id: str) -> dict:
     with db.connect() as connection:
         clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project_id,)).fetchone()[0]
         count_rows = connection.execute(
-            "SELECT c.start_s,c.end_s,d.id,d.lang,d.status,d.translation,d.audio_path,d.duration_s,d.audio_stale,d.user_verified,d.verified_fingerprint,d.verify_override,d.timing_offset_s "
+            "SELECT c.start_s,c.end_s,d.id,d.lang,d.status,d.auto_status,d.translation,d.selected_take_id,d.audio_path,d.duration_s,d.audio_stale,d.user_verified,d.verified_fingerprint,d.verified_at,d.verify_override,d.verify_override_note,d.timing_offset_s "
             "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id WHERE c.project_id=?", (project_id,),
         ).fetchall()
         jobs = connection.execute(
@@ -946,13 +943,14 @@ async def project_summary(project_id: str) -> dict:
     checkpoint = json.loads(checkpoint_row["checkpoint_json"] or "{}") if checkpoint_row else {}
     counts = {"total": int(clip_count), "green": 0, "yellow": 0, "red": 0}
     for count_row in count_rows:
-        status = count_row["status"] or "pending"
-        audio = verification_audio_path(project_id, count_row["lang"], count_row["audio_path"])
-        # Approval is a user decision. Editing the translation, replacing its
-        # audio, or changing its timing explicitly clears user_verified in the
-        # corresponding write path; filesystem mtimes must not revoke it.
-        if count_row["user_verified"] and audio and audio.is_file() and not count_row["audio_stale"]:
+        status = count_row["auto_status"] or count_row["status"] or "pending"
+        # Approval is a user decision tied to text, selected take and placement.
+        # Media rebuilds and file mtimes do not alter that fingerprint.
+        if count_row["user_verified"] and count_row["verified_fingerprint"] == verification_fingerprint(count_row):
             status = "green"
+        elif status == "green":
+            # Machine checks are advisory; only an explicit user decision is Verified.
+            status = "yellow"
         if status not in {"green", "yellow", "red"}:
             status = "yellow"
         counts[status] += 1
@@ -1654,7 +1652,7 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
     project_row(project_id)
     with db.connect() as connection:
         rows = connection.execute(
-        "SELECT c.*,d.id AS dub_id,d.translation,d.draft_translation,d.status,d.reasons_json,d.attempts_json,d.audio_path,d.audio_stale,d.human_edited,d.user_verified,d.verified_fingerprint,d.verify_override,d.timing_offset_s,d.timing_locked,d.duration_s AS dub_duration_s "
+        "SELECT c.*,d.id AS dub_id,d.selected_take_id,d.translation,d.draft_translation,d.status,d.auto_status,d.reasons_json,d.attempts_json,d.audio_path,d.audio_stale,d.human_edited,d.user_verified,d.verified_fingerprint,d.verified_at,d.verify_override,d.verify_override_note,d.timing_offset_s,d.timing_locked,d.duration_s AS dub_duration_s "
             "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
             (lang, project_id),
         ).fetchall()
@@ -1669,7 +1667,7 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
     result = []
     for row in rows:
         item = dict(row)
-        automatic_status = item.get("status") or "pending"
+        automatic_status = item.get("auto_status") or item.get("status") or "pending"
         audio_path = item.pop("audio_path", None)
         audio_present = bool(audio_path and Path(audio_path).is_file())
         audio_version = Path(audio_path).stat().st_mtime_ns if audio_present else ""
@@ -1680,11 +1678,12 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         item["timeline_start_s"] = float(item["start_s"]) + float(item.get("timing_offset_s") or 0)
         item["timing_locked"] = bool(item.get("timing_locked", False))
         item["audio_removed"] = bool(audio_path and not audio_present)
-        verified = bool(item.get("user_verified") and verification_audio and not item["audio_stale"])
+        verified = bool(item.get("user_verified") and item.get("verified_fingerprint") == verification_fingerprint(item))
         item["automatic_status"] = automatic_status
         item["user_verified"] = verified
         item["verify_override"] = bool(verified and item.get("verify_override"))
-        item["status"] = "green" if verified else automatic_status
+        item["verified_at"] = item.get("verified_at") if verified else None
+        item["status"] = "green" if verified else ("yellow" if automatic_status == "green" else automatic_status)
         item["status"] = "yellow" if item["status"] == "pending" else item["status"]
         attempts = json.loads(row["attempts_json"] or "[]")
         attempt_root = (DATA_ROOT / "exports" / project_id).resolve()
@@ -1714,7 +1713,9 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         )
         reason_texts = item["reasons"]
         reason_blob = " ".join(reason_texts).casefold()
-        if "withheld" in reason_blob or "exceeds its safe slot" in reason_blob or "slot" in reason_blob and "speech" in reason_blob:
+        if "text changed" in reason_blob:
+            reason_code, reason_text, fix_action = "text_changed", "Text changed, verify again.", "Re-speak this clip"
+        elif "withheld" in reason_blob or "exceeds its safe slot" in reason_blob or "slot" in reason_blob and "speech" in reason_blob:
             reason_code, reason_text, fix_action = "too_long_for_slot", "Speech is too long for its time slot.", "Shorten the translation"
         elif "number" in reason_blob or "name" in reason_blob or "term missing" in reason_blob:
             reason_code, reason_text, fix_action = "number_or_name_missing", "A number or name may be missing.", "Check the translation"
@@ -1725,7 +1726,9 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         elif "meaning" in reason_blob:
             reason_code, reason_text, fix_action = "source_looks_wrong", "The source meaning needs review.", "Fix the source text"
         else:
-            reason_code, reason_text, fix_action = "review_needed", "This clip needs a quick review.", "Review this clip"
+            reason_code = "review_needed"
+            reason_text = "" if automatic_status == "green" else "This clip needs a quick review."
+            fix_action = "" if automatic_status == "green" else "Review this clip"
         item.update({"reason_code": reason_code, "reason_text": reason_text, "fix_action": fix_action})
         item.pop("attempts_json", None)
         item.pop("reasons_json", None)
@@ -1788,6 +1791,7 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
     checks = run_checks(clip["src_text"], body.translation, lang, sheet)
     reasons = [f"{item['check']}: {item['detail']}" for item in checks]
     status = "red" if checks else "yellow"
+    reasons.append("Text changed; verify again.")
     with db.connect() as connection:
         existing = connection.execute("SELECT draft_translation,translation,status,reasons_json,human_edited,audio_stale FROM dubs WHERE clip_id=? AND lang=?", (clip_id, lang)).fetchone()
         if existing and existing["translation"] == body.translation:
@@ -1795,44 +1799,40 @@ async def edit_dub(clip_id: str, lang: str, body: DubEdit) -> dict:
                     "human_edited": bool(existing["human_edited"]), "audio_stale": bool(existing["audio_stale"])}
         draft_translation = (existing["draft_translation"] or existing["translation"]) if existing else body.translation
         connection.execute(
-        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,reasons_json,human_edited,audio_path,duration_s,audio_stale) VALUES(?,?,?,?,?,?,?,1,NULL,NULL,1) "
-            "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,reasons_json=excluded.reasons_json,human_edited=1,audio_stale=1,user_verified=0,verified_fingerprint=NULL,verify_override=0,updated_at=CURRENT_TIMESTAMP",
-            (new_id(), clip_id, lang, body.translation, draft_translation, status, json.dumps(reasons, ensure_ascii=False)),
+        "INSERT INTO dubs(id,clip_id,lang,translation,draft_translation,status,auto_status,reasons_json,human_edited,audio_path,duration_s,audio_stale) VALUES(?,?,?,?,?,?,?,?,1,NULL,NULL,1) "
+            "ON CONFLICT(clip_id,lang) DO UPDATE SET translation=excluded.translation,status=excluded.status,auto_status=excluded.status,reasons_json=excluded.reasons_json,human_edited=1,audio_stale=1,user_verified=0,verified_fingerprint=NULL,verified_at=NULL,verify_override=0,verify_override_note=NULL,updated_at=CURRENT_TIMESTAMP",
+            (new_id(), clip_id, lang, body.translation, draft_translation, status, status, json.dumps(reasons, ensure_ascii=False)),
         )
     return {"status": status, "reasons": reasons, "human_edited": True}
 
 
 @app.post("/api/clips/{clip_id}/dubs/{lang}/verify")
 async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None = None) -> dict:
-    """Mark a listened-to take as human verified, only when its audio is available and safe."""
+    """Record the user's approval of the current translation, take, and placement."""
     with db.connect() as connection:
         row = connection.execute(
-            "SELECT d.id,d.status,d.reasons_json,d.audio_path,d.audio_stale,d.duration_s,d.translation,d.timing_offset_s,d.verify_override,c.project_id,c.idx,c.start_s,c.end_s,"
+            "SELECT d.id,d.selected_take_id,d.status,d.auto_status,d.reasons_json,d.audio_path,d.audio_stale,d.translation,d.timing_offset_s,d.verify_override,c.project_id,c.idx,c.start_s,c.end_s,"
             "p.status AS project_status,p.duration_s AS video_duration "
             "FROM dubs d JOIN clips c ON c.id=d.clip_id JOIN projects p ON p.id=c.project_id "
             "WHERE c.id=? AND d.lang=?", (clip_id, lang),
         ).fetchone()
         if row is None:
             raise HTTPException(404, "Dub not found")
-        # Manual approval applies to the take the user can currently listen to.
-        # If regeneration later replaces that take, the save path clears this
-        # approval along with the superseded audio.
-        if row["audio_stale"]:
-            raise HTTPException(409, "The saved translation has no matching generated audio yet. Re-speak this clip before verifying it")
-        audio_path = verification_audio_path(row["project_id"], lang, row["audio_path"])
-        if audio_path is None:
-            raise HTTPException(409, "Generate current clip audio or a dubbed track before verifying it")
-        # Verification records the user's approval of the generated take.
-        # Automatic QA and fit warnings remain visible separately; a manual
-        # approval must not silently fail because the take is long or flagged.
         reasons = json.loads(row["reasons_json"] or "[]")
-        automatic_flag = row["status"] != "green" or bool(reasons)
-        fingerprint = verification_fingerprint(row, audio_path)
+        reason_blob = " ".join(str(reason) for reason in reasons).casefold()
+        truly_cannot_fit = row["status"] == "red" and any(
+            marker in reason_blob for marker in ("cannot fit", "still overlaps", "speech overlaps", "withheld", "too long for its slot", "exceeds its slot")
+        )
+        if truly_cannot_fit and not (body and body.confirm_override):
+            raise HTTPException(409, "This clip cannot fit its slot. Confirm Verify anyway to approve it with an override note.")
+        reasons = json.loads(row["reasons_json"] or "[]")
+        automatic_status = row["auto_status"] or row["status"] or "pending"
+        fingerprint = verification_fingerprint(row)
+        override_note = ((body.note.strip() if body and body.note else "User approved audio despite unresolved fit warning.")
+                         if truly_cannot_fit else None)
         connection.execute(
-            # Verification changes review metadata only. Do not advance the
-            # dub content timestamp used by downstream artifact freshness.
-            "UPDATE dubs SET user_verified=1,verified_fingerprint=?,verify_override=? WHERE id=?",
-            (fingerprint, int(automatic_flag), row["id"]),
+            "UPDATE dubs SET auto_status=COALESCE(auto_status,status),user_verified=1,verified_fingerprint=?,verified_at=CURRENT_TIMESTAMP,verify_override=?,verify_override_note=? WHERE id=?",
+            (fingerprint, int(truly_cannot_fit), override_note, row["id"]),
         )
 
     report_path = _language_artifacts(row["project_id"], lang).get("report")
@@ -1841,25 +1841,34 @@ async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None =
             report = json.loads(report_path.read_text(encoding="utf-8"))
             for clip in report.get("clips", []):
                 if int(clip.get("clip", -1)) == int(row["idx"]) + 1:
-                    clip["automatic_status"] = clip.get("status", "yellow")
+                    clip["automatic_status"] = automatic_status
                     clip["status"] = "green"
                     clip["human_verified"] = True
-                    clip["verify_override"] = automatic_flag
+                    clip["verify_override"] = truly_cannot_fit
                     break
             atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2))
         except (OSError, ValueError, json.JSONDecodeError):
             LOGGER.exception("Could not update review report after human verification for clip %s", clip_id)
-    return {"status": "green", "human_verified": True, "verify_override": automatic_flag, "clip_id": clip_id, "lang": lang}
+    clips = await get_clips(row["project_id"], lang)
+    updated_clip = next((clip for clip in clips if clip["id"] == clip_id), None)
+    counts = {"total": len(clips), "green": 0, "yellow": 0, "red": 0}
+    for clip in clips:
+        status = clip.get("status") or "yellow"
+        counts[status if status in {"green", "yellow", "red"} else "yellow"] += 1
+    return {"status": "green", "human_verified": True, "verify_override": truly_cannot_fit,
+            "verify_override_note": override_note, "clip_id": clip_id, "lang": lang,
+            "clip": updated_clip, "counts": counts}
 
 
 @app.post("/api/clips/{clip_id}/dubs/{lang}/unverify")
 async def unverify_dub_clip(clip_id: str, lang: str) -> dict:
     with db.connect() as connection:
-        row = connection.execute("SELECT id,status FROM dubs WHERE clip_id=? AND lang=?", (clip_id, lang)).fetchone()
+        row = connection.execute("SELECT id,status,auto_status FROM dubs WHERE clip_id=? AND lang=?", (clip_id, lang)).fetchone()
         if row is None:
             raise HTTPException(404, "Dub not found")
-        connection.execute("UPDATE dubs SET user_verified=0,verified_fingerprint=NULL,verify_override=0 WHERE id=?", (row["id"],))
-    return {"status": row["status"] if row["status"] in {"green", "yellow", "red"} else "yellow", "human_verified": False, "clip_id": clip_id, "lang": lang}
+        connection.execute("UPDATE dubs SET user_verified=0,verified_fingerprint=NULL,verified_at=NULL,verify_override=0,verify_override_note=NULL WHERE id=?", (row["id"],))
+    status = row["auto_status"] or row["status"] or "yellow"
+    return {"status": "yellow" if status == "green" else status, "human_verified": False, "clip_id": clip_id, "lang": lang}
 
 
 def _render_scheduled_track(project_id: str, lang: str, placements: list[dict], duration_s: float) -> Path:
@@ -1909,7 +1918,7 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         raise HTTPException(404, "Language is not enabled for this project")
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT c.id,c.idx,c.start_s,c.end_s,c.src_text,d.id AS dub_id,d.translation,d.audio_path,d.duration_s,d.human_edited,d.user_verified,d.timing_offset_s,d.timing_locked "
+            "SELECT c.id,c.idx,c.start_s,c.end_s,c.src_text,d.id AS dub_id,d.selected_take_id,d.translation,d.audio_path,d.duration_s,d.human_edited,d.user_verified,d.timing_offset_s,d.timing_locked "
             "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
             (body.lang, project_id),
         ).fetchall()
@@ -1919,7 +1928,7 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         "id": row["id"], "start_s": row["start_s"], "end_s": row["end_s"],
         "speech_duration_s": row["duration_s"] or 0,
         "timing_offset_s": body.timing_offsets.get(row["id"], row["timing_offset_s"] or 0),
-        "edited": bool(row["human_edited"]), "locked": bool(row["user_verified"] or row["timing_locked"] or row["id"] in body.timing_offsets),
+        "edited": bool(row["human_edited"]), "locked": bool(row["timing_locked"] or row["id"] in body.timing_offsets),
         "translation": row["translation"] or "", "source_text": row["src_text"] or "",
     } for row in rows]
     schedule = schedule_language(inputs, float(project["duration_s"] or 0))
@@ -1929,14 +1938,31 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         # translation and ask the scheduler again.
         return {"lang": body.lang, **schedule}
     placement_by_id = {item["id"]: item for item in schedule["placements"]}
+    verification_cleared_clips: list[str] = []
     with db.connect() as connection:
         for row in rows:
             placement = placement_by_id[row["id"]]
             offset = float(placement["start_s"]) - float(row["start_s"])
-            connection.execute(
-                "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,user_verified=CASE WHEN ABS(COALESCE(timing_offset_s,0)-?)>0.000001 THEN 0 ELSE user_verified END,verified_fingerprint=CASE WHEN ABS(COALESCE(timing_offset_s,0)-?)>0.000001 THEN NULL ELSE verified_fingerprint END,verify_override=CASE WHEN ABS(COALESCE(timing_offset_s,0)-?)>0.000001 THEN 0 ELSE verify_override END,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
-                (offset, int(row["dub_id"] in body.timing_offsets), offset, offset, offset, row["id"], body.lang),
-            )
+            moved = abs(offset - float(row["timing_offset_s"] or 0))
+            if row["user_verified"] and moved < 0.5:
+                updated = dict(row)
+                updated["timing_offset_s"] = offset
+                fingerprint = verification_fingerprint(updated)
+                connection.execute(
+                    "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,verified_fingerprint=?,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                    (offset, int(row["dub_id"] in body.timing_offsets), fingerprint, row["id"], body.lang),
+                )
+            elif row["user_verified"]:
+                verification_cleared_clips.append(row["id"])
+                connection.execute(
+                    "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,user_verified=0,verified_fingerprint=NULL,verified_at=NULL,verify_override=0,verify_override_note=NULL,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                    (offset, int(row["dub_id"] in body.timing_offsets), row["id"], body.lang),
+                )
+            else:
+                connection.execute(
+                    "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                    (offset, int(row["dub_id"] in body.timing_offsets), row["id"], body.lang),
+                )
     artifact = _language_artifacts(project_id, body.lang).get("report")
     if artifact and artifact.is_file():
         try:
@@ -1965,7 +1991,7 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         except Exception as error:
             LOGGER.exception("Could not rebuild balanced dub preview for project %s language %s", project_id, body.lang)
             raise HTTPException(500, f"Timing placements saved, but the preview could not be rebuilt: {str(error)[:250]}") from error
-    return {"lang": body.lang, **schedule}
+    return {"lang": body.lang, "verification_cleared_clips": verification_cleared_clips, **schedule}
 
 
 @app.patch("/api/clips/{clip_id}/source")

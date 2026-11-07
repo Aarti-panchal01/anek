@@ -56,7 +56,8 @@ def initialize() -> None:
       duration_s REAL, human_edited INTEGER NOT NULL DEFAULT 0,
       audio_stale INTEGER NOT NULL DEFAULT 0,
       user_verified INTEGER NOT NULL DEFAULT 0, verified_fingerprint TEXT,
-      verify_override INTEGER NOT NULL DEFAULT 0,
+      verified_at TEXT, auto_status TEXT, verify_override INTEGER NOT NULL DEFAULT 0,
+      verify_override_note TEXT, selected_take_id TEXT,
       timing_offset_s REAL NOT NULL DEFAULT 0,
       timing_locked INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -137,11 +138,16 @@ def initialize() -> None:
             db.execute("ALTER TABLE dubs ADD COLUMN audio_stale INTEGER NOT NULL DEFAULT 0")
         for name, definition in (("user_verified", "INTEGER NOT NULL DEFAULT 0"),
                                  ("verified_fingerprint", "TEXT"),
+                                 ("verified_at", "TEXT"),
+                                 ("auto_status", "TEXT"),
                                  ("verify_override", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("verify_override_note", "TEXT"),
+                                 ("selected_take_id", "TEXT"),
                                  ("timing_offset_s", "REAL NOT NULL DEFAULT 0"),
                                  ("timing_locked", "INTEGER NOT NULL DEFAULT 0")):
             if name not in dub_columns:
                 db.execute(f"ALTER TABLE dubs ADD COLUMN {name} {definition}")
+        db.execute("UPDATE dubs SET auto_status=status WHERE auto_status IS NULL")
 
 
 def json_value(value):
