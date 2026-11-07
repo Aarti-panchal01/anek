@@ -837,7 +837,7 @@ def _project_with_review_audio(data_root, *, overlap=False):
 def test_user_can_verify_a_saved_audio_take(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         _project_with_review_audio(data_root)
-        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN", app_module.VerifyDecision(confirm_override=True)))
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
         assert result["human_verified"] is True
         with db.connect() as connection:
             row = connection.execute("SELECT status,reasons_json FROM dubs WHERE id='review-dub-1'").fetchone()
@@ -848,7 +848,7 @@ def test_user_can_verify_a_saved_audio_take(monkeypatch):
 def test_human_verification_updates_clip_and_project_counts_and_can_be_undone(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root)
-        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN", app_module.VerifyDecision(confirm_override=True)))
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
         assert result["human_verified"] is True
         clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
         assert clips[0]["status"] == "green"
@@ -862,16 +862,12 @@ def test_human_verification_updates_clip_and_project_counts_and_can_be_undone(mo
         assert clips[0]["user_verified"] is False
 
 
-def test_verification_override_requires_confirmation_and_is_persisted(monkeypatch):
+def test_manual_verification_overrides_automatic_flags_without_confirmation(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         _project_with_review_audio(data_root)
         with db.connect() as connection:
             connection.execute("UPDATE dubs SET reasons_json=? WHERE id=?", (json.dumps(["name mismatch"]), "review-dub-1"))
-        with pytest.raises(app_module.HTTPException) as exc:
-            _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
-        assert exc.value.status_code == 409
-        assert exc.value.detail["confirm_override"] is True
-        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN", app_module.VerifyDecision(confirm_override=True)))
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
         assert result["verify_override"] is True
         with db.connect() as connection:
             row = connection.execute("SELECT user_verified,verify_override FROM dubs WHERE id='review-dub-1'").fetchone()

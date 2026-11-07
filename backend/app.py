@@ -1841,8 +1841,6 @@ async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None =
             sibling_end = sibling_start + float(sibling["duration_s"] or 0)
             if min(current_end, sibling_end) - max(current_start, sibling_start) > 0.01:
                 raise HTTPException(409, "This clip overlaps another clip's speech; regenerate it before verifying")
-        if automatic_flag and not (body and body.confirm_override):
-            raise HTTPException(409, detail={"message": "Automatic checks still flag this clip. Verify anyway?", "confirm_override": True})
         fingerprint = verification_fingerprint(row, audio_path)
         connection.execute(
             "UPDATE dubs SET user_verified=1,verified_fingerprint=?,verify_override=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
