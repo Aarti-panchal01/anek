@@ -10,7 +10,7 @@
 [![Vercel](https://img.shields.io/badge/web-Vercel-000000)](https://anek-tau.vercel.app)
 [![Railway](https://img.shields.io/badge/api-Railway-0B0D0E)](https://railway.com)
 
-[Live app](https://anek-tau.vercel.app) · [SPEC.md](SPEC.md) · [EVAL.md](EVAL.md)
+[Live app](https://anek-tau.vercel.app) · [SPEC.md](SPEC.md) · [EVAL.md](EVAL.md) · [Go-live checklist](docs/GO_LIVE.md)
 
 </div>
 
@@ -95,7 +95,6 @@ flowchart LR
     FastAPI --> Storage
     Pipeline --> Gnani[Gnani speech services]
     Pipeline --> Sarvam[Sarvam translation and QA]
-    Pipeline --> Fallback[Fallback LLM chain]
 ```
 
 **Frontend.** React and TypeScript run in Vite. API and media URLs use the shared `apiUrl()` helper. A build check rejects project media URLs that bypass the `/api` prefix.
@@ -104,7 +103,7 @@ flowchart LR
 
 **Pipeline.** The pipeline transcribes once, applies term rules, translates, synthesizes, fits speech, checks results and exports media. Checkpoints let jobs resume.
 
-**Providers.** Gnani provides speech recognition, synthesis and voice services. Sarvam is primary for translation and QA. The existing LLM chain is fallback. Failed or quota-limited models are skipped by a five-minute circuit breaker.
+**Providers.** Gnani provides speech recognition, synthesis and voice services. Sarvam provides translation and QA. Failed or quota-limited calls are skipped by a five-minute circuit breaker.
 
 **Storage.** SQLite stores project and job records. A persistent volume stores uploads, generated clips and exports. Writes use temporary files, fsync and atomic rename. Storage is budgeted to 350 MB.
 
@@ -117,7 +116,7 @@ sequenceDiagram
     participant API as FastAPI
     participant Store as Checkpoint store
     participant Speech as Gnani
-    participant Translate as Sarvam or fallback
+    participant Translate as Sarvam
     participant Media as FFmpeg
     User->>Web: Upload video and choose languages
     Web->>API: Create project and upload
@@ -229,7 +228,7 @@ The review studio has an Original/Dubbed player toggle, optional side-by-side pl
 | Frontend | React, TypeScript, Vite |
 | Backend | Python, FastAPI, Uvicorn |
 | Speech and voice | Gnani |
-| Translation and QA | Sarvam with fallback LLM providers |
+| Translation and QA | Sarvam |
 | Media | FFmpeg and ffprobe |
 | Hosting | Vercel and Railway |
 | Tests | pytest and frontend production build |
@@ -342,4 +341,4 @@ Built by [Aarti Panchal](https://aarti-panchal.site).
 
 ## Credits
 
-Speech recognition, synthesis and voice services are provided by Gnani. Translation and language model services are provided by Sarvam and configured fallback providers.
+Speech recognition, synthesis and voice services are provided by Gnani. Translation and quality checks are provided by Sarvam.
