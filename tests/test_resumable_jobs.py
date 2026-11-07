@@ -150,14 +150,49 @@ def test_job_with_zero_clips_is_failed_instead_of_completed(monkeypatch):
                     ("empty-job", project["id"], "dub", "stock", "Shivani", "pending", "queued", 1),
                 )
 
-            monkeypatch.setattr(app_module, "run_quality_pass", lambda *args, **kwargs: [])
+            monkeypatch.setattr(
+                app_module, "run_quality_pass",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    ValueError("Speech check rejected the audio (400): audio payload rejected")
+                ),
+            )
             await app_module.run_job("empty-job")
 
             with db.connect() as connection:
                 job = connection.execute("SELECT state,error FROM jobs WHERE id='empty-job'").fetchone()
                 project_state = connection.execute("SELECT status FROM projects WHERE id=?", (project["id"],)).fetchone()
             assert job["state"] == "failed"
-            assert "without creating any clips" in job["error"]
+            assert "Processing created no clips." in job["error"]
+            assert "audio payload rejected" in job["error"]
+            assert "Mozilla" not in job["error"]
             assert project_state["status"] == "failed"
+
+    asyncio.run(scenario())
+
+
+def test_second_start_returns_the_existing_project_job(monkeypatch):
+    async def scenario():
+        with _sandbox(monkeypatch) as (_, data_root):
+            source = data_root / "uploads" / "duplicate-start" / "source.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"mock video")
+            project = _resolve(app_module.create_project(app_module.ProjectCreate(
+                name="duplicate start", source_lang="en-IN", target_langs=["hi-IN"],
+            )))
+            with db.connect() as connection:
+                connection.execute(
+                    "UPDATE projects SET video_path=?,duration_s=20 WHERE id=?",
+                    (str(source), project["id"]),
+                )
+            first_tasks, second_tasks = BackgroundTasks(), BackgroundTasks()
+            body = app_module.StartJob(voice_mode="stock", stock_voice="Shivani")
+            first = await app_module.start_job(_request(), project["id"], body, first_tasks)
+            second = await app_module.start_job(_request(), project["id"], body, second_tasks)
+            assert first["job_id"] == second["job_id"]
+            assert second["already_running"] is True
+            assert len(first_tasks.tasks) == 1
+            assert len(second_tasks.tasks) == 0
+            with db.connect() as connection:
+                assert connection.execute("SELECT COUNT(*) FROM jobs WHERE project_id=?", (project["id"],)).fetchone()[0] == 1
 
     asyncio.run(scenario())

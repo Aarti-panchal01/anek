@@ -10,6 +10,7 @@ import logging
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 from pathlib import Path
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from backend.brain.termsheet import (
     mask_protected_terms, restore_protected_terms,
 )
 from backend.clients.gnani import create_gnani_client
+from backend.clients.sarvam_stt import create_sarvam_stt_client
 from backend.clients.llm import SarvamTranslationClient, MockLLMClient, create_translation_client, create_workflow_client
 from backend.config import LANGUAGES, Settings, get_settings
 from backend.verify.flags import audio_number_status
@@ -75,6 +77,150 @@ def duration_of(path: Path) -> float:
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", str(path),
     ]).strip())
+
+
+def audio_stream_info(path: Path) -> dict:
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+        "stream=codec_name,sample_rate,channels,duration", "-of", "json", str(path),
+    ], capture_output=True, text=True, check=True)
+    streams = json.loads(result.stdout).get("streams", [])
+    return streams[0] if streams else {}
+
+
+def validate_stt_chunk(path: Path) -> dict:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("STT chunk is missing or empty")
+    info = audio_stream_info(path)
+    seconds = float(info.get("duration") or duration_of(path))
+    if seconds < 0.3:
+        raise ValueError(f"STT chunk is too short ({seconds:.3f}s); trailing audio was not sent")
+    probe = subprocess.run([
+        "ffmpeg", "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "NUL",
+    ], capture_output=True, text=True)
+    mean = re.search(r"mean_volume:\s*(-?inf|-?[0-9.]+) dB", probe.stderr)
+    if probe.returncode not in {0, 1} or (mean and (mean.group(1) == "-inf" or float(mean.group(1)) < -60)):
+        raise ValueError("STT chunk contains silent audio")
+    return {**info, "duration": seconds, "bytes": path.stat().st_size}
+
+
+def stt_error_status(error: Exception) -> int | None:
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def stt_error_body(error: Exception) -> str:
+    response = getattr(error, "response", None)
+    body = getattr(response, "text", "") if response is not None else ""
+    if not body:
+        body = str(error)
+    cleaned = re.sub(r"\s+", " ", str(body)).strip()
+    cleaned = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~-]+", "Bearer [REDACTED]", cleaned)
+    cleaned = re.sub(r"(?i)\s*For more information check:\s*https?://developer\.mozilla\.org/\S*", "", cleaned)
+    cleaned = re.sub(
+        r"(?i)(api[_ -]?key|access[_ -]?token|secret|authorization)(['\"=: ]+)[^,\s}\"']+",
+        r"\1\2[REDACTED]", cleaned,
+    )
+    return cleaned[:300]
+
+
+def log_stt_failure(provider: str, model: str, language: str, chunk_index: int, path: Path, error: Exception) -> str:
+    try:
+        info = audio_stream_info(path) if path.is_file() else {}
+        duration = float(info.get("duration") or duration_of(path)) if path.is_file() else 0.0
+        size = path.stat().st_size if path.is_file() else 0
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
+    except Exception:
+        info, duration, size, digest = {}, 0.0, 0, "unavailable"
+    endpoint = getattr(getattr(error, "response", None), "request", None)
+    endpoint_path = getattr(getattr(endpoint, "url", None), "path", "/speech-to-text" if provider == "sarvam" else "/stt/v3")
+    status, snippet = stt_error_status(error), stt_error_body(error)
+    LOGGER.error(
+        "STT HTTP failure provider=%s endpoint=%s model=%s language=%s chunk=%d duration_s=%.3f sample_rate=%s channels=%s codec=%s bytes=%d sha256=%s status=%s body=%s",
+        provider, endpoint_path, model, language, chunk_index, duration, info.get("sample_rate", "unknown"),
+        info.get("channels", "unknown"), info.get("codec_name", "unknown"), size, digest, status, snippet,
+    )
+    if status:
+        return f"Speech check rejected the audio ({status}): {snippet or 'provider returned an empty error response'}"
+    return f"Speech check failed: {snippet or type(error).__name__}"
+
+
+def source_stt_with_retry(path: Path, transcribe: Callable[[bytes], dict], reencode: Callable[[], Path],
+                          language: str, model: str, chunk_index: int) -> dict:
+    validate_stt_chunk(path)
+    try:
+        return transcribe(path.read_bytes())
+    except Exception as first_error:
+        reason = log_stt_failure("sarvam", model, language, chunk_index, path, first_error)
+        status = stt_error_status(first_error)
+        if not status or not 400 <= status < 500:
+            raise ValueError(reason) from first_error
+        retry_path = reencode()
+        validate_stt_chunk(retry_path)
+        if hashlib.sha256(path.read_bytes()).digest() == hashlib.sha256(retry_path.read_bytes()).digest():
+            raise ValueError("Speech provider retry encoding did not change the request bytes") from first_error
+        try:
+            return transcribe(retry_path.read_bytes())
+        except Exception as retry_error:
+            retry_reason = log_stt_failure("sarvam", model, language, chunk_index, retry_path, retry_error)
+            raise ValueError(retry_reason) from retry_error
+
+
+def advisory_stt(path: Path, transcribe: Callable[[bytes], dict], language: str, model: str, chunk_index: int,
+                 reencode: Callable[[], Path] | None = None) -> dict | None:
+    try:
+        validate_stt_chunk(path)
+        return transcribe(path.read_bytes())
+    except Exception as error:
+        reason = log_stt_failure("gnani", model, language, chunk_index, path, error)
+        status = stt_error_status(error)
+        if reencode and status and 400 <= status < 500:
+            try:
+                retry_path = reencode()
+                validate_stt_chunk(retry_path)
+                if hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(retry_path.read_bytes()).digest():
+                    return transcribe(retry_path.read_bytes())
+                reason = "Speech check retry encoding did not change the request bytes"
+            except Exception as retry_error:
+                reason = log_stt_failure("gnani", model, language, chunk_index, locals().get("retry_path", path), retry_error)
+        LOGGER.warning("Audio check unavailable for %s clip %d: %s", language, chunk_index, reason)
+        return None
+
+
+def cache_successful_stt(cache: dict, key: str, request: Callable[[], dict]) -> dict:
+    if key not in cache:
+        result = request()
+        cache[key] = result
+    return cache[key]
+
+
+def advisory_audio_flag(transcript: dict | None, translation: str, language: str, low_trust_langs: list[str]) -> dict:
+    if transcript is None:
+        return {"status": "yellow", "reasons": ["Audio check unavailable"]}
+    return audio_number_status(translation, transcript["transcript"], language, low_trust_langs)
+
+
+def merge_tiny_trailing_range(time_ranges: list[tuple[float, float]], minimum_seconds: float = 0.3) -> list[tuple[float, float]]:
+    ranges = list(time_ranges)
+    if len(ranges) > 1 and ranges[-1][1] - ranges[-1][0] < minimum_seconds:
+        ranges[-2] = (ranges[-2][0], ranges[-1][1])
+        ranges.pop()
+    elif ranges and ranges[-1][1] - ranges[-1][0] < minimum_seconds:
+        ranges.pop()
+    return ranges
+
+
+def _reencode_audio(source: Path, target: Path, comment: str) -> Path:
+    run_command([
+        "ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:a:0", "-vn",
+        "-ac", "1", "-ar", "16000", "-af", "aresample=async=1:first_pts=0",
+        "-c:a", "pcm_s16le", "-metadata", f"comment={comment}", str(target),
+    ])
+    return target
 
 
 def detected_silence_spans(audio_path: Path, duration: float) -> list[tuple[float, float]]:
@@ -786,6 +932,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
     duration = duration_of(video)
     if duration > settings.max_video_seconds:
         raise ValueError("Video exceeds the configured hard cap")
+    if not audio_stream_info(video):
+        raise ValueError("This video has no audio track")
     output_dir.mkdir(parents=True, exist_ok=True)
     prior_report = None
     prior_clip = None
@@ -801,6 +949,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             raise ValueError("Regeneration clip index is outside the saved segment map")
         prior_clip = prior_rows[only_clip_index]
     gnani = create_gnani_client(settings.gnani_mock)
+    sarvam_stt = None
     checkpoint_state = resume_state if resume_state is not None else {}
 
     def checkpoint(stage: str) -> None:
@@ -821,10 +970,14 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         cache_key = json.dumps(key_parts, sort_keys=True, ensure_ascii=False)
         if cache_key not in stt_cache:
             check_continue()
-            if provider == "gnani":
-                stt_cache[cache_key] = transcribe_generated_speech(gnani, audio, language, model, **options)
-            else:
+            def request() -> dict:
+                if provider == "gnani":
+                    return transcribe_generated_speech(gnani, audio, language, model, **options)
+                if provider == "sarvam":
+                    return {"transcript": normalize_provider_transcript(
+                        sarvam_stt.transcribe(audio, language, model, **options)), "detected_language_code": language}
                 raise ValueError(f"Unknown transcription provider: {provider}")
+            cache_successful_stt(stt_cache, cache_key, request)
             checkpoint("transcript")
         return stt_cache[cache_key]
 
@@ -840,12 +993,12 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
     with tempfile.TemporaryDirectory(prefix="anek-phase3b-", dir=temp_root) as temp_name:
         work = Path(temp_name)
         source_wav = work / "source.wav"
+        sarvam_stt = create_sarvam_stt_client(settings)
         run_command(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(source_wav)])
         room_tone_path, room_tone_span = extract_room_tone(source_wav, work, duration)
         source_silence_spans = detected_silence_spans(source_wav, duration)
-        source_stt_model = "prisma-v3.0"
+        source_stt_model = "saaras:v3"
         stt_language = "unknown" if source_language == "auto" else source_language
-        source_format = "transcribe"
         resumed_term_fixes = checkpoint_state.get("term_fixes")
         if prior_clip is not None:
             source_lang = prior_report.get("source_language", source_language)
@@ -863,16 +1016,34 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
             boundaries = [(start + end) / 2 for start, end in source_silence_spans]
             time_ranges = targeted_silence_segments(duration, boundaries, hard_max=8.0)
             source_chunks = []
+            # Merge any tiny final span into its predecessor instead of sending
+            # an invalid request to either speech provider.
+            time_ranges = merge_tiny_trailing_range(time_ranges)
             for index, (start, end) in enumerate(time_ranges):
                 check_continue()
                 chunk_path = work / f"source_{index:02d}.wav"
-                run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-ac", "1", "-ar", "16000", str(chunk_path)])
-                response = cached_stt(chunk_path.read_bytes(), stt_language, source_stt_model, format=source_format)
+                run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(chunk_path)])
+                def reencode_source_chunk() -> Path:
+                    retry_path = work / f"source_{index:02d}_retry.wav"
+                    run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", "-metadata", f"comment=stt-retry-{index}-{time.time_ns()}", str(retry_path)])
+                    return retry_path
+                response = source_stt_with_retry(
+                    chunk_path, lambda audio: cached_stt(audio, stt_language, source_stt_model, provider="sarvam"),
+                    reencode_source_chunk, stt_language, source_stt_model, index + 1,
+                )
                 source_chunks.append({"start": start, "end": end, "raw": response["transcript"], "lang": response.get("detected_language_code", source_language)})
             def transcribe_range(start: float, end: float) -> dict:
                 chunk_path = work / f"source_join_{start:.3f}_{end:.3f}.wav"
-                run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-ac", "1", "-ar", "16000", str(chunk_path)])
-                return cached_stt(chunk_path.read_bytes(), stt_language, source_stt_model, format=source_format)
+                run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(chunk_path)])
+                join_index = len(source_chunks) + 1
+                def reencode_join() -> Path:
+                    retry_path = work / f"source_join_{start:.3f}_{end:.3f}_retry.wav"
+                    run_command(["ffmpeg", "-y", "-v", "error", "-i", str(source_wav), "-ss", str(start), "-t", str(end-start), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", "-metadata", f"comment=stt-retry-{join_index}-{time.time_ns()}", str(retry_path)])
+                    return retry_path
+                return source_stt_with_retry(
+                    chunk_path, lambda audio: cached_stt(audio, stt_language, source_stt_model, provider="sarvam"),
+                    reencode_join, stt_language, source_stt_model, join_index,
+                )
 
             source_chunks = merge_incomplete_chunks(source_chunks, transcribe_range, max_seconds=8.0)
             langs = [row["lang"] for row in source_chunks if row["lang"] != "unknown"]
@@ -1225,10 +1396,23 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     ])
                 if recovery_step:
                     LOGGER.info("Timing recovery for %s clip %s: %s", target_lang, clip_index + 1, recovery_step)
-                transcript = cached_stt(
-                    sentence_audio.read_bytes(), target_lang, "prisma-v3.0", provider="gnani",
+                qa_audio = work / f"{target_lang}_{index}_qa_16k.wav"
+                run_command(["ffmpeg", "-y", "-v", "error", "-i", str(sentence_audio), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(qa_audio)])
+                validate_stt_chunk(qa_audio)
+                audio_check_unavailable = False
+                advisory = advisory_stt(
+                    qa_audio, lambda audio: cached_stt(audio, target_lang, "prisma-v3.0", provider="gnani"),
+                    target_lang, "prisma-v3.0", clip_index + 1,
+                    lambda: _reencode_audio(qa_audio, work / f"{target_lang}_{index}_qa_retry.wav", f"qa-retry-{clip_index}-{time.time_ns()}"),
                 )
-                audio_flag = audio_number_status(selected, transcript["transcript"], target_lang, settings.low_trust_verify_langs)
+                if advisory is None:
+                    audio_check_unavailable = True
+                    transcript = {"transcript": ""}
+                else:
+                    transcript = advisory
+                audio_flag = advisory_audio_flag(
+                    advisory, selected, target_lang, settings.low_trust_verify_langs,
+                )
                 translation_checks = run_checks(row["cleaned"], selected, target_lang, clip_terms, max_chars=1000)
                 meaning_check_failed = False
                 try:
@@ -1283,6 +1467,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     "selected_candidate_index": selected_index, "selection_reason": selection_reason,
                     "translation": selected, "back_translation": meaning.get("back_translation", ""),
                     "meaning_preserved": meaning.get("meaning_preserved"), "audio_transcript": transcript["transcript"],
+                    "audio_check_unavailable": audio_check_unavailable,
                     "status": "red" if protected_missing else status, "reasons": reasons, "time_stretched": stretched, "overrun_seconds": overrun_s,
                     "translated_character_count": len(selected),
                     "synthesized_duration_s": round(raw_synthesized_seconds, 3),

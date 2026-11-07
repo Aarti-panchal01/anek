@@ -57,6 +57,7 @@ _shutdown_requested = threading.Event()
 _active_job_tasks: set[asyncio.Task] = set()
 _storage_maintenance_task: asyncio.Task | None = None
 _preview_tasks: dict[str, asyncio.Task] = {}
+_project_language_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 
 class JobInterrupted(Exception):
@@ -2463,6 +2464,25 @@ async def edit_clip_source(clip_id: str, body: SourceEdit) -> dict:
 
 async def run_job(job_id: str) -> None:
     with db.connect() as connection:
+        row = connection.execute("SELECT j.project_id,j.lang,j.kind,p.target_langs_json FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=?", (job_id,)).fetchone()
+    if row is None:
+        return
+    languages = [row["lang"]] if row["kind"] in {"regenerate", "regenerate_clip", "retry_language"} and row["lang"] else json.loads(row["target_langs_json"])
+    locks = [_project_language_locks.setdefault((row["project_id"], lang), asyncio.Lock()) for lang in sorted(languages)]
+    if any(lock.locked() for lock in locks):
+        LOGGER.info("Skipping duplicate active job %s for %s", job_id, row["project_id"])
+        return
+    for lock in locks:
+        await lock.acquire()
+    try:
+        await _run_job_once(job_id)
+    finally:
+        for lock in reversed(locks):
+            lock.release()
+
+
+async def _run_job_once(job_id: str) -> None:
+    with db.connect() as connection:
         job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not job:
             return
@@ -2650,7 +2670,9 @@ async def run_job(job_id: str) -> None:
         with db.connect() as connection:
             clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project["id"],)).fetchone()[0]
             if clip_count == 0:
-                raise ValueError("Processing finished without creating any clips.")
+                errors = checkpoint_state.get("language_errors") or {}
+                detail = next(iter(errors.values()), "No transcript was created.")
+                raise ValueError(f"Processing created no clips. {detail}")
             source_count = len((checkpoint_state.get("term_fixes") or {}).get("cleaned_rows") or [])
             selected_languages = json.loads(project["target_langs_json"])
             for target_lang in selected_languages:
@@ -2693,6 +2715,12 @@ async def start_job(request: Request, project_id: str, body: StartJob, backgroun
     if body.voice_mode == "stock" and body.stock_voice not in STOCK_VOICES:
         raise HTTPException(422, "Choose an available Timbre stock voice")
     with db.connect() as connection:
+        active = connection.execute(
+            "SELECT id,state FROM jobs WHERE project_id=? AND state IN ('pending','running') ORDER BY created_at DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if active:
+            return {"job_id": active["id"], "state": active["state"], "already_running": True}
         voice = (connection.execute("SELECT id FROM voices WHERE id=? AND consent_ok=1", (body.voice_id,)).fetchone()
                  if body.voice_mode == "clone" and body.voice_id else None)
         if body.voice_mode == "clone" and not voice:
@@ -2738,6 +2766,12 @@ async def retry_language(request: Request, project_id: str, lang: str, backgroun
     if lang not in json.loads(project["target_langs_json"]):
         raise HTTPException(422, "Language is not a target of this project")
     with db.connect() as connection:
+        active = connection.execute(
+            "SELECT id,state,lang FROM jobs WHERE project_id=? AND state IN ('pending','running') ORDER BY created_at DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if active:
+            return {"job_id": active["id"], "state": active["state"], "lang": active["lang"], "already_running": True}
         job = connection.execute("SELECT id,state FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
         if job is None or job["state"] == "running":
             raise HTTPException(409, "No retryable job is available for this language")
