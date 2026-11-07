@@ -1814,14 +1814,9 @@ async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None =
         ).fetchone()
         if row is None:
             raise HTTPException(404, "Dub not found")
-        active_job = connection.execute(
-            "SELECT kind,clip_id,state FROM jobs WHERE project_id=? AND state IN ('pending','running') ORDER BY created_at DESC LIMIT 1",
-            (row["project_id"],),
-        ).fetchone()
-        # A finished take can be approved while other clips or languages are
-        # processing. Only block the exact clip whose audio is being replaced.
-        if active_job and active_job["kind"] == "regenerate_clip" and active_job["clip_id"] == clip_id:
-            raise HTTPException(409, "Wait for this clip's new audio to finish before verifying it")
+        # Manual approval applies to the take the user can currently listen to.
+        # If regeneration later replaces that take, the save path clears this
+        # approval along with the superseded audio.
         if row["audio_stale"]:
             raise HTTPException(409, "The saved translation has no matching generated audio yet. Re-speak this clip before verifying it")
         audio_path = verification_audio_path(row["project_id"], lang, row["audio_path"])

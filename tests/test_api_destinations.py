@@ -893,7 +893,7 @@ def test_human_verification_is_available_while_another_language_runs(monkeypatch
         assert clips[0]["status"] == "green"
 
 
-def test_human_verification_waits_for_the_same_clip_regeneration(monkeypatch):
+def test_human_verification_approves_current_take_during_same_clip_regeneration(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root)
         with db.connect() as connection:
@@ -901,8 +901,11 @@ def test_human_verification_waits_for_the_same_clip_regeneration(monkeypatch):
                 "INSERT INTO jobs(id,project_id,kind,lang,clip_id,state,stage) VALUES(?,?,?,?,?,?,?)",
                 ("same-clip-job", project["id"], "regenerate_clip", "hi-IN", "review-clip-1", "running", "synthesis"),
             )
-        with pytest.raises(HTTPException, match="Wait for this clip"):
-            _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        assert result["human_verified"] is True
+        clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
+        assert clips[0]["user_verified"] is True
+        assert clips[0]["status"] == "green"
 
 
 def test_manual_verification_uses_mixed_track_when_clip_take_is_missing(monkeypatch):
