@@ -17,6 +17,7 @@ from backend.clients.llm import (
 def reset_provider_breaker():
     SharedSarvamLimiter._unavailable_until = 0.0
     SharedSarvamLimiter._starts.clear()
+    SharedSarvamLimiter._key_unavailable_until.clear()
     yield
     SharedSarvamLimiter._unavailable_until = 0.0
 
@@ -40,7 +41,7 @@ def test_sarvam_translation_uses_mayura_and_returns_three_candidate_sets(monkeyp
 
     client = _client()
     client.client = type("Sarvam", (), {"text": Text()})()
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     response = client.chat_json([
         {"role": "system", "content": "Translate the full source paragraph"},
         {"role": "user", "content": json.dumps({
@@ -88,7 +89,7 @@ def test_same_language_translation_reuses_source_text_without_provider_call(monk
 
 
 def test_shared_provider_retry_classifies_rate_limit_and_recovers(monkeypatch):
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     monkeypatch.setattr("backend.clients.llm.time.sleep", lambda _: None)
     monkeypatch.setattr("backend.clients.llm.random.uniform", lambda *_: 0)
 
@@ -110,7 +111,7 @@ def test_shared_provider_retry_classifies_rate_limit_and_recovers(monkeypatch):
 
 @pytest.mark.parametrize(("status", "error"), [(429, RateLimitedError), (503, ProviderError), (400, BadInputError)])
 def test_provider_errors_have_clear_classes_and_no_secret_text(monkeypatch, status, error):
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     monkeypatch.setattr("backend.clients.llm.time.sleep", lambda _: None)
 
     class HttpError(Exception):
@@ -141,3 +142,49 @@ def test_mocked_failing_provider_opens_five_minute_circuit(monkeypatch):
     with pytest.raises(ProviderError):
         _provider_call(failing_provider, attempts=1)
     assert calls == [1, 1]
+
+
+def test_settings_load_five_numbered_sarvam_keys_and_prefer_them(monkeypatch):
+    from backend.config import Settings
+
+    settings = Settings(
+        sarvam_api_key="legacy",
+        sarvam_api_key_1="first",
+        sarvam_api_key_2="second",
+        sarvam_api_key_3="third",
+        sarvam_api_key_4="fourth",
+        sarvam_api_key_5="fifth",
+    )
+    assert settings.resolved_sarvam_api_keys == ("first", "second", "third", "fourth", "fifth")
+
+
+def test_translation_rotates_to_next_key_after_quota_and_cools_only_failed_key(monkeypatch):
+    client = _client()
+    client.api_keys = ("first", "second")
+    client._key_fingerprints = ["fingerprint-one", "fingerprint-two"]
+    client._rotation_index = 0
+    clients = []
+
+    class TooManyRequests(Exception):
+        status_code = 429
+
+    class FakeText:
+        def __init__(self, fail):
+            self.fail = fail
+        def translate(self, **kwargs):
+            if self.fail:
+                raise TooManyRequests()
+            return "translated"
+
+    client.clients = [
+        type("C", (), {"text": FakeText(True)})(),
+        type("C", (), {"text": FakeText(False)})(),
+    ]
+    client.client = client.clients[0]
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
+    monkeypatch.setattr("backend.clients.llm.time.monotonic", lambda: 100.0)
+
+    result = client.translate_text(input="hello")
+    assert result == "translated"
+    assert SharedSarvamLimiter._key_unavailable_until == {"fingerprint-one": 400.0}
+    assert client._rotation_index == 0

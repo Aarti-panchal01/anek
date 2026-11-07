@@ -32,7 +32,7 @@ def test_translation_style_parameters_for_all_ten_targets(monkeypatch, target, s
             calls.append(kwargs)
             return type("Result", (), {"translated_text": "ಅನುವಾದ"})()
 
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     instance = _client()
     instance.client = type("Sarvam", (), {"text": Text()})()
     instance.chat_json([
@@ -58,7 +58,7 @@ def test_long_clip_input_is_split_at_one_thousand_characters(monkeypatch):
             calls.append(kwargs)
             return type("Result", (), {"translated_text": "क"})()
 
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     instance = _client()
     instance.client = type("Sarvam", (), {"text": Text()})()
     text = ("word " * 250).strip()
@@ -81,7 +81,7 @@ def test_mayura_failure_uses_formal_sarvam_translate_fallback(monkeypatch):
                 raise RuntimeError("provider unavailable")
             return type("Result", (), {"translated_text": "अनुवाद"})()
 
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     instance = _client()
     instance.client = type("Sarvam", (), {"text": Text()})()
     instance.chat_json([
@@ -144,7 +144,7 @@ def test_numeric_values_are_protected_during_translation_and_restored(monkeypatc
             calls.append(kwargs["input"])
             return type("Result", (), {"translated_text": kwargs["input"]})()
 
-    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation, **kwargs: operation()))
     instance = _client()
     instance.client = type("Sarvam", (), {"text": Text()})()
     source = "Zorvo plan Rs 1,00,000. Call 98765 43210 between 9 AM and 6 PM."

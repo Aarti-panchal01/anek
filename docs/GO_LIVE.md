@@ -16,7 +16,8 @@
 - Deploy from the repository root using the included `Dockerfile`.
 - Attach a persistent volume at `/data`.
 - Keep the Railway service port setting aligned with the platform `PORT`; the app defaults to 8080.
-- Add the provider credentials `SARVAM_API_KEY` and `GNANI_API_KEY` in the production environment. Do not store credentials in Vercel or the repository.
+- Add `SARVAM_API_KEY_1` through `SARVAM_API_KEY_5` and `GNANI_API_KEY` in the Railway production environment. The numbered Sarvam keys rotate when a key is rejected or quota-limited; legacy `SARVAM_API_KEY` is used only when no numbered keys are configured. Do not store credentials in Vercel or the repository.
+- Gnani handles STT and TTS. Sarvam handles translation and the associated text workflow.
 - Set `SARVAM_TRANSLATION_MODEL` and `SARVAM_REWRITE_MODEL` only when overriding their code defaults.
 - Set `REQUIRE_ACCESS_AUTH=true`, `ANEK_ACCESS_PASSWORD`, and `ANEK_AUTH_SECRET` before exposing a private workspace.
 - Set `CORS_ORIGINS` to the exact production Vercel origin, including scheme and no trailing slash. Keep it aligned with the domain assigned to the production deployment. Use `CORS_ORIGIN_REGEX` only when preview subdomains must also be allowed.
@@ -40,5 +41,5 @@ Local unit coverage checks that unauthenticated requests are denied, valid signe
 ## Names to configure
 
 - Vercel: `VITE_API_BASE_URL`
-- Railway: `SARVAM_API_KEY`, `GNANI_API_KEY`, `SARVAM_TRANSLATION_MODEL`, `SARVAM_REWRITE_MODEL`, `ANEK_DATA_DIR`, `REQUIRE_ACCESS_AUTH`, `ANEK_ACCESS_PASSWORD`, `ANEK_AUTH_SECRET`, `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`, `MAX_VIDEO_SECONDS`, `EXPORT_RETENTION_HOURS`, `GNANI_DAILY_LIMIT`, `MAX_CREDITS_PER_JOB`, `APP_NAME`, `NUMERAL_STYLE`, `ENABLED_LANGS`, `LOW_TRUST_VERIFY_LANGS`, `PER_IP_LIMITS`, `FIT_TOLERANCE`, `MAX_STRETCH`, `SIMILARITY_THRESHOLD`, `CONSENT_MATCH_THRESHOLD`
+- Railway: `SARVAM_API_KEY_1`, `SARVAM_API_KEY_2`, `SARVAM_API_KEY_3`, `SARVAM_API_KEY_4`, `SARVAM_API_KEY_5`, `SARVAM_API_KEY` (legacy fallback), `GNANI_API_KEY`, `SARVAM_TRANSLATION_MODEL`, `SARVAM_REWRITE_MODEL`, `ANEK_DATA_DIR`, `REQUIRE_ACCESS_AUTH`, `ANEK_ACCESS_PASSWORD`, `ANEK_AUTH_SECRET`, `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`, `MAX_VIDEO_SECONDS`, `EXPORT_RETENTION_HOURS`, `GNANI_DAILY_LIMIT`, `MAX_CREDITS_PER_JOB`, `APP_NAME`, `NUMERAL_STYLE`, `ENABLED_LANGS`, `LOW_TRUST_VERIFY_LANGS`, `PER_IP_LIMITS`, `FIT_TOLERANCE`, `MAX_STRETCH`, `SIMILARITY_THRESHOLD`, `CONSENT_MATCH_THRESHOLD`
 - Development/test only: `GNANI_MOCK`, `LLM_MOCK`

@@ -11,9 +11,9 @@ from pathlib import Path
 from backend.atomic_files import atomic_write_bytes, atomic_write_text, run_atomic_command
 from backend.brain.autocorrect import translate_with_autocorrect, combine_audio_verification
 from backend.brain.termsheet import extract_termsheet
-from backend.pipeline.phase3b import back_translate, meaning_check_reasons
-from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import SarvamSpeechClient, SarvamTranslationClient, create_translation_client, create_workflow_client
+from backend.pipeline.phase3b import back_translate, meaning_check_reasons, normalize_provider_transcript
+from backend.clients.gnani import create_gnani_client
+from backend.clients.llm import SarvamTranslationClient, create_translation_client, create_workflow_client
 from backend.config import Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -82,8 +82,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
             ]
         )
         chunks = split_audio(source_audio, work_dir, duration)
-        gnani = LiveGnaniClient(settings)
-        sarvam_stt = SarvamSpeechClient(settings)
+        gnani = create_gnani_client(settings.gnani_mock)
         llm = SarvamTranslationClient(settings)
         workflow_llm = create_workflow_client(llm, settings)
         translator = create_translation_client(llm, settings)
@@ -96,13 +95,13 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
 
         transcripts = []
         for audio_path, start, end in chunks:
-            response = sarvam_stt.stt(audio_path.read_bytes(), language_code="unknown", format="transcribe")
+            response = gnani.stt(audio_path.read_bytes(), language_code="unknown", model="prisma-v3.0", format="transcribe")
             transcripts.append(
                 {
                     "start_s": start,
                     "end_s": end,
-                    "text": response["transcript"],
-                    "source_lang": response.get("detected_language_code", "unknown"),
+                    "text": normalize_provider_transcript(response),
+                    "source_lang": response.get("language_code", response.get("detected_language_code", "unknown")),
                     "audio_path": audio_path,
                 }
             )
@@ -138,9 +137,9 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
                     ]
                 )
                 speech_path = fitted_path
-            verification = sarvam_stt.stt(speech_path.read_bytes(), "hi-IN", format="transcribe")
+            verification = gnani.stt(speech_path.read_bytes(), "hi-IN", "prisma-v3.0", format="transcribe")
             audio_status = audio_number_status(
-                translated, verification["transcript"], "hi-IN", settings.low_trust_verify_langs
+                translated, normalize_provider_transcript(verification), "hi-IN", settings.low_trust_verify_langs
             )
             text_status = {
                 "status": translation_result["status"],
@@ -148,7 +147,7 @@ def run_phase3(video_path: Path, reference_path: Path, output_path: Path, settin
             }
             final_status = combine_audio_verification(
                 translated,
-                verification["transcript"],
+                normalize_provider_transcript(verification),
                 "hi-IN",
                 text_status,
                 settings.low_trust_verify_langs,

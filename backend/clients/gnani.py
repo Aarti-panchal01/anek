@@ -24,7 +24,7 @@ class GnaniClient(Protocol):
 
 
 class MockGnaniClient:
-    def stt(self, audio: bytes, language_code: str, model: str) -> dict:
+    def stt(self, audio: bytes, language_code: str, model: str, **options) -> dict:
         return {"text": "Synthetic mock transcript", "language_code": language_code, "model": model}
 
     def make_embedding(self, audio: bytes) -> dict:

@@ -3,7 +3,7 @@
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from typing import Annotated
 
@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     gnani_api_key: str = ""
     gnani_base_url: str = "https://api.vachana.ai"
     sarvam_api_key: str = ""
+    sarvam_api_key_1: str = ""
+    sarvam_api_key_2: str = ""
+    sarvam_api_key_3: str = ""
+    sarvam_api_key_4: str = ""
+    sarvam_api_key_5: str = ""
     sarvam_translation_model: str = "mayura:v1"
     sarvam_rewrite_model: str = "sarvam-105b-conversations"
     numeral_style: str = "ascii"
@@ -52,6 +57,26 @@ class Settings(BaseSettings):
     anek_auth_secret: str = ""
     cors_origins: str = ""
     cors_origin_regex: str = ""
+
+    @property
+    def resolved_sarvam_api_keys(self) -> tuple[str, ...]:
+        numbered = tuple(
+            key for key in (
+                self.sarvam_api_key_1, self.sarvam_api_key_2, self.sarvam_api_key_3,
+                self.sarvam_api_key_4, self.sarvam_api_key_5,
+            ) if key and key.strip()
+        )
+        if numbered:
+            return tuple(dict.fromkeys(key.strip() for key in numbered))
+        return (self.sarvam_api_key.strip(),) if self.sarvam_api_key.strip() else ()
+
+    @model_validator(mode="after")
+    def set_legacy_sarvam_key(self) -> "Settings":
+        if not self.sarvam_api_key:
+            keys = self.resolved_sarvam_api_keys
+            if keys:
+                self.sarvam_api_key = keys[0]
+        return self
 
     @field_validator("enabled_langs", mode="before")
     @classmethod

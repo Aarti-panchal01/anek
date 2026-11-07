@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import os
 import argparse
 import sys
 import unicodedata
 from pathlib import Path
 
-from sarvamai import SarvamAI
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.brain.numbers import compare_numbers
-from backend.config import LANGUAGES
+from backend.clients.llm import SarvamTranslationClient
+from backend.config import LANGUAGES, get_settings
 
 
 SENTENCES = [
@@ -44,10 +43,11 @@ def main() -> None:
     parser.add_argument("--style", choices=("Natural", "Pure", "both"), default="both")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    key = os.environ.get("SARVAM_API_KEY")
-    if not key:
-        raise SystemExit("SARVAM_API_KEY is required")
-    client = SarvamAI(api_subscription_key=key)
+    settings = get_settings()
+    try:
+        client = SarvamTranslationClient(settings)
+    except ValueError as exc:
+        raise SystemExit("SARVAM_API_KEY or SARVAM_API_KEY_1..5 is required") from exc
     styles = (
             ("Natural", "modern-colloquial", "spoken-form-in-native"),
             ("Pure", "formal", "fully-native"),
@@ -65,7 +65,7 @@ def main() -> None:
                 source_text = HINDI_SENTENCES[index - 1] if code == "en-IN" else sentence
                 source_code = "hi-IN" if code == "en-IN" else "en-IN"
                 try:
-                    result = client.text.translate(
+                    result = client.translate_text(
                         input=source_text,
                         source_language_code=source_code,
                         target_language_code=code,

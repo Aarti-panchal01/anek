@@ -24,8 +24,8 @@ from backend.brain.termsheet import (
     TermSheet, apply_mishearing_maps, apply_spoken_forms, extract_termsheet,
     mask_protected_terms, restore_protected_terms,
 )
-from backend.clients.gnani import LiveGnaniClient
-from backend.clients.llm import SarvamTranslationClient, MockLLMClient, SarvamSpeechClient, create_translation_client, create_workflow_client
+from backend.clients.gnani import create_gnani_client
+from backend.clients.llm import SarvamTranslationClient, MockLLMClient, create_translation_client, create_workflow_client
 from backend.config import LANGUAGES, Settings, get_settings
 from backend.verify.flags import audio_number_status
 from backend.verify.report import build_report
@@ -311,9 +311,9 @@ def normalize_cleanup_changes(changes) -> list[dict]:
     return normalized
 
 
-def transcribe_generated_speech(gnani, audio: bytes, language: str) -> dict:
-    """Use Gnani STT to check target-language audio produced by Gnani TTS."""
-    response = gnani.stt(audio, language, "prisma-v3.0")
+def transcribe_generated_speech(gnani, audio: bytes, language: str, model: str = "prisma-v3.0", **options) -> dict:
+    """Use Gnani STT for source and generated speech transcription."""
+    response = gnani.stt(audio, language, model, **options)
     return {"transcript": normalize_provider_transcript(response), "detected_language_code": language}
 
 
@@ -800,8 +800,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         if only_clip_index >= len(prior_rows):
             raise ValueError("Regeneration clip index is outside the saved segment map")
         prior_clip = prior_rows[only_clip_index]
-    gnani = LiveGnaniClient(settings)
-    sarvam_stt = SarvamSpeechClient(settings)
+    gnani = create_gnani_client(settings.gnani_mock)
     checkpoint_state = resume_state if resume_state is not None else {}
 
     def checkpoint(stage: str) -> None:
@@ -814,7 +813,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
 
     stt_cache = checkpoint_state.setdefault("stt_cache", {})
 
-    def cached_stt(audio: bytes, language: str, model: str, *, provider: str = "sarvam", **options) -> dict:
+    def cached_stt(audio: bytes, language: str, model: str, *, provider: str = "gnani", **options) -> dict:
         digest = hashlib.sha256(audio).hexdigest()
         key_parts = [digest, language, model, options]
         if provider != "sarvam":
@@ -822,10 +821,8 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         cache_key = json.dumps(key_parts, sort_keys=True, ensure_ascii=False)
         if cache_key not in stt_cache:
             check_continue()
-            if provider == "sarvam":
-                stt_cache[cache_key] = sarvam_stt.stt(audio, language_code=language, **options)
-            elif provider == "gnani":
-                stt_cache[cache_key] = transcribe_generated_speech(gnani, audio, language)
+            if provider == "gnani":
+                stt_cache[cache_key] = transcribe_generated_speech(gnani, audio, language, model, **options)
             else:
                 raise ValueError(f"Unknown transcription provider: {provider}")
             checkpoint("transcript")
@@ -846,7 +843,7 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
         run_command(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(source_wav)])
         room_tone_path, room_tone_span = extract_room_tone(source_wav, work, duration)
         source_silence_spans = detected_silence_spans(source_wav, duration)
-        source_stt_model = "saaras:v3"
+        source_stt_model = "prisma-v3.0"
         stt_language = "unknown" if source_language == "auto" else source_language
         source_format = "transcribe"
         resumed_term_fixes = checkpoint_state.get("term_fixes")

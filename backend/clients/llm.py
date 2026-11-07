@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import random
 import re
@@ -32,6 +33,10 @@ class BadInputError(ProviderError):
     code = "bad_input"
 
 
+class CredentialError(ProviderError):
+    code = "credential_rejected"
+
+
 class LLMClient(Protocol):
     def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]: ...
 
@@ -43,11 +48,12 @@ class SharedSarvamLimiter:
     _lock = threading.Lock()
     _starts: deque[float] = deque()
     _unavailable_until = 0.0
+    _key_unavailable_until: dict[str, float] = {}
 
     @classmethod
-    def call(cls, operation):
+    def call(cls, operation, *, respect_breaker: bool = True):
         with cls._lock:
-            if time.monotonic() < cls._unavailable_until:
+            if respect_breaker and time.monotonic() < cls._unavailable_until:
                 raise ProviderError("Sarvam circuit is open after a recent provider failure")
         with cls._semaphore:
             while True:
@@ -71,10 +77,10 @@ def _status_code(error: Exception) -> int | None:
         return None
 
 
-def _provider_call(operation, *, attempts: int = 4):
+def _provider_call(operation, *, attempts: int = 4, respect_breaker: bool = True):
     for attempt in range(attempts):
         try:
-            result = SharedSarvamLimiter.call(operation)
+            result = SharedSarvamLimiter.call(operation, respect_breaker=respect_breaker)
             with SharedSarvamLimiter._lock:
                 SharedSarvamLimiter._unavailable_until = 0.0
             return result
@@ -82,7 +88,9 @@ def _provider_call(operation, *, attempts: int = 4):
             if isinstance(exc, ProviderError) and "circuit is open" in str(exc):
                 raise
             status = _status_code(exc)
-            if status == 429:
+            if status in {401, 403, 402}:
+                error_type = CredentialError
+            elif status == 429:
                 error_type = RateLimitedError
             elif status is not None and status >= 500:
                 error_type = ProviderError
@@ -94,8 +102,9 @@ def _provider_call(operation, *, attempts: int = 4):
             if retryable and attempt + 1 < attempts:
                 time.sleep(min(8.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25))
                 continue
-            with SharedSarvamLimiter._lock:
-                SharedSarvamLimiter._unavailable_until = time.monotonic() + 300.0
+            if respect_breaker and error_type not in {CredentialError, RateLimitedError, BadInputError}:
+                with SharedSarvamLimiter._lock:
+                    SharedSarvamLimiter._unavailable_until = time.monotonic() + 300.0
             raise error_type(f"Sarvam request failed ({error_type.code})") from exc
 
 
@@ -177,7 +186,8 @@ class SarvamTranslationClient:
     """Sarvam Translate/Mayura for translations and Sarvam chat for structured QA."""
 
     def __init__(self, settings: Settings):
-        if not settings.sarvam_api_key:
+        self.api_keys = settings.resolved_sarvam_api_keys
+        if not self.api_keys:
             raise ValueError("SARVAM_API_KEY is required")
         from sarvamai import SarvamAI
 
@@ -185,11 +195,53 @@ class SarvamTranslationClient:
         self.rewrite_model = settings.sarvam_rewrite_model
         self.model = self.translation_model
         self.models_used: list[str] = []
-        self.client = SarvamAI(api_subscription_key=settings.sarvam_api_key, timeout=60.0)
+        self.clients = [SarvamAI(api_subscription_key=key, timeout=60.0) for key in self.api_keys]
+        self.client = self.clients[0]
+        self._key_fingerprints = [hashlib.sha256(key.encode("utf-8")).hexdigest() for key in self.api_keys]
+        self._rotation_index = 0
+
+    def _call_with_key_rotation(self, operation):
+        clients = getattr(self, "clients", [self.client])
+        fingerprints = getattr(self, "_key_fingerprints", ["legacy-key"])
+        now = time.monotonic()
+        indices = list(range(len(clients)))
+        if indices:
+            shift = getattr(self, "_rotation_index", 0) % len(indices)
+            indices = indices[shift:] + indices[:shift]
+        attempted = []
+        last_key_error: ProviderError | None = None
+        for index in indices:
+            fingerprint = fingerprints[index]
+            with SharedSarvamLimiter._lock:
+                unavailable_until = SharedSarvamLimiter._key_unavailable_until.get(fingerprint, 0.0)
+            if unavailable_until > now:
+                continue
+            attempted.append(index)
+            try:
+                result = _provider_call(
+                    lambda: operation(clients[index]), attempts=1, respect_breaker=False,
+                )
+                self._rotation_index = (index + 1) % len(clients)
+                return result
+            except (CredentialError, RateLimitedError) as exc:
+                last_key_error = exc
+                with SharedSarvamLimiter._lock:
+                    SharedSarvamLimiter._key_unavailable_until[fingerprint] = time.monotonic() + 300.0
+                LOGGER.warning("Sarvam key slot %d cooling down for 5 minutes after %s", index + 1, exc.code)
+            except ProviderError:
+                raise
+        if last_key_error is not None:
+            raise ProviderError("All configured Sarvam keys are unavailable or quota-limited") from last_key_error
+        if attempted:
+            raise ProviderError("Sarvam is temporarily unavailable; retry after the provider cooldown")
+        raise ProviderError("All configured Sarvam keys are in a 5-minute cooldown")
+
+    def translate_text(self, **options):
+        return self._call_with_key_rotation(lambda client: client.text.translate(**options))
 
     def _chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         try:
-            response = _provider_call(lambda: self.client.chat.completions(
+            response = self._call_with_key_rotation(lambda client: client.chat.completions(
                 model=self.rewrite_model, messages=messages, temperature=0.2, max_tokens=4096,
                 response_format={"type": "json_object"},
                 request_options={"timeout_in_seconds": 60, "max_retries": 0},
@@ -248,7 +300,7 @@ class SarvamTranslationClient:
                         if self.translation_model == "mayura:v1" and target != "en-IN":
                             translate_options["output_script"] = output_script
                         try:
-                            result = _provider_call(lambda: self.client.text.translate(**translate_options))
+                            result = self.translate_text(**translate_options)
                         except ProviderError:
                             if self.translation_model != "mayura:v1":
                                 raise
@@ -257,7 +309,7 @@ class SarvamTranslationClient:
                             LOGGER.warning("Mayura translation failed; using sarvam-translate:v1 formal fallback")
                             # A failed Mayura request opens its circuit. The separately
                             # configured formal fallback is still attempted once.
-                            result = self.client.text.translate(**translate_options)
+                            result = self.translate_text(**translate_options)
                         translated = getattr(result, "translated_text", None)
                         if not isinstance(translated, str) or not translated.strip():
                             raise ProviderError("Sarvam translation returned no text")
@@ -270,41 +322,6 @@ class SarvamTranslationClient:
             self.models_used.extend(model for model in used_models if model not in self.models_used)
             return {"candidates": [{"translations": translations, "review_notes": []} for _ in range(3)]}
         return self._chat_json(messages)
-
-
-class SarvamSpeechClient:
-    """Saaras v3 REST transcription. Callers split long audio at silence boundaries."""
-
-    def __init__(self, settings: Settings):
-        self.mock = bool(settings.llm_mock)
-        if self.mock:
-            self.client = None
-            return
-        if not settings.sarvam_api_key:
-            raise ValueError("SARVAM_API_KEY is required")
-        from sarvamai import SarvamAI
-        self.client = SarvamAI(api_subscription_key=settings.sarvam_api_key, timeout=60.0)
-
-    def stt(self, audio: bytes, language_code: str = "unknown", **options) -> dict[str, Any]:
-        if self.mock:
-            return {"transcript": "Synthetic mock transcript", "detected_language_code": language_code,
-                    "timestamps": None}
-        try:
-            result = _provider_call(lambda: self.client.speech_to_text.transcribe(
-                file=("audio.wav", audio, "audio/wav"),
-                model="saaras:v3", mode="transcribe", language_code=language_code,
-                with_timestamps=True, input_audio_codec="wav",
-                request_options={"timeout_in_seconds": 60, "max_retries": 0},
-            ))
-        except ProviderError:
-            raise
-        transcript = getattr(result, "transcript", None)
-        if not isinstance(transcript, str):
-            raise BadInputError("Sarvam transcription returned no transcript")
-        timestamps = getattr(result, "timestamps", None)
-        return {"transcript": transcript,
-                "detected_language_code": getattr(result, "language_code", None) or language_code,
-                "timestamps": timestamps.model_dump() if hasattr(timestamps, "model_dump") else timestamps}
 
 
 def create_llm_client(mock: bool = False) -> LLMClient:

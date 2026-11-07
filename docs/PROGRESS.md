@@ -272,3 +272,15 @@ Exact ffprobe outputs:
 - Final frontend validation: `cd frontend && npm run build` passed (API-prefix guard, TypeScript, Vite). `git diff --check` passed.
 - Remaining visual detail: the verified card's action row may move vertically by about 10 px in the local browser despite stable action widths and reserved warning space; this is a minor layout shift, not a failed interaction. Production deployment and Railway live diagnostic output were not verified here.
 - Final push is pending after these passing checks.
+
+## Round 15: Sarvam key pool and Gnani speech path
+
+- Added support for `SARVAM_API_KEY_1` through `SARVAM_API_KEY_5`, preferring the numbered pool and retaining `SARVAM_API_KEY` as a single-key fallback. Each key that returns auth rejection or quota/rate-limit is skipped for five minutes; translation calls continue with another configured key. Keys remain only in local `.env` and Railway, never in source or logs.
+- Confirmed the provider split: Gnani handles source/generated-speech STT and TTS. Sarvam is used by translation/text workflow. Removed Sarvam STT from both dubbing pipelines; the Hindi legacy pipeline now uses Gnani STT too.
+- Updated `.env.example`, provider check scripts, and `docs/GO_LIVE.md` for the numbered Sarvam key pool.
+- Railway Production variable names checked without reading values: all five numbered Sarvam names are present, the legacy single-key variable is also present, and `GNANI_API_KEY` is configured. Numbered keys take precedence over the legacy name.
+- Live Sarvam provider check using the local configured key pool passed for Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil, and Telugu.
+- Live Gnani smoke call passed: Hindi stock TTS returned audio and Gnani STT returned a transcript. Only audio byte count and transcript character count were displayed.
+- End-to-end mocked smoke test: `python -m pytest tests/test_resilience_smoke.py -q` passed. Full backend suite and frontend build were rerun after the implementation and passed (207 backend tests; four existing FastAPI lifecycle deprecation warnings; API-prefix check, TypeScript, and Vite build passed).
+- Limitation: external provider uptime and quota accounting are controlled by Sarvam/Gnani. Key rotation prevents one exhausted/rejected Sarvam key from stopping translation while another is usable, but cannot guarantee zero errors during network outages or if all keys are exhausted/invalid.
+- Git push and Railway deployment verification are pending.
