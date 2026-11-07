@@ -248,10 +248,12 @@ class SarvamTranslationClient:
                 raise UnsupportedLanguageError(f"Unsupported target language: {target}")
             style = str(payload.get("translation_style", "natural")).casefold()
             tone = str(payload.get("tone", "")).casefold()
-            mode = "formal" if style == "pure" else "classic-colloquial"
+            # General is deliberately code-mixed: preserve English words in
+            # Latin script while translating the surrounding sentence. Pure
+            # uses formal wording and native-script transliteration.
+            mode = "formal" if style == "pure" else "code-mixed"
             if self.translation_model == "sarvam-translate:v1":
                 mode = "formal"
-            output_script = "fully-native"
             translations = []
             used_models: list[str] = []
             for span in spans:
@@ -274,8 +276,8 @@ class SarvamTranslationClient:
                             mode=mode,
                             request_options={"timeout_in_seconds": 60, "max_retries": 0},
                         )
-                        if self.translation_model == "mayura:v1" and target != "en-IN":
-                            translate_options["output_script"] = output_script
+                        if style == "pure" and self.translation_model == "mayura:v1" and target != "en-IN":
+                            translate_options["output_script"] = "fully-native"
                         try:
                             result = self.translate_text(**translate_options)
                         except ProviderError:

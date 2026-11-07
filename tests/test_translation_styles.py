@@ -21,7 +21,7 @@ def _client(model="mayura:v1"):
 
 @pytest.mark.parametrize("target", list(LANGUAGES))
 @pytest.mark.parametrize(("style", "mode", "script"), [
-    ("natural", "classic-colloquial", "fully-native"),
+    ("natural", "code-mixed", None),
     ("pure", "formal", "fully-native"),
 ])
 def test_translation_style_parameters_for_all_ten_targets(monkeypatch, target, style, mode, script):
@@ -46,7 +46,7 @@ def test_translation_style_parameters_for_all_ten_targets(monkeypatch, target, s
     assert calls[0]["mode"] == mode
     assert calls[0]["input"] == "We studied 2 things. Asia is a large continent."
     assert "ZXQ" not in calls[0]["input"]
-    if target == "en-IN":
+    if target == "en-IN" or style == "natural":
         assert "output_script" not in calls[0]
     else:
         assert calls[0]["output_script"] == script

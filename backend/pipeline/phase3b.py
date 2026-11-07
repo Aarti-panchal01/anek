@@ -20,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 from backend.atomic_files import atomic_copyfile, atomic_write_bytes, atomic_write_text, run_atomic_command
 
-from backend.brain.checks import latin_letter_share, run_checks
+from backend.brain.checks import run_checks
 from backend.brain.termsheet import (
     TermSheet, apply_mishearing_maps, apply_spoken_forms, extract_termsheet,
     mask_protected_terms, restore_protected_terms,
@@ -49,11 +49,11 @@ SENTENCE_ENDINGS = r".!?।॥。！？؟։"
 
 
 def translation_style_instruction(style: str, target_lang: str) -> str:
-    """Keep everyday translation in the target language unless English is requested."""
+    """Return the user-visible General/Pure translation contract."""
     if style == "pure":
-        return "Use formal spoken phrasing and native script. Translate ordinary English loanwords into natural target-script spellings. Preserve approved brand/person names and terms from the term sheet exactly as instructed."
+        return "Use formal spoken phrasing in the target language and native script. Translate all ordinary English words and phrases. Preserve approved brand/person names and protected terms from the term sheet exactly as instructed."
     if style == "natural":
-        return "Use modern-colloquial spoken phrasing in the target script. Render English loanwords in the target script where natural; preserve approved brand/person names and terms from the term sheet exactly as instructed."
+        return "Use modern-colloquial, code-mixed speech. Keep English words and phrases from the source in English Latin script when they fit naturally, including names and technical or subject terms such as 'northeastern hemisphere'. Translate the rest into the target language and script. Preserve protected terms from the term sheet exactly as instructed."
     if style == "keep_technical":
         return "Translate ordinary words and place names into the target language; keep only established technical terms and approved brand/person names in English."
     if style == "formal":
@@ -523,7 +523,7 @@ def translation_candidates(
         "formal": "clear, respectful formal spoken register",
         "colloquial": "everyday casual spoken language",
         "marketing": "energetic and persuasive spoken language",
-        "natural_spoken": "natural spoken target-language speech with minimal English",
+        "natural_spoken": "natural spoken code-mixed speech with source English terms retained",
         "keep_technical": "natural spoken speech with established English technical terms",
     }.get(translation_style, CONTENT_TONES[content_type])
     style_instruction = translation_style_instruction(translation_style, target_lang)
@@ -542,7 +542,7 @@ def translation_candidates(
         }
     response = prompt_json(
         client,
-        f"Generate exactly three spoken translations. {style_instruction} Use the target language's native script for ordinary words. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement or infinitive phrase into an instruction, or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun, verb, or brand means. For uncertain phrases, preserve the ASR content without resolving it. Every keep/locked term must appear in its exact approved form. Preserve full meaning even when it exceeds the duration budget; duration is a preference for rephrasing concisely, never a reason to remove information. Follow duration_budget.instruction and target_chars as an estimate, not a truncation rule. Return JSON: {{candidates:[string,string,string]}}.",
+        f"Generate exactly three spoken translations. {style_instruction} Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement or infinitive phrase into an instruction, or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun, verb, or brand means. For uncertain phrases, preserve the ASR content without resolving it. Every keep/locked term must appear in its exact approved form. Preserve full meaning even when it exceeds the duration budget; duration is a preference for rephrasing concisely, never a reason to remove information. Follow duration_budget.instruction and target_chars as an estimate, not a truncation rule. Return JSON: {{candidates:[string,string,string]}}.",
         payload,
     )
     candidates = response.get("candidates", [])
@@ -606,7 +606,7 @@ def paragraph_translation_candidates(
         "formal": "clear, respectful spoken register",
         "colloquial": "everyday casual spoken language",
         "marketing": "energetic and persuasive spoken language",
-        "natural_spoken": "natural spoken target-language speech with minimal English",
+        "natural_spoken": "natural spoken code-mixed speech with source English terms retained",
         "keep_technical": "natural spoken speech with established English technical terms",
     }.get(translation_style, CONTENT_TONES[content_type])
     style_instruction = translation_style_instruction(translation_style, target_lang)
@@ -641,7 +641,8 @@ def paragraph_translation_candidates(
         "Return exactly three candidate objects, each with a translations array in the same order and length as "
         "timed_source_spans. Translate every span fully; do not merge spans or change who does what. Use natural spoken "
         "target-language phrasing and preserve casual register and fillers. The character budget is a timing hint only; "
-        "never drop meaning. Use the target language's native script for ordinary words, including place names and number words. Do not "
+        "never drop meaning. In Pure style use the target language's native script for all translated words. In General style "
+        "retain source English terms in Latin script as requested by the style instruction. Do not "
         "transliterate abstract English words. Keep agents, actions, objects, polarity, modality, numbers, and speech act. "
         "Do not guess unclear source nouns or brands; retain the heard wording and mark uncertainty in review_notes. "
         "Return JSON shaped as {candidates:[{translations:[...],review_notes:[...]}, ...]}.",
@@ -1422,10 +1423,6 @@ def run_quality_pass(video: Path, reference: Path | None, targets: list[str], ou
                     meaning = {"back_translation": "", "meaning_preserved": None}
                     meaning_check_failed = True
                 reasons = list(audio_flag["reasons"])
-                if translation_style == "natural":
-                    latin_share = latin_letter_share(selected, target_lang, clip_terms)
-                    if latin_share >= 0.05:
-                        reasons.append(f"Native-script advisory: {latin_share:.1%} of unprotected letters are Latin.")
                 if translation_checks:
                     reasons.append("Translation checks flagged this clip; edit and review it before approval.")
                 if protected_missing:

@@ -38,13 +38,15 @@ from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons,
 
 
 @pytest.mark.parametrize("target_lang", ["hi-IN", "kn-IN"])
-def test_natural_spoken_translation_style_rejects_unnecessary_english_for_geography_sample(target_lang):
+def test_general_translation_style_preserves_english_geography_terms(target_lang):
     source = "So we have studied two things. India is located on the northeastern hemisphere, along with it,"
-    instruction = translation_style_instruction("natural_spoken", target_lang)
+    instruction = translation_style_instruction("natural", target_lang)
     assert source.startswith("So we have studied two things.")
-    assert "Translate ordinary words, place names, and common number words" in instruction
-    assert "minimal English loanwords" in instruction
-    assert "approved brand/person names" in instruction
+    assert "code-mixed" in instruction
+    assert "northeastern hemisphere" in instruction
+    assert "Latin script" in instruction
+    pure_instruction = translation_style_instruction("pure", target_lang)
+    assert "Translate all ordinary English words and phrases" in pure_instruction
 
 
 @pytest.mark.parametrize("target_lang", ["hi-IN", "kn-IN"])
