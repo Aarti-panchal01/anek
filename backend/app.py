@@ -645,6 +645,22 @@ def verification_fingerprint(row: dict | object, audio_path: Path) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def verification_audio_path(project_id: str, lang: str, clip_audio_path: str | Path | None) -> Path | None:
+    """Use the clip take when present, otherwise the current mixed dub track."""
+    export_root = (DATA_ROOT / "exports" / project_id).resolve()
+    candidates = [Path(clip_audio_path).resolve()] if clip_audio_path else []
+    mixed_track = _track_artifact_path(project_id, lang, "dubbed")
+    if mixed_track:
+        candidates.append(mixed_track.resolve())
+    for path in candidates:
+        try:
+            if path.is_relative_to(export_root) and path.is_file() and path.stat().st_size > 0:
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def safe_upload_name(filename: str | None) -> str:
     return Path(filename or "upload.bin").name
 
@@ -1662,17 +1678,19 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         audio_version = Path(audio_path).stat().st_mtime_ns if audio_present else ""
         item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio?v={audio_version}" if audio_present else None
         item["audio_stale"] = bool(item.get("audio_stale", False))
+        verification_audio = verification_audio_path(project_id, lang, audio_path)
+        item["verification_available"] = bool(verification_audio and not item["audio_stale"])
         item["timeline_start_s"] = float(item["start_s"]) + float(item.get("timing_offset_s") or 0)
         item["timing_locked"] = bool(item.get("timing_locked", False))
         item["audio_removed"] = bool(audio_path and not audio_present)
         fingerprint = None
-        if audio_present and not item["audio_stale"] and item.get("dub_id"):
+        if verification_audio and not item["audio_stale"] and item.get("dub_id"):
             try:
                 fingerprint = verification_fingerprint({
                     "id": item["dub_id"], "translation": item.get("translation") or "",
                     "duration_s": item.get("dub_duration_s"), "start_s": item["start_s"],
                     "end_s": item["end_s"], "timing_offset_s": item.get("timing_offset_s", 0),
-                }, Path(audio_path))
+                }, verification_audio)
             except OSError:
                 fingerprint = None
         verified = bool(item.get("user_verified") and fingerprint and fingerprint == item.get("verified_fingerprint"))
@@ -1817,10 +1835,9 @@ async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None =
             raise HTTPException(409, "Wait for this clip's new audio to finish before verifying it")
         if row["audio_stale"]:
             raise HTTPException(409, "The saved translation has no matching generated audio yet. Re-speak this clip before verifying it")
-        audio_path = Path(row["audio_path"] or "").resolve()
-        export_root = (DATA_ROOT / "exports" / row["project_id"]).resolve()
-        if not row["audio_path"] or not audio_path.is_relative_to(export_root) or not audio_path.is_file() or audio_path.stat().st_size == 0:
-            raise HTTPException(409, "Generate and listen to this clip's audio before verifying it")
+        audio_path = verification_audio_path(row["project_id"], lang, row["audio_path"])
+        if audio_path is None:
+            raise HTTPException(409, "Generate current clip audio or a dubbed track before verifying it")
         # Verification records the user's approval of the generated take.
         # Automatic QA and fit warnings remain visible separately; a manual
         # approval must not silently fail because the take is long or flagged.
