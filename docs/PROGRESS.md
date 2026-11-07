@@ -283,4 +283,4 @@ Exact ffprobe outputs:
 - Live Gnani smoke call passed: Hindi stock TTS returned audio and Gnani STT returned a transcript. Only audio byte count and transcript character count were displayed.
 - End-to-end mocked smoke test: `python -m pytest tests/test_resilience_smoke.py -q` passed. Full backend suite and frontend build were rerun after the implementation and passed (207 backend tests; four existing FastAPI lifecycle deprecation warnings; API-prefix check, TypeScript, and Vite build passed).
 - Limitation: external provider uptime and quota accounting are controlled by Sarvam/Gnani. Key rotation prevents one exhausted/rejected Sarvam key from stopping translation while another is usable, but cannot guarantee zero errors during network outages or if all keys are exhausted/invalid.
-- Git push and Railway deployment verification are pending.
+- Code commit `e57f42b` was pushed to `main`. Railway's latest deployment `f3f25cd5-11ad-43f2-832c-23ae0f6da6f0` reached `SUCCESS`; production `/health` returned HTTP 200. Recheck is pending only if the progress note itself triggers another deployment.
