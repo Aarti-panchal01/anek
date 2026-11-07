@@ -1703,6 +1703,10 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
             "duration_budget_chars": review_by_clip.get(int(row["idx"]), {}).get("duration_budget_chars"),
             "withheld": bool(review_by_clip.get(int(row["idx"]), {}).get("withheld", False)),
         })
+        item["timeline_end_s"] = review_by_clip.get(int(row["idx"]), {}).get(
+            "scheduled_end_s",
+            item["timeline_start_s"] + float(item.get("spoken_duration_s") or 0) / max(1.0, float(item.get("timing_speedup") or 1.0)),
+        )
         reason_texts = item["reasons"]
         reason_blob = " ".join(reason_texts).casefold()
         if "withheld" in reason_blob or "exceeds its safe slot" in reason_blob or "slot" in reason_blob and "speech" in reason_blob:

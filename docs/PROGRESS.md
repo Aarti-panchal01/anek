@@ -198,3 +198,18 @@ Exact ffprobe outputs:
 - Part B commit: pending.
 - Part C next: rolling synchronized playback, playhead and list-follow behavior, drag timing with bounds and snapping, undo/redo, transcript layout and local visual QA.
 - Part B limitation: the endpoint reports `shorten_required` and advises the Concise style but does not automatically call Sarvam to shorten and re-synthesize a clip. Automatic paid generation is deferred; the schedule never writes an overlapping placement.
+
+### Part B push
+
+- Part B commit and push: `80c4d14`.
+
+### Part C complete
+
+- The main dubbed player continues on the server-rendered mixed track. Playback time moves a timeline playhead, selects the active clip, and scrolls the transcript list to it. Selecting a clip seeks to its placed start and plays only its speech range.
+- The timeline shows status-colored source slots, the placed speech fill, and an overlap marker. Dragging the speech bar adjusts its start within +/-1.0 seconds; an overlap is surfaced immediately and the server rejects invalid placements. Added per-timeline Undo and Redo, plus Balance timing.
+- The selected transcript editor presents source and translated text in two columns on desktop and stacks them on mobile. Audio elements load metadata so existing take durations appear without first pressing Play. Verified clips no longer show contradictory automatic review warnings. Removed the accidental numeric `0` rendered next to Undo edit.
+- Playback implementation choice: use the single mixed preview track rendered server-side, so preview and export share one placement and mix.
+- Playwright QA ran against a local API server with `GNANI_MOCK` and `LLM_MOCK`, an isolated temporary data directory, and a 17.8-second generated source. The job completed with three clips in Hindi and Kannada. Actual clip statuses were review-needed; none was red because of slot length. All three takes were nonempty WAVs and reported durations through the browser. A routed visual fixture showed one verified, one review, and one needs-you state. Captured and viewed `timeline-statuses.png`, `timeline-drag.png`, and `timeline-balanced.png` under the system temp directory; screenshots and Playwright code are not committed.
+- Part C validation: `python -m pytest tests -q` passed (158 tests; 4 existing FastAPI lifecycle deprecation warnings). `cd frontend && npm run build` passed (API-prefix check, TypeScript, Vite). The screenshots were captured and inspected; the first loaded take reports 2.856 seconds in Playwright.
+- Part C commit: pending.
+- Limits: drag editing currently adjusts clip start only, not the end handle, and does not snap automatically to neighboring clips. The mock visual fixture used generated test-pattern video and synthetic transcript text, not user footage or paid providers. Part B automatic Sarvam shortening and re-synthesis remains deferred as recorded above.
