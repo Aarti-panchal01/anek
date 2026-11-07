@@ -1,6 +1,7 @@
 """Anek HTTP API and static frontend host."""
 
 import asyncio
+from array import array
 import base64
 import hashlib
 import hmac
@@ -550,6 +551,24 @@ class BalanceRequest(BaseModel):
     max_speedup: float = Field(default=1.15, ge=1, le=1.25)
     pack_all: bool = False
     apply: bool = True
+
+
+class TrimRequest(BaseModel):
+    tighten_pauses: bool = False
+
+
+class TimelinePlacement(BaseModel):
+    clip_id: str
+    start_s: float = Field(ge=0)
+    speed_factor: float = Field(default=1.0, ge=1.0, le=1.25)
+    trim_head_s: float = Field(default=0.0, ge=0)
+    trim_tail_s: float = Field(default=0.0, ge=0)
+    pause_tightening: bool = False
+    manual: bool = True
+
+
+class TimelinePlacementRequest(BaseModel):
+    placements: list[TimelinePlacement]
 
 
 class SourceEdit(BaseModel):
@@ -1722,7 +1741,7 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
     project_row(project_id)
     with db.connect() as connection:
         rows = connection.execute(
-        "SELECT c.*,d.id AS dub_id,d.selected_take_id,d.translation,d.draft_translation,d.status,d.auto_status,d.reasons_json,d.attempts_json,d.audio_path,d.audio_stale,d.human_edited,d.user_verified,d.verified_fingerprint,d.verified_at,d.verify_override,d.verify_override_note,d.timing_offset_s,d.timing_locked,d.duration_s AS dub_duration_s "
+        "SELECT c.*,d.id AS dub_id,d.selected_take_id,d.translation,d.draft_translation,d.status,d.auto_status,d.reasons_json,d.attempts_json,d.audio_path,d.audio_stale,d.human_edited,d.user_verified,d.verified_fingerprint,d.verified_at,d.verify_override,d.verify_override_note,d.timing_offset_s,d.timing_locked,d.timing_speedup,d.trim_head_s,d.trim_tail_s,d.pause_tightening,d.duration_s AS dub_duration_s "
             "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
             (lang, project_id),
         ).fetchall()
@@ -1742,6 +1761,7 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         audio_present = bool(audio_path and Path(audio_path).is_file())
         audio_version = Path(audio_path).stat().st_mtime_ns if audio_present else ""
         item["audio_url"] = f"/api/clips/{item['id']}/dubs/{lang}/audio?v={audio_version}" if audio_present else None
+        item["waveform_peaks"] = _audio_peaks(Path(audio_path)) if audio_present else []
         item["audio_stale"] = bool(item.get("audio_stale", False))
         verification_audio = verification_audio_path(project_id, lang, audio_path)
         item["verification_available"] = bool(verification_audio and not item["audio_stale"])
@@ -1772,7 +1792,10 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
             "stt_review": review_by_clip.get(int(row["idx"]), {}).get("stt_review", {}),
             "slot_s": review_by_clip.get(int(row["idx"]), {}).get("slot_s", float(row["end_s"]) - float(row["start_s"])),
             "spoken_duration_s": review_by_clip.get(int(row["idx"]), {}).get("final_audio_duration_s", row["dub_duration_s"]),
-            "timing_speedup": review_by_clip.get(int(row["idx"]), {}).get("timing_speedup", 1.0),
+            "timing_speedup": float(item.get("timing_speedup") or review_by_clip.get(int(row["idx"]), {}).get("timing_speedup", 1.0)),
+            "trim_head_s": float(item.get("trim_head_s") or 0.0),
+            "trim_tail_s": float(item.get("trim_tail_s") or 0.0),
+            "pause_tightening": bool(item.get("pause_tightening")),
             "timing_shorten_required": bool(review_by_clip.get(int(row["idx"]), {}).get("timing_shorten_required", False)),
             "duration_budget_chars": review_by_clip.get(int(row["idx"]), {}).get("duration_budget_chars"),
             "withheld": bool(review_by_clip.get(int(row["idx"]), {}).get("withheld", False)),
@@ -1948,21 +1971,25 @@ def _render_scheduled_track(project_id: str, lang: str, placements: list[dict], 
         raise FileNotFoundError(f"The saved dubbed track is missing for {lang}")
     with db.connect() as connection:
         audio_rows = connection.execute(
-            "SELECT c.id,d.audio_path FROM clips c JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=?",
+            "SELECT c.id,d.audio_path,d.trim_head_s,d.trim_tail_s FROM clips c JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=?",
             (lang, project_id),
         ).fetchall()
-    audio_by_id = {row["id"]: Path(row["audio_path"]) for row in audio_rows if row["audio_path"]}
+    audio_by_id = {row["id"]: dict(row) for row in audio_rows if row["audio_path"]}
     inputs: list[str] = []
     graph: list[str] = []
     labels: list[str] = []
     for index, placement in enumerate(placements):
-        audio_path = audio_by_id.get(placement.get("id"))
+        audio_row = audio_by_id.get(placement.get("id"))
+        audio_path = Path(audio_row["audio_path"]) if audio_row else None
         if not audio_path or not audio_path.is_file():
             continue
         inputs.extend(["-i", str(audio_path)])
         speedup = max(1.0, float(placement.get("speedup") or 1.0))
         start_ms = max(0, round(float(placement["start_s"]) * 1000))
-        graph.append(f"[{len(labels)}:a]atempo={speedup:.6f},adelay={start_ms}|{start_ms}[a{len(labels)}]")
+        trim_head = max(0.0, float(placement.get("trim_head_s", audio_row.get("trim_head_s", 0)) or 0))
+        trim_tail = max(0.0, float(placement.get("trim_tail_s", audio_row.get("trim_tail_s", 0)) or 0))
+        effective = max(0.01, float(placement["speech_duration_s"]) - trim_head - trim_tail)
+        graph.append(f"[{len(labels)}:a]atrim=start={trim_head:.6f}:duration={effective:.6f},asetpts=PTS-STARTPTS,atempo={speedup:.6f},adelay={start_ms}|{start_ms}[a{len(labels)}]")
         labels.append(f"[a{len(labels)}]")
     if not labels:
         raise FileNotFoundError(f"No saved clip takes are available for {lang}")
@@ -1973,12 +2000,140 @@ def _render_scheduled_track(project_id: str, lang: str, placements: list[dict], 
             ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(graph), "-map", "[dub]", "-t", f"{duration_s:.6f}", str(temporary)],
             check=True, capture_output=True, timeout=240,
         )
-        with temporary.open("rb") as stream:
+        with temporary.open("r+b") as stream:
             os.fsync(stream.fileno())
         commit_temporary(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
     return target
+
+
+def _timing_state(connection, project_id: str, lang: str) -> dict[str, dict]:
+    rows = connection.execute(
+        "SELECT d.clip_id,d.timing_offset_s,d.timing_speedup,d.trim_head_s,d.trim_tail_s,d.pause_tightening,d.timing_locked "
+        "FROM dubs d JOIN clips c ON c.id=d.clip_id WHERE c.project_id=? AND d.lang=? ORDER BY c.idx",
+        (project_id, lang),
+    ).fetchall()
+    return {row["clip_id"]: {key: row[key] for key in (
+        "timing_offset_s", "timing_speedup", "trim_head_s", "trim_tail_s", "pause_tightening", "timing_locked"
+    )} for row in rows}
+
+
+def _record_timing_history(connection, project_id: str, lang: str, before: dict, after: dict) -> None:
+    if before == after:
+        return
+    connection.execute("DELETE FROM timing_history WHERE project_id=? AND lang=? AND state='undone'", (project_id, lang))
+    connection.execute(
+        "INSERT INTO timing_history(project_id,lang,before_json,after_json,state) VALUES(?,?,?,?, 'applied')",
+        (project_id, lang, json.dumps(before, sort_keys=True), json.dumps(after, sort_keys=True)),
+    )
+    connection.execute(
+        "DELETE FROM timing_history WHERE project_id=? AND lang=? AND id NOT IN "
+        "(SELECT id FROM timing_history WHERE project_id=? AND lang=? ORDER BY id DESC LIMIT 50)",
+        (project_id, lang, project_id, lang),
+    )
+
+
+def _audio_peaks(path: Path) -> list[float]:
+    cache = path.with_suffix(path.suffix + ".peaks.json")
+    try:
+        metadata = {"mtime_ns": path.stat().st_mtime_ns, "size": path.stat().st_size}
+        if cache.is_file():
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if cached.get("source") == metadata and isinstance(cached.get("peaks"), list):
+                return cached["peaks"]
+    except (OSError, ValueError, TypeError):
+        metadata = None
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-ac", "1", "-ar", "8000", "-f", "s16le", "-"],
+            check=True, capture_output=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        LOGGER.warning("Could not read waveform peaks from %s: %s", path, error)
+        return []
+    samples = array("h")
+    samples.frombytes(result.stdout[:len(result.stdout) - (len(result.stdout) % 2)])
+    bucket = 40  # 200 waveform points per second at 8 kHz
+    peaks = [round(max((abs(value) for value in samples[i:i + bucket]), default=0) / 32768, 4)
+             for i in range(0, len(samples), bucket)]
+    if metadata is not None:
+        try:
+            atomic_write_text(cache, json.dumps({"source": metadata, "peaks": peaks}, separators=(",", ":")))
+        except OSError:
+            LOGGER.warning("Could not cache waveform peaks for %s", path)
+    return peaks
+
+
+def _silence_intervals(path: Path) -> tuple[float, list[tuple[float, float]]]:
+    duration = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip())
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(path), "-af", "silencedetect=noise=-45dB:d=0.02", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=120,
+    )
+    log = result.stderr or ""
+    starts = [float(value) for value in re.findall(r"silence_start:\s*([0-9.]+)", log)]
+    ends = [float(value) for value in re.findall(r"silence_end:\s*([0-9.]+)", log)]
+    intervals: list[tuple[float, float]] = []
+    for index, start in enumerate(starts):
+        end = ends[index] if index < len(ends) else duration
+        intervals.append((max(0.0, start), min(duration, max(start, end))))
+    return duration, intervals
+
+
+def _trim_take_audio(source: Path, target: Path, tighten_pauses: bool) -> float:
+    duration, silences = _silence_intervals(source)
+    segments: list[tuple[float, float]] = []
+    cursor = 0.0
+    leading_trim = 0.0
+    trailing_end = duration
+    if silences and silences[0][0] <= 0.02:
+        leading_trim = max(0.0, silences[0][1] - 0.08)
+    if silences and silences[-1][1] >= duration - 0.02:
+        trailing_end = min(duration, silences[-1][0] + 0.08)
+    cursor = leading_trim
+    for start, end in silences:
+        if start <= 0.02 or end >= duration - 0.02 or not tighten_pauses or end - start <= 0.3:
+            continue
+        cut_start = max(cursor, start + 0.075)
+        cut_end = min(trailing_end, end - 0.075)
+        if cut_start > cursor:
+            segments.append((cursor, cut_start))
+        cursor = max(cursor, cut_end)
+    if trailing_end > cursor:
+        segments.append((cursor, trailing_end))
+    segments = [(start, end) for start, end in segments if end - start > 0.01]
+    if not segments:
+        raise ValueError("Trim would remove all speech audio")
+    filters = []
+    if len(segments) > 1:
+        filters.append("[0:a]asplit=" + str(len(segments)) + "".join(f"[in{index}]" for index in range(len(segments))))
+    for index, (start, end) in enumerate(segments):
+        source_label = f"[in{index}]" if len(segments) > 1 else "[0:a]"
+        filters.append(f"{source_label}atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[s{index}]")
+    if len(segments) == 1:
+        filters.append("[s0]anull[out]")
+    else:
+        filters.append("".join(f"[s{index}]" for index in range(len(segments))) + f"concat=n={len(segments)}:v=0:a=1[out]")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.tmp.wav")
+    try:
+        run_atomic_command([
+            "ffmpeg", "-y", "-v", "error", "-i", str(source), "-filter_complex", ";".join(filters),
+            "-map", "[out]", "-c:a", "pcm_s16le", str(temporary),
+        ], check=True, capture_output=True, timeout=180)
+        with temporary.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        commit_temporary(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(target)],
+        check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip())
 
 
 @app.post("/api/projects/{project_id}/balance")
@@ -1989,7 +2144,7 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         raise HTTPException(404, "Language is not enabled for this project")
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT c.id,c.idx,c.start_s,c.end_s,c.src_text,d.id AS dub_id,d.selected_take_id,d.translation,d.audio_path,d.duration_s,d.human_edited,d.user_verified,d.timing_offset_s,d.timing_locked "
+            "SELECT c.id,c.idx,c.start_s,c.end_s,c.src_text,d.id AS dub_id,d.selected_take_id,d.translation,d.audio_path,d.duration_s,d.human_edited,d.user_verified,d.timing_offset_s,d.timing_locked,d.trim_head_s,d.trim_tail_s,d.pause_tightening "
             "FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
             (body.lang, project_id),
         ).fetchall()
@@ -1998,6 +2153,8 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
     inputs = [{
         "id": row["id"], "start_s": row["start_s"], "end_s": row["end_s"],
         "speech_duration_s": row["duration_s"] or 0,
+        "trim_head_s": row["trim_head_s"] or 0, "trim_tail_s": row["trim_tail_s"] or 0,
+        "pause_tightening": bool(row["pause_tightening"]),
         "timing_offset_s": body.timing_offsets.get(row["id"], row["timing_offset_s"] or 0),
         "placed_start_s": float(row["start_s"]) + float(body.timing_offsets.get(row["id"], row["timing_offset_s"] or 0)),
         "manual": bool(row["timing_locked"] or row["id"] in body.timing_offsets or float(row["timing_offset_s"] or 0) != 0),
@@ -2011,6 +2168,11 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         # drift, or video-end invariants. The client can shorten the flagged
         # translation and ask the scheduler again.
         return {"lang": body.lang, **schedule}
+    for placement in schedule.get("placements", []):
+        placement.setdefault("speedup", 1.0)
+        placement.setdefault("trim_head_s", 0.0)
+        placement.setdefault("trim_tail_s", 0.0)
+        placement.setdefault("pause_tightening", False)
     if not body.apply:
         return {"lang": body.lang, "preview": True, **schedule}
     placement_by_id = {item["id"]: item for item in schedule["placements"]}
@@ -2025,19 +2187,19 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
                 updated["timing_offset_s"] = offset
                 fingerprint = verification_fingerprint(updated)
                 connection.execute(
-                    "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,verified_fingerprint=?,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
-                    (offset, int(row["dub_id"] in body.timing_offsets), fingerprint, row["id"], body.lang),
+                    "UPDATE dubs SET timing_offset_s=?,timing_speedup=?,trim_head_s=?,trim_tail_s=?,pause_tightening=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,verified_fingerprint=?,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                    (offset, placement["speedup"], placement["trim_head_s"], placement["trim_tail_s"], int(placement["pause_tightening"]), int(row["dub_id"] in body.timing_offsets), fingerprint, row["id"], body.lang),
                 )
             elif row["user_verified"]:
                 verification_cleared_clips.append(row["id"])
                 connection.execute(
-                    "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,user_verified=0,verified_fingerprint=NULL,verified_at=NULL,verify_override=0,verify_override_note=NULL,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
-                    (offset, int(row["dub_id"] in body.timing_offsets), row["id"], body.lang),
+                    "UPDATE dubs SET timing_offset_s=?,timing_speedup=?,trim_head_s=?,trim_tail_s=?,pause_tightening=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,user_verified=0,verified_fingerprint=NULL,verified_at=NULL,verify_override=0,verify_override_note=NULL,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                    (offset, placement["speedup"], placement["trim_head_s"], placement["trim_tail_s"], int(placement["pause_tightening"]), int(row["dub_id"] in body.timing_offsets), row["id"], body.lang),
                 )
             else:
                 connection.execute(
-                    "UPDATE dubs SET timing_offset_s=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
-                    (offset, int(row["dub_id"] in body.timing_offsets), row["id"], body.lang),
+                    "UPDATE dubs SET timing_offset_s=?,timing_speedup=?,trim_head_s=?,trim_tail_s=?,pause_tightening=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                    (offset, placement["speedup"], placement["trim_head_s"], placement["trim_tail_s"], int(placement["pause_tightening"]), int(row["dub_id"] in body.timing_offsets), row["id"], body.lang),
                 )
     artifact = _language_artifacts(project_id, body.lang).get("report")
     if artifact and artifact.is_file():
@@ -2068,6 +2230,207 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
             LOGGER.exception("Could not rebuild balanced dub preview for project %s language %s", project_id, body.lang)
             raise HTTPException(500, f"Timing placements saved, but the preview could not be rebuilt: {str(error)[:250]}") from error
     return {"lang": body.lang, "verification_cleared_clips": verification_cleared_clips, **schedule}
+
+
+@app.get("/api/projects/{project_id}/timeline/{lang}")
+async def get_project_timeline(project_id: str, lang: str) -> dict:
+    project = project_row(project_id)
+    clips = await get_clips(project_id, lang)
+    segments = [{"clip_id": clip["id"], "start_s": float(clip["start_s"]),
+                 "end_s": float(clip["end_s"]), "text": clip.get("src_text", "")}
+                for clip in clips if clip.get("src_text")]
+    return {"lang": lang, "video_duration_s": float(project["duration_s"] or 0),
+            "clips": clips, "original_speech_segments": segments}
+
+
+@app.put("/api/projects/{project_id}/timeline/{lang}/placements")
+async def put_timeline_placements(project_id: str, lang: str, body: TimelinePlacementRequest) -> dict:
+    project = project_row(project_id)
+    with db.connect() as connection:
+        rows = connection.execute(
+            "SELECT c.id,c.start_s,c.end_s,d.duration_s,d.timing_offset_s,d.timing_speedup,d.trim_head_s,d.trim_tail_s,d.pause_tightening,d.timing_locked "
+            "FROM clips c JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
+            (lang, project_id),
+        ).fetchall()
+        if not rows:
+            raise HTTPException(404, "No dubbed clips are available for this language")
+        row_by_id = {row["id"]: row for row in rows}
+        submitted = {item.clip_id: item for item in body.placements}
+        if len(submitted) != len(body.placements) or any(key not in row_by_id for key in submitted):
+            raise HTTPException(422, "Placement list contains a duplicate or unknown clip")
+        placements = []
+        video_end = float(project["duration_s"] or 0)
+        for row in rows:
+            update = submitted.get(row["id"])
+            start = float(update.start_s if update else row["start_s"] + (row["timing_offset_s"] or 0))
+            speed = float(update.speed_factor if update else row["timing_speedup"] or 1)
+            trim_head = float(update.trim_head_s if update else row["trim_head_s"] or 0)
+            trim_tail = float(update.trim_tail_s if update else row["trim_tail_s"] or 0)
+            duration = float(row["duration_s"] or 0)
+            source_start = float(row["start_s"])
+            if start < source_start - 1e-6 or start - source_start > 3.000001:
+                raise HTTPException(422, f"Clip {row['id']} start must stay at or after its source slot and within 3 seconds")
+            if trim_head + trim_tail >= duration - 0.01:
+                raise HTTPException(422, f"Clip {row['id']} trims remove all speech")
+            end = start + max(0.0, duration - trim_head - trim_tail) / speed
+            placements.append({"id": row["id"], "source_start_s": source_start,
+                "source_end_s": float(row["end_s"]), "start_s": start, "end_s": end,
+                "speech_duration_s": duration, "speedup": speed, "trim_head_s": trim_head,
+                "trim_tail_s": trim_tail, "pause_tightening": bool(update.pause_tightening if update else row["pause_tightening"]),
+                "shorten_required": False})
+        for previous, following in zip(placements, placements[1:]):
+            if previous["end_s"] + 0.1 > following["start_s"] + 1e-6:
+                raise HTTPException(422, f"Clip {following['id']} overlaps the preceding clip; allow at least 0.1 seconds")
+        if placements[-1]["end_s"] > video_end + 1e-6:
+            raise HTTPException(422, "The final clip extends beyond the video duration")
+        before = _timing_state(connection, project_id, lang)
+        for item in placements:
+            original = row_by_id[item["id"]]
+            update = submitted.get(item["id"])
+            offset = item["start_s"] - float(original["start_s"])
+            moved = abs(offset - float(original["timing_offset_s"] or 0))
+            connection.execute(
+                "UPDATE dubs SET timing_offset_s=?,timing_speedup=?,trim_head_s=?,trim_tail_s=?,pause_tightening=?,timing_locked=CASE WHEN ? THEN 1 ELSE timing_locked END,"
+                "user_verified=CASE WHEN ? THEN 0 ELSE user_verified END,verified_fingerprint=CASE WHEN ? THEN NULL ELSE verified_fingerprint END,verified_at=CASE WHEN ? THEN NULL ELSE verified_at END,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                (offset, item["speedup"], item["trim_head_s"], item["trim_tail_s"], int(item["pause_tightening"]),
+                 int(bool(update and update.manual)), int(moved >= 0.5), int(moved >= 0.5), int(moved >= 0.5), item["id"], lang),
+            )
+        after = _timing_state(connection, project_id, lang)
+        _record_timing_history(connection, project_id, lang, before, after)
+    try:
+        _render_scheduled_track(project_id, lang, placements, video_end)
+        source_value = project.get("preview_path") if project.get("preview_status") == "ready" else project.get("original_video_path") or project.get("video_path")
+        if source_value:
+            rebuilt = _rebuild_dubbed_preview(project_id, lang, Path(source_value), DATA_ROOT / "exports" / project_id)
+            canonical = next(iter((DATA_ROOT / "exports" / project_id).glob(f"*_{lang}_phase3d_ai-dubbed.mp4")), None)
+            if canonical:
+                from backend.atomic_files import atomic_copyfile
+                atomic_copyfile(rebuilt, canonical)
+    except Exception as error:
+        LOGGER.exception("Could not render timeline update for %s/%s", project_id, lang)
+        raise HTTPException(500, f"Timeline saved, but mixed preview update failed: {str(error)[:200]}") from error
+    return {"lang": lang, "placements": placements, "clips": await get_clips(project_id, lang)}
+
+
+async def _restore_timeline_history(project_id: str, lang: str, direction: str) -> dict:
+    project = project_row(project_id)
+    with db.connect() as connection:
+        predicate = "state='applied'" if direction == "undo" else "state='undone'"
+        ordering = "DESC" if direction == "undo" else "ASC"
+        record = connection.execute(
+            f"SELECT id,before_json,after_json FROM timing_history WHERE project_id=? AND lang=? AND {predicate} ORDER BY id {ordering} LIMIT 1",
+            (project_id, lang),
+        ).fetchone()
+        if record is None:
+            raise HTTPException(409, f"Nothing to {direction}")
+        state = json.loads(record["before_json"] if direction == "undo" else record["after_json"])
+        current = _timing_state(connection, project_id, lang)
+        for clip_id, values in state.items():
+            old = current.get(clip_id, {})
+            moved = abs(float(values.get("timing_offset_s") or 0) - float(old.get("timing_offset_s") or 0))
+            connection.execute(
+                "UPDATE dubs SET timing_offset_s=?,timing_speedup=?,trim_head_s=?,trim_tail_s=?,pause_tightening=?,timing_locked=?,"
+                "user_verified=CASE WHEN ? THEN 0 ELSE user_verified END,verified_fingerprint=CASE WHEN ? THEN NULL ELSE verified_fingerprint END,"
+                "verified_at=CASE WHEN ? THEN NULL ELSE verified_at END,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+                (values.get("timing_offset_s", 0), values.get("timing_speedup", 1), values.get("trim_head_s", 0),
+                 values.get("trim_tail_s", 0), values.get("pause_tightening", 0), values.get("timing_locked", 0),
+                 int(moved >= .5), int(moved >= .5), int(moved >= .5), clip_id, lang),
+            )
+        connection.execute("UPDATE timing_history SET state=? WHERE id=?", ("undone" if direction == "undo" else "applied", record["id"]))
+        rows = connection.execute(
+            "SELECT c.id,c.start_s,c.end_s,d.duration_s,d.timing_offset_s,d.timing_speedup,d.trim_head_s,d.trim_tail_s,d.pause_tightening FROM clips c JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
+            (lang, project_id),
+        ).fetchall()
+    placements = []
+    for row in rows:
+        start = float(row["start_s"]) + float(row["timing_offset_s"] or 0)
+        spoken = float(row["duration_s"] or 0)
+        speed = float(row["timing_speedup"] or 1)
+        head, tail = float(row["trim_head_s"] or 0), float(row["trim_tail_s"] or 0)
+        placements.append({"id": row["id"], "start_s": start, "end_s": start + max(0, spoken-head-tail)/speed,
+            "source_start_s": float(row["start_s"]), "source_end_s": float(row["end_s"]), "speech_duration_s": spoken,
+            "speedup": speed, "trim_head_s": head, "trim_tail_s": tail, "pause_tightening": bool(row["pause_tightening"])})
+    try:
+        _render_scheduled_track(project_id, lang, placements, float(project["duration_s"] or 0))
+        source_value = project.get("preview_path") if project.get("preview_status") == "ready" else project.get("original_video_path") or project.get("video_path")
+        if source_value:
+            rebuilt = _rebuild_dubbed_preview(project_id, lang, Path(source_value), DATA_ROOT / "exports" / project_id)
+            canonical = next(iter((DATA_ROOT / "exports" / project_id).glob(f"*_{lang}_phase3d_ai-dubbed.mp4")), None)
+            if canonical:
+                from backend.atomic_files import atomic_copyfile
+                atomic_copyfile(rebuilt, canonical)
+    except Exception as error:
+        raise HTTPException(500, f"Timeline restored, but preview rebuild failed: {str(error)[:200]}") from error
+    return {"lang": lang, "direction": direction, "clips": await get_clips(project_id, lang)}
+
+
+@app.post("/api/projects/{project_id}/timeline/{lang}/undo")
+async def undo_timeline(project_id: str, lang: str) -> dict:
+    return await _restore_timeline_history(project_id, lang, "undo")
+
+
+@app.post("/api/projects/{project_id}/timeline/{lang}/redo")
+async def redo_timeline(project_id: str, lang: str) -> dict:
+    return await _restore_timeline_history(project_id, lang, "redo")
+
+
+@app.post("/api/clips/{clip_id}/dubs/{lang}/trim")
+async def trim_dub_take(clip_id: str, lang: str, body: TrimRequest) -> dict:
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT d.audio_path,d.duration_s,c.project_id FROM dubs d JOIN clips c ON c.id=d.clip_id WHERE c.id=? AND d.lang=?",
+            (clip_id, lang),
+        ).fetchone()
+        if row is None or not row["audio_path"] or not Path(row["audio_path"]).is_file():
+            raise HTTPException(404, "Saved speech take is unavailable")
+        source = Path(row["audio_path"])
+        target = DATA_ROOT / "exports" / row["project_id"] / "takes" / f"{clip_id}_{lang}_trimmed.wav"
+    try:
+        duration = _trim_take_audio(source, target, body.tighten_pauses)
+        peaks = _audio_peaks(target)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        target.unlink(missing_ok=True)
+        raise HTTPException(422, f"Could not safely trim this take: {str(error)[:200]}") from error
+    with db.connect() as connection:
+        before = _timing_state(connection, row["project_id"], lang)
+        connection.execute(
+            "UPDATE dubs SET audio_path=?,duration_s=?,trim_head_s=0,trim_tail_s=0,pause_tightening=?,user_verified=0,verified_fingerprint=NULL,verified_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE clip_id=? AND lang=?",
+            (str(target), duration, int(body.tighten_pauses), clip_id, lang),
+        )
+        after = _timing_state(connection, row["project_id"], lang)
+        _record_timing_history(connection, row["project_id"], lang, before, after)
+        project = connection.execute("SELECT duration_s,preview_status,preview_path,original_video_path,video_path FROM projects WHERE id=?", (row["project_id"],)).fetchone()
+        timeline_rows = connection.execute(
+            "SELECT c.id,c.start_s,c.end_s,d.duration_s,d.timing_offset_s,d.timing_speedup,d.trim_head_s,d.trim_tail_s,d.pause_tightening "
+            "FROM clips c JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? ORDER BY c.idx",
+            (lang, row["project_id"]),
+        ).fetchall()
+    placements = []
+    for item in timeline_rows:
+        start_s = float(item["start_s"]) + float(item["timing_offset_s"] or 0)
+        spoken_s = float(item["duration_s"] or 0)
+        speed = max(1.0, float(item["timing_speedup"] or 1))
+        trim_head = float(item["trim_head_s"] or 0)
+        trim_tail = float(item["trim_tail_s"] or 0)
+        placements.append({"id": item["id"], "start_s": start_s,
+            "end_s": start_s + max(0, spoken_s-trim_head-trim_tail)/speed,
+            "source_start_s": float(item["start_s"]), "source_end_s": float(item["end_s"]),
+            "speech_duration_s": spoken_s, "speedup": speed, "trim_head_s": trim_head,
+            "trim_tail_s": trim_tail, "pause_tightening": bool(item["pause_tightening"])})
+    try:
+        _render_scheduled_track(row["project_id"], lang, placements, float(project["duration_s"] or 0))
+        source_value = project["preview_path"] if project["preview_status"] == "ready" else project["original_video_path"] or project["video_path"]
+        if source_value:
+            rebuilt = _rebuild_dubbed_preview(row["project_id"], lang, Path(source_value), DATA_ROOT / "exports" / row["project_id"])
+            canonical = next(iter((DATA_ROOT / "exports" / row["project_id"]).glob(f"*_{lang}_phase3d_ai-dubbed.mp4")), None)
+            if canonical:
+                from backend.atomic_files import atomic_copyfile
+                atomic_copyfile(rebuilt, canonical)
+    except Exception as error:
+        LOGGER.exception("Could not rebuild dub after trimming %s/%s", clip_id, lang)
+        raise HTTPException(500, f"Take was trimmed, but the mixed preview could not be rebuilt: {str(error)[:200]}") from error
+    return {"clip_id": clip_id, "lang": lang, "duration_s": duration, "waveform_peaks": peaks,
+            "audio_url": f"/api/clips/{clip_id}/dubs/{lang}/audio", "pause_tightening": body.tighten_pauses}
 
 
 @app.patch("/api/clips/{clip_id}/source")
@@ -2799,7 +3162,7 @@ def _rebuild_dubbed_preview(project_id: str, lang: str, source: Path, output_dir
             check=True, capture_output=True, timeout=240,
         )
         _validate_media_file(temporary)
-        with temporary.open("rb") as recovered_file:
+        with temporary.open("r+b") as recovered_file:
             os.fsync(recovered_file.fileno())
         temporary.replace(rebuilt)
     finally:

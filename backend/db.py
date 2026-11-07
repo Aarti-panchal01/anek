@@ -61,6 +61,10 @@ def initialize() -> None:
       verify_override_note TEXT, selected_take_id TEXT,
       timing_offset_s REAL NOT NULL DEFAULT 0,
       timing_locked INTEGER NOT NULL DEFAULT 0,
+      timing_speedup REAL NOT NULL DEFAULT 1,
+      trim_head_s REAL NOT NULL DEFAULT 0,
+      trim_tail_s REAL NOT NULL DEFAULT 0,
+      pause_tightening INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(clip_id, lang), FOREIGN KEY(clip_id) REFERENCES clips(id)
     );
@@ -78,6 +82,11 @@ def initialize() -> None:
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    CREATE TABLE IF NOT EXISTS timing_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+      lang TEXT NOT NULL, before_json TEXT NOT NULL, after_json TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'applied', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS credit_ledger (
       id TEXT PRIMARY KEY, project_id TEXT, kind TEXT NOT NULL, units INTEGER NOT NULL,
@@ -146,7 +155,11 @@ def initialize() -> None:
                                  ("verify_override_note", "TEXT"),
                                  ("selected_take_id", "TEXT"),
                                  ("timing_offset_s", "REAL NOT NULL DEFAULT 0"),
-                                 ("timing_locked", "INTEGER NOT NULL DEFAULT 0")):
+                                 ("timing_locked", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("timing_speedup", "REAL NOT NULL DEFAULT 1"),
+                                 ("trim_head_s", "REAL NOT NULL DEFAULT 0"),
+                                 ("trim_tail_s", "REAL NOT NULL DEFAULT 0"),
+                                 ("pause_tightening", "INTEGER NOT NULL DEFAULT 0")):
             if name not in dub_columns:
                 db.execute(f"ALTER TABLE dubs ADD COLUMN {name} {definition}")
         db.execute("UPDATE dubs SET auto_status=status WHERE auto_status IS NULL")

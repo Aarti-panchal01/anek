@@ -1150,3 +1150,64 @@ def test_edit_length_is_advisory_until_real_speech_duration_is_measured(monkeypa
         assert row["translation"] == text
         assert row["audio_path"] is not None
         assert row["audio_stale"] == 1
+
+
+def test_timeline_api_saves_waveform_placement_and_undo_redo(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        client = TestClient(app_module.app)
+        monkeypatch.setattr(app_module, "_audio_peaks", lambda _path: [0.1, 0.7, 0.3])
+        timeline = client.get(f"/api/projects/{project['id']}/timeline/hi-IN")
+        assert timeline.status_code == 200
+        assert timeline.json()["clips"][0]["waveform_peaks"] == [0.1, 0.7, 0.3]
+        monkeypatch.setattr(app_module, "_render_scheduled_track", lambda *args, **kwargs: data_root / "track.wav")
+        saved = client.put(f"/api/projects/{project['id']}/timeline/hi-IN/placements", json={
+            "placements": [{"clip_id": "review-clip-1", "start_s": 0.3, "speed_factor": 1.1,
+                            "trim_head_s": 0, "trim_tail_s": 0, "pause_tightening": False, "manual": True}],
+        })
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["placements"][0]["start_s"] == pytest.approx(0.3)
+        with db.connect() as connection:
+            row = connection.execute("SELECT timing_offset_s,timing_speedup FROM dubs WHERE id='review-dub-1'").fetchone()
+        assert row["timing_offset_s"] == pytest.approx(0.3)
+        assert row["timing_speedup"] == pytest.approx(1.1)
+        undone = client.post(f"/api/projects/{project['id']}/timeline/hi-IN/undo")
+        assert undone.status_code == 200, undone.text
+        assert undone.json()["clips"][0]["timeline_start_s"] == pytest.approx(0)
+        redone = client.post(f"/api/projects/{project['id']}/timeline/hi-IN/redo")
+        assert redone.status_code == 200, redone.text
+        assert redone.json()["clips"][0]["timeline_start_s"] == pytest.approx(0.3)
+
+
+def test_timeline_rejects_overlap_and_moves_before_source_slot(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root, overlap=True)
+        client = TestClient(app_module.app)
+        before_slot = client.put(f"/api/projects/{project['id']}/timeline/hi-IN/placements", json={
+            "placements": [{"clip_id": "review-clip-1", "start_s": -0.1, "speed_factor": 1.0}],
+        })
+        assert before_slot.status_code == 422
+        overlapping = client.put(f"/api/projects/{project['id']}/timeline/hi-IN/placements", json={
+            "placements": [
+                {"clip_id": "review-clip-1", "start_s": 0, "speed_factor": 1.0},
+                {"clip_id": "review-clip-2", "start_s": 1.1, "speed_factor": 1.0},
+            ],
+        })
+        assert overlapping.status_code == 422
+
+
+def test_trim_endpoint_persists_processed_take_and_waveform(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        monkeypatch.setattr(app_module, "_trim_take_audio", lambda _source, target, tighten: target.parent.mkdir(parents=True, exist_ok=True) or target.write_bytes(b"trimmed") or 1.0)
+        monkeypatch.setattr(app_module, "_audio_peaks", lambda _path: [0.2, 0.5])
+        monkeypatch.setattr(app_module, "_render_scheduled_track", lambda *args, **kwargs: data_root / "track.wav")
+        response = TestClient(app_module.app).post("/api/clips/review-clip-1/dubs/hi-IN/trim", json={"tighten_pauses": True})
+        assert response.status_code == 200, response.text
+        assert response.json()["pause_tightening"] is True
+        assert response.json()["waveform_peaks"] == [0.2, 0.5]
+        with db.connect() as connection:
+            row = connection.execute("SELECT audio_path,pause_tightening,user_verified FROM dubs WHERE id='review-dub-1'").fetchone()
+        assert Path(row["audio_path"]).is_file()
+        assert row["pause_tightening"] == 1
+        assert row["user_verified"] == 0
