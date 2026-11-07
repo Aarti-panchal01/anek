@@ -1821,26 +1821,11 @@ async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None =
         export_root = (DATA_ROOT / "exports" / row["project_id"]).resolve()
         if not row["audio_path"] or not audio_path.is_relative_to(export_root) or not audio_path.is_file() or audio_path.stat().st_size == 0:
             raise HTTPException(409, "Generate and listen to this clip's audio before verifying it")
+        # Verification records the user's approval of the generated take.
+        # Automatic QA and fit warnings remain visible separately; a manual
+        # approval must not silently fail because the take is long or flagged.
         reasons = json.loads(row["reasons_json"] or "[]")
         automatic_flag = row["status"] != "green" or bool(reasons)
-        if any("withheld" in str(reason).casefold() for reason in reasons):
-            raise HTTPException(409, "This clip's speech was withheld because it overlaps; regenerate it before verifying")
-        current_start = float(row["start_s"])
-        current_end = current_start + float(row["duration_s"] or 0)
-        if current_end > float(row["video_duration"] or row["end_s"]) + 0.05:
-            raise HTTPException(409, "This clip's audio extends past the video")
-        siblings = connection.execute(
-            "SELECT c.id,c.start_s,d.duration_s,d.audio_path FROM clips c "
-            "JOIN dubs d ON d.clip_id=c.id AND d.lang=? WHERE c.project_id=? AND c.id<>?",
-            (lang, row["project_id"], clip_id),
-        ).fetchall()
-        for sibling in siblings:
-            if not sibling["audio_path"] or not Path(sibling["audio_path"]).is_file():
-                continue
-            sibling_start = float(sibling["start_s"])
-            sibling_end = sibling_start + float(sibling["duration_s"] or 0)
-            if min(current_end, sibling_end) - max(current_start, sibling_start) > 0.01:
-                raise HTTPException(409, "This clip overlaps another clip's speech; regenerate it before verifying")
         fingerprint = verification_fingerprint(row, audio_path)
         connection.execute(
             "UPDATE dubs SET user_verified=1,verified_fingerprint=?,verify_override=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -1964,7 +1949,7 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
             atomic_write_text(artifact, json.dumps(report, ensure_ascii=False, indent=2))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             LOGGER.exception("Could not persist timing placements for project %s language %s", project_id, body.lang)
-    if schedule["valid"] and any(abs(placement_by_id[row["id"]]["shift_s"]) > 0.001 or placement_by_id[row["id"]]["speedup"] > 1.001 for row in rows):
+    if schedule["valid"]:
         try:
             _render_scheduled_track(project_id, body.lang, schedule["placements"], float(project["duration_s"] or 0))
             source_value = project.get("preview_path") if project.get("preview_status") == "ready" else project.get("original_video_path") or project.get("video_path")

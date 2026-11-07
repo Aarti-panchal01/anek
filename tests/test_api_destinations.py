@@ -864,14 +864,18 @@ def test_human_verification_updates_clip_and_project_counts_and_can_be_undone(mo
 
 def test_manual_verification_overrides_automatic_flags_without_confirmation(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
-        _project_with_review_audio(data_root)
+        project = _project_with_review_audio(data_root)
         with db.connect() as connection:
             connection.execute("UPDATE dubs SET reasons_json=? WHERE id=?", (json.dumps(["name mismatch"]), "review-dub-1"))
-        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
-        assert result["verify_override"] is True
-        with db.connect() as connection:
-            row = connection.execute("SELECT user_verified,verify_override FROM dubs WHERE id='review-dub-1'").fetchone()
-        assert tuple(row) == (1, 1)
+        client = TestClient(app_module.app)
+        response = client.post("/api/clips/review-clip-1/dubs/hi-IN/verify")
+        assert response.status_code == 200
+        assert response.json()["human_verified"] is True
+        assert response.json()["verify_override"] is True
+        refreshed = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN")
+        assert refreshed.status_code == 200
+        assert refreshed.json()[0]["status"] == "green"
+        assert refreshed.json()[0]["user_verified"] is True
 
 
 def test_balance_endpoint_persists_language_specific_placements(monkeypatch):
@@ -890,11 +894,16 @@ def test_balance_endpoint_persists_language_specific_placements(monkeypatch):
         assert offset == pytest.approx(0.2)
 
 
-def test_user_verification_rejects_overlapping_speech(monkeypatch):
+def test_manual_verification_records_approval_even_when_fit_needs_rebalancing(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
-        _project_with_review_audio(data_root, overlap=True)
-        with pytest.raises(app_module.HTTPException, match="overlaps"):
-            _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        project = _project_with_review_audio(data_root, overlap=True)
+        with db.connect() as connection:
+            connection.execute("UPDATE dubs SET duration_s=2.5,reasons_json=? WHERE id=?", (json.dumps(["Speech overlaps the next clip."]), "review-dub-1"))
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        assert result["human_verified"] is True
+        clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
+        assert clips[0]["status"] == "green"
+        assert clips[0]["user_verified"] is True
 
 
 def test_edit_length_is_advisory_until_real_speech_duration_is_measured(monkeypatch):

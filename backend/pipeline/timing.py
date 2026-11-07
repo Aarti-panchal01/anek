@@ -30,46 +30,33 @@ def schedule_language(
         row["shorten_required"] = False
         row["fit_reason"] = None
 
-    # First use silence after a clip. Then borrow slack before its start, and
-    # extend into a following clip's head while keeping each move bounded.
+    # Keep starts at or after their source slots. Use the actual silent gap,
+    # then move following clips later within their own slack. Speed up only
+    # the speech that still cannot fit after that local reflow.
     for index, row in enumerate(rows):
-        if index:
-            previous = rows[index - 1]
-            previous_end = previous["placed_start_s"] + previous["speech_duration_s"] / previous["speedup"]
-            if row["placed_start_s"] < previous_end and not (row.get("locked") or row.get("edited")):
-                row["placed_start_s"] = min(previous_end, row["start_s"] + max_shift_s)
-        if row.get("locked") or row.get("edited"):
-            continue
-        next_row = rows[index + 1] if index + 1 < len(rows) else None
-        available_end = float(next_row["start_s"]) if next_row else float(video_duration_s)
-        if next_row:
-            available_end += max(0.0, float(next_row["start_s"]) - float(row["end_s"]))
-        current_end = row["placed_start_s"] + row["speech_duration_s"]
-        overrun = current_end - available_end
-        if overrun <= tolerance_s:
-            continue
-        # Borrow the previous clip's tail by moving this take earlier, but
-        # never start on top of speech already placed before it.
-        if index:
-            previous = rows[index - 1]
-            previous_end = previous["placed_start_s"] + previous["speech_duration_s"] / previous["speedup"]
-            earlier = min(overrun, max_shift_s, max(0.0, row["placed_start_s"] - (row["start_s"] - max_shift_s)))
-            row["placed_start_s"] -= earlier
+        previous_end = (rows[index - 1]["placed_start_s"] + rows[index - 1]["speech_duration_s"] / rows[index - 1]["speedup"]) if index else 0.0
+        row["placed_start_s"] = max(row["start_s"], row["placed_start_s"])
+        if not row.get("locked"):
             row["placed_start_s"] = max(row["placed_start_s"], previous_end)
-            overrun = row["placed_start_s"] + row["speech_duration_s"] - available_end
-        # Borrow the next clip's head by shifting that clip later within its
-        # source-relative limit. Its own duration is handled on its turn.
-        if overrun > tolerance_s and next_row and not next_row.get("locked") and not next_row.get("edited"):
-            later = min(overrun, max_shift_s)
+        next_row = rows[index + 1] if index + 1 < len(rows) else None
+        available_end = float(next_row["placed_start_s"]) if next_row else float(video_duration_s)
+        overrun = row["placed_start_s"] + row["speech_duration_s"] - available_end
+        if overrun <= 1e-6:
+            continue
+        # Move the following take into its own trailing slack. A text edit
+        # locks the wording, not its timeline position.
+        if overrun > tolerance_s and next_row and not next_row.get("locked"):
+            room_to_move = max(0.0, next_row["start_s"] + max_shift_s - next_row["placed_start_s"])
+            later = min(overrun, room_to_move)
             next_row["placed_start_s"] += later
-            available_end = next_row["placed_start_s"] + max(0.0, float(next_row["start_s"]) - float(row["end_s"]))
+            available_end = next_row["placed_start_s"]
             overrun = row["placed_start_s"] + row["speech_duration_s"] - available_end
-        if overrun > tolerance_s:
+        if overrun > 1e-6:
             required = row["speech_duration_s"] / max(0.01, available_end - row["placed_start_s"])
             if required <= max_speedup + 1e-9:
                 row["speedup"] = max(1.0, required)
                 overrun = 0.0
-        if overrun > tolerance_s:
+        if overrun > 1e-6:
             row["shorten_required"] = True
             row["fit_reason"] = "Speech needs a shorter translation to fit without overlap."
 
@@ -86,7 +73,7 @@ def schedule_language(
         end = start + duration
         shift = start - row["start_s"]
         total_drift += shift
-        if abs(shift) > max_shift_s + 1e-6 or abs(total_drift) > max_total_drift_s + 1e-6:
+        if shift < -1e-6 or abs(shift) > max_shift_s + 1e-6 or abs(total_drift) > max_total_drift_s + 1e-6:
             valid = False
         if start < previous_end - 1e-6 or end > float(video_duration_s) + 1e-6:
             valid = False
@@ -97,7 +84,7 @@ def schedule_language(
             "start_s": round(start, 6), "end_s": round(end, 6), "speech_duration_s": natural_duration,
             "speedup": round(float(row["speedup"]), 6), "shift_s": round(shift, 6),
             "shorten_required": bool(row["shorten_required"]), "fit_reason": row["fit_reason"],
-            "locked": bool(row.get("locked") or row.get("edited")),
+            "locked": bool(row.get("locked")),
         })
         previous_end = end
     return {"placements": placements, "valid": valid, "video_duration_s": float(video_duration_s),
