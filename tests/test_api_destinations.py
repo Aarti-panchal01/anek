@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend import db
@@ -875,6 +876,33 @@ def test_human_verification_survives_preview_artifact_rebuild(monkeypatch):
         assert clips[0]["status"] == "green"
         summary = _resolve(app_module.project_summary(project["id"]))
         assert summary["clips"]["green"] == 1
+
+
+def test_human_verification_is_available_while_another_language_runs(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO jobs(id,project_id,kind,lang,state,stage) VALUES(?,?,?,?,?,?)",
+                ("other-language-job", project["id"], "retry_language", "kn-IN", "running", "synthesis"),
+            )
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        assert result["human_verified"] is True
+        clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
+        assert clips[0]["user_verified"] is True
+        assert clips[0]["status"] == "green"
+
+
+def test_human_verification_waits_for_the_same_clip_regeneration(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO jobs(id,project_id,kind,lang,clip_id,state,stage) VALUES(?,?,?,?,?,?,?)",
+                ("same-clip-job", project["id"], "regenerate_clip", "hi-IN", "review-clip-1", "running", "synthesis"),
+            )
+        with pytest.raises(HTTPException, match="Wait for this clip"):
+            _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
 
 
 def test_manual_verification_uses_mixed_track_when_clip_take_is_missing(monkeypatch):
