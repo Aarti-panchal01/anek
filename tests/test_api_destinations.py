@@ -862,6 +862,21 @@ def test_human_verification_updates_clip_and_project_counts_and_can_be_undone(mo
         assert clips[0]["user_verified"] is False
 
 
+def test_human_verification_survives_preview_artifact_rebuild(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        audio_path = data_root / "exports" / project["id"] / "clips" / "clip_001.wav"
+        # Preview/export rebuilds can replace the same audio file and change
+        # its mtime. That must not silently revoke the user's saved approval.
+        audio_path.write_bytes(b"rebuilt audio take")
+        clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
+        assert clips[0]["user_verified"] is True
+        assert clips[0]["status"] == "green"
+        summary = _resolve(app_module.project_summary(project["id"]))
+        assert summary["clips"]["green"] == 1
+
+
 def test_manual_verification_uses_mixed_track_when_clip_take_is_missing(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root)
@@ -916,6 +931,10 @@ def test_manual_verification_overrides_automatic_flags_without_confirmation(monk
         assert refreshed.status_code == 200
         assert refreshed.json()[0]["status"] == "green"
         assert refreshed.json()[0]["user_verified"] is True
+        preflight = _resolve(app_module.export_preflight(project["id"], app_module.ExportRequest(lang="hi-IN")))
+        assert preflight["unresolved_red_clips"] == []
+        red_check = next(check for check in preflight["checks"] if check["name"] == "red_clips")
+        assert red_check["passed"] is True
 
 
 def test_balance_endpoint_persists_language_specific_placements(monkeypatch):

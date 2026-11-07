@@ -947,18 +947,12 @@ async def project_summary(project_id: str) -> dict:
     counts = {"total": int(clip_count), "green": 0, "yellow": 0, "red": 0}
     for count_row in count_rows:
         status = count_row["status"] or "pending"
-        audio = Path(count_row["audio_path"] or "")
-        if count_row["user_verified"] and audio.is_file() and not count_row["audio_stale"]:
-            try:
-                fingerprint = verification_fingerprint({
-                    "id": count_row["id"], "translation": count_row["translation"] or "",
-                    "duration_s": count_row["duration_s"], "start_s": count_row["start_s"],
-                    "end_s": count_row["end_s"], "timing_offset_s": count_row["timing_offset_s"] or 0,
-                }, audio)
-                if fingerprint == count_row["verified_fingerprint"]:
-                    status = "green"
-            except OSError:
-                pass
+        audio = verification_audio_path(project_id, count_row["lang"], count_row["audio_path"])
+        # Approval is a user decision. Editing the translation, replacing its
+        # audio, or changing its timing explicitly clears user_verified in the
+        # corresponding write path; filesystem mtimes must not revoke it.
+        if count_row["user_verified"] and audio and audio.is_file() and not count_row["audio_stale"]:
+            status = "green"
         if status not in {"green", "yellow", "red"}:
             status = "yellow"
         counts[status] += 1
@@ -1686,17 +1680,7 @@ async def get_clips(project_id: str, lang: str) -> list[dict]:
         item["timeline_start_s"] = float(item["start_s"]) + float(item.get("timing_offset_s") or 0)
         item["timing_locked"] = bool(item.get("timing_locked", False))
         item["audio_removed"] = bool(audio_path and not audio_present)
-        fingerprint = None
-        if verification_audio and not item["audio_stale"] and item.get("dub_id"):
-            try:
-                fingerprint = verification_fingerprint({
-                    "id": item["dub_id"], "translation": item.get("translation") or "",
-                    "duration_s": item.get("dub_duration_s"), "start_s": item["start_s"],
-                    "end_s": item["end_s"], "timing_offset_s": item.get("timing_offset_s", 0),
-                }, verification_audio)
-            except OSError:
-                fingerprint = None
-        verified = bool(item.get("user_verified") and fingerprint and fingerprint == item.get("verified_fingerprint"))
+        verified = bool(item.get("user_verified") and verification_audio and not item["audio_stale"])
         item["automatic_status"] = automatic_status
         item["user_verified"] = verified
         item["verify_override"] = bool(verified and item.get("verify_override"))
@@ -1848,7 +1832,9 @@ async def verify_dub_clip(clip_id: str, lang: str, body: VerifyDecision | None =
         automatic_flag = row["status"] != "green" or bool(reasons)
         fingerprint = verification_fingerprint(row, audio_path)
         connection.execute(
-            "UPDATE dubs SET user_verified=1,verified_fingerprint=?,verify_override=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            # Verification changes review metadata only. Do not advance the
+            # dub content timestamp used by downstream artifact freshness.
+            "UPDATE dubs SET user_verified=1,verified_fingerprint=?,verify_override=? WHERE id=?",
             (fingerprint, int(automatic_flag), row["id"]),
         )
 
@@ -2386,10 +2372,10 @@ def _export_preflight(project_id: str, lang: str, formats: list[str]) -> dict:
     with db.connect() as connection:
         clip_count = connection.execute("SELECT COUNT(*) FROM clips WHERE project_id=?", (project_id,)).fetchone()[0]
         dubs = connection.execute(
-            "SELECT c.idx,d.status,d.updated_at FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? "
+            "SELECT c.idx,d.status,d.audio_stale,d.user_verified FROM clips c LEFT JOIN dubs d ON d.clip_id=c.id AND d.lang=? "
             "WHERE c.project_id=? ORDER BY c.idx", (lang, project_id)
         ).fetchall()
-    unresolved_red = [int(row["idx"]) + 1 for row in dubs if row["status"] == "red"]
+    unresolved_red = [int(row["idx"]) + 1 for row in dubs if row["status"] == "red" and not row["user_verified"]]
     artifacts = _language_artifacts(project_id, lang)
     checks: list[dict] = []
     resolved: dict[str, Path] = {}
@@ -2451,22 +2437,11 @@ def _export_preflight(project_id: str, lang: str, formats: list[str]) -> dict:
         except (OSError, json.JSONDecodeError) as error:
             checks.append({"name": "report_readable", "passed": False, "detail": str(error)})
 
-    latest_edit = max((row["updated_at"] or "" for row in dubs), default="")
-    stale_artifacts = []
-    if latest_edit:
-        try:
-            from datetime import datetime, timezone
-            edit_time = datetime.fromisoformat(latest_edit).replace(tzinfo=timezone.utc).timestamp()
-            stale_artifacts = [name for name, path in resolved.items() if edit_time > path.stat().st_mtime + 1]
-            if "audio_wav" in resolved or "audio_mp3" in resolved:
-                source_mp4 = artifacts.get("mp4")
-                if source_mp4 and edit_time > source_mp4.stat().st_mtime + 1 and "mp4" not in stale_artifacts:
-                    stale_artifacts.append("source mp4 for audio export")
-        except ValueError:
-            stale_artifacts = []
-    stale = bool(stale_artifacts)
+    stale_clips = [int(row["idx"]) + 1 for row in dubs if row["audio_stale"]]
+    stale = bool(stale_clips)
     checks.append({"name": "not_stale", "passed": not stale,
-                   "detail": f"Edited dub is newer than: {', '.join(stale_artifacts)}" if stale else "No newer dub edit detected"})
+                   "detail": (f"Saved translation has no matching generated audio for clip(s): {', '.join(map(str, stale_clips))}. Re-speak those clips before exporting."
+                              if stale else "All saved translations have current generated audio")})
     checks.append({"name": "red_clips", "passed": not unresolved_red,
                    "detail": "No unresolved red clips" if not unresolved_red else f"Unresolved red clips: {', '.join(map(str, unresolved_red))}"})
     missing_dub_rows = [int(row["idx"]) + 1 for row in dubs if row["status"] is None]
