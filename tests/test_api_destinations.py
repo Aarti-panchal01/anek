@@ -1110,6 +1110,21 @@ def test_balance_endpoint_persists_language_specific_placements(monkeypatch):
         assert offset == pytest.approx(0.2)
 
 
+def test_pack_preview_does_not_persist_or_render_until_accepted(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        rendered = []
+        monkeypatch.setattr(app_module, "_render_scheduled_track", lambda *args: rendered.append(args))
+        result = _resolve(app_module.balance_project_timing(
+            project["id"], app_module.BalanceRequest(lang="hi-IN", apply=False)))
+        assert result["preview"] is True
+        assert result["valid"] is True
+        assert rendered == []
+        with db.connect() as connection:
+            offset = connection.execute("SELECT timing_offset_s FROM dubs WHERE id='review-dub-1'").fetchone()[0]
+        assert offset == pytest.approx(0.0)
+
+
 def test_manual_verification_records_approval_even_when_fit_needs_rebalancing(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root, overlap=True)

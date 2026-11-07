@@ -293,3 +293,15 @@ Exact ffprobe outputs:
 - Backend suite: `python -m pytest tests -q` passed (207 tests; FastAPI lifecycle deprecation warnings only).
 - Frontend: `cd frontend && npm run build` passed (API-prefix check, TypeScript, and Vite build).
 - Screenshots/logs for the earlier geography project show the poor Kannada/Marathi text and separate Hindi duration failure. Existing saved project clips were not rewritten; this fix affects new translations and explicit retranslation only.
+
+## Round 16: draggable dub timeline
+
+- Started the timeline editor task from the supplied spec. This continues the existing Round 16 entry because the repository already had a translation-quality Round 16.
+- Current step: reproduce the Kannada sample scheduler failure with a test and record the actual constraint before replacing the packer.
+- Next: implement/test deterministic packing, then server take editing and timeline API, then the two-lane editor and local Playwright verification. No implementation results claimed yet.
+- Part A reproduction: added the exact three-clip sample test. Before the packer change it fails (`valid` is false). The current scheduler places clip 1 at 0.0-4.5, clip 2 at 6.5-13.4 with 1.043478x speed, and clip 3 at 13.4-19.7 with `shorten_required=true`; the last take exceeds the 18.6s video by 1.1s. Root cause: the local greedy scheduler shifts clip 3 only up to its old 1.0s cap, speeds clip 2 only enough to meet that intermediate boundary, then never globally reallocates the remaining schedule. Total speech being 18.0s alone does not satisfy source-start, shift, and order constraints.
+- Part A complete: replaced the local greedy scheduler with deterministic bounded pack search. Defaults are 1.5s max shift, 1.15x max speed and 0.1s minimum gap. API accepts `max_shift_s` up to 3, `max_speedup` up to 1.25, and `pack_all`; stored/manual placements remain fixed by default. Added `/pack` preview mode (`apply:false`) and only persists/renders when `apply:true`.
+- Part A sample after packing: clip 1 at 0.0-4.5s, shift 0.0s, 1.00x; clip 2 at 6.5-12.76087s, shift 0.0s, 1.15x; clip 3 at 12.9-18.378261s, shift +0.5s, 1.15x. Order is preserved, minimum gaps are respected, and the result is inside 18.6s with no overlap.
+- Part A tests: `python -m pytest tests/test_timing.py -q` passed (27 tests), including all 10 languages and deterministic random property cases. Added API coverage that a pack preview neither writes placements nor renders audio.
+- Part A required checks: `python -m pytest tests -q` passed (220 tests, four existing FastAPI lifecycle deprecation warnings); `cd frontend && npm run build` passed (API prefix guard, TypeScript, Vite). Push after Part A is pending.
+- Current task: Part B take trimming, waveform peaks, tempo parity, timeline/placements API, and undo/redo history. Next: implement Part B, then build the interactive two-lane editor and local browser checks in Part C.

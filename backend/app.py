@@ -546,6 +546,10 @@ class VerifyDecision(BaseModel):
 class BalanceRequest(BaseModel):
     lang: str
     timing_offsets: dict[str, float] = Field(default_factory=dict)
+    max_shift_s: float = Field(default=1.5, ge=0, le=3)
+    max_speedup: float = Field(default=1.15, ge=1, le=1.25)
+    pack_all: bool = False
+    apply: bool = True
 
 
 class SourceEdit(BaseModel):
@@ -1978,6 +1982,7 @@ def _render_scheduled_track(project_id: str, lang: str, placements: list[dict], 
 
 
 @app.post("/api/projects/{project_id}/balance")
+@app.post("/api/projects/{project_id}/pack")
 async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
     project = project_row(project_id)
     if body.lang not in json.loads(project["target_langs_json"]):
@@ -1994,15 +1999,20 @@ async def balance_project_timing(project_id: str, body: BalanceRequest) -> dict:
         "id": row["id"], "start_s": row["start_s"], "end_s": row["end_s"],
         "speech_duration_s": row["duration_s"] or 0,
         "timing_offset_s": body.timing_offsets.get(row["id"], row["timing_offset_s"] or 0),
-        "edited": bool(row["human_edited"]), "locked": bool(row["timing_locked"] or row["id"] in body.timing_offsets),
+        "placed_start_s": float(row["start_s"]) + float(body.timing_offsets.get(row["id"], row["timing_offset_s"] or 0)),
+        "manual": bool(row["timing_locked"] or row["id"] in body.timing_offsets or float(row["timing_offset_s"] or 0) != 0),
+        "edited": bool(row["human_edited"]), "locked": bool(row["timing_locked"] or row["id"] in body.timing_offsets or float(row["timing_offset_s"] or 0) != 0),
         "translation": row["translation"] or "", "source_text": row["src_text"] or "",
     } for row in rows]
-    schedule = schedule_language(inputs, float(project["duration_s"] or 0))
+    schedule = schedule_language(inputs, float(project["duration_s"] or 0), max_shift_s=body.max_shift_s,
+                                  max_speedup=body.max_speedup, pack_all=body.pack_all)
     if not schedule["valid"]:
         # Never persist a placement set that violates the no-overlap, shift,
         # drift, or video-end invariants. The client can shorten the flagged
         # translation and ask the scheduler again.
         return {"lang": body.lang, **schedule}
+    if not body.apply:
+        return {"lang": body.lang, "preview": True, **schedule}
     placement_by_id = {item["id"]: item for item in schedule["placements"]}
     verification_cleared_clips: list[str] = []
     with db.connect() as connection:
