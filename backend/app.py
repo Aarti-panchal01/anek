@@ -652,6 +652,9 @@ def verification_audio_path(project_id: str, lang: str, clip_audio_path: str | P
     mixed_track = _track_artifact_path(project_id, lang, "dubbed")
     if mixed_track:
         candidates.append(mixed_track.resolve())
+    dubbed_video = _language_artifacts(project_id, lang).get("mp4")
+    if dubbed_video:
+        candidates.append(dubbed_video.resolve())
     for path in candidates:
         try:
             if path.is_relative_to(export_root) and path.is_file() and path.stat().st_size > 0:

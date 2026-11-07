@@ -884,6 +884,24 @@ def test_manual_verification_uses_mixed_track_when_clip_take_is_missing(monkeypa
         assert after["status"] == "green"
 
 
+def test_manual_verification_uses_dubbed_video_when_audio_artifacts_are_missing(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute("UPDATE dubs SET audio_path=NULL WHERE id='review-dub-1'")
+        export_dir = data_root / "exports" / project["id"]
+        export_dir.mkdir(parents=True, exist_ok=True)
+        (export_dir / "project_hi-IN_phase3d_ai-dubbed.mp4").write_bytes(b"dubbed video with mixed audio")
+
+        client = TestClient(app_module.app)
+        before = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN").json()[0]
+        assert before["verification_available"] is True
+        response = client.post("/api/clips/review-clip-1/dubs/hi-IN/verify")
+        assert response.status_code == 200
+        after = client.get(f"/api/projects/{project['id']}/clips?lang=hi-IN").json()[0]
+        assert after["user_verified"] is True
+
+
 def test_manual_verification_overrides_automatic_flags_without_confirmation(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root)
