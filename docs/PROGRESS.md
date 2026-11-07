@@ -189,3 +189,12 @@ Exact ffprobe outputs:
 - Part A reproduction: `python -m pytest tests/test_api_destinations.py::test_user_can_verify_a_saved_audio_take -q -o addopts=''` passed (1 test), confirming only that the old endpoint sets `status='green'`; it did not cover a separate durable user decision, fingerprint invalidation, or row/header consistency. Added migration fields for those missing semantics. No live DB was read or changed.
 - Part A validation: `python -m pytest tests -q` passed; `cd frontend && npm run build` passed (API-prefix scan, TypeScript, Vite). Existing FastAPI lifecycle deprecation warnings remain.
 - Part A commit: `9774cef` (awaiting push after documentation checkpoint validation).
+
+### Round 11 checkpoint update
+
+- Part A was pushed as `8ce3eb3` (correcting the earlier short hash recorded above).
+- Part B complete: added a deterministic language-independent scheduler with 1.0s per-clip and cumulative drift bounds, 1.15x speed-up ceiling, 100ms tolerance, pause reset behavior, and final video-end / no-overlap validation. Added a language balance endpoint that preserves manual placements, clears verification if timing changes, rebuilds the mixed dubbed track and preview, and returns timing health. Invalid schedules are returned for review and are not persisted. The review timeline now shows placed speech, source slots, overlap markers, and a Concise-style suggestion when total speech exceeds available time.
+- Part B tests: `python -m pytest tests -q` passed (158 tests; 4 existing FastAPI lifecycle deprecation warnings). `cd frontend && npm run build` passed (API-prefix check, TypeScript, Vite).
+- Part B commit: pending.
+- Part C next: rolling synchronized playback, playhead and list-follow behavior, drag timing with bounds and snapping, undo/redo, transcript layout and local visual QA.
+- Part B limitation: the endpoint reports `shorten_required` and advises the Concise style but does not automatically call Sarvam to shorten and re-synthesize a clip. Automatic paid generation is deferred; the schedule never writes an overlapping placement.

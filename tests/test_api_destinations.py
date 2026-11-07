@@ -878,6 +878,22 @@ def test_verification_override_requires_confirmation_and_is_persisted(monkeypatc
         assert tuple(row) == (1, 1)
 
 
+def test_balance_endpoint_persists_language_specific_placements(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute("UPDATE dubs SET timing_offset_s=0.2 WHERE id='review-dub-1'")
+        rendered = []
+        monkeypatch.setattr(app_module, "_render_scheduled_track", lambda project_id, lang, placements, duration: rendered.append((project_id, lang, placements)) or data_root / "track.wav")
+        result = _resolve(app_module.balance_project_timing(project["id"], app_module.BalanceRequest(lang="hi-IN")))
+        assert result["valid"] is True
+        assert result["placements"][0]["start_s"] == pytest.approx(0.2)
+        assert rendered and rendered[0][1] == "hi-IN"
+        with db.connect() as connection:
+            offset = connection.execute("SELECT timing_offset_s FROM dubs WHERE id='review-dub-1'").fetchone()[0]
+        assert offset == pytest.approx(0.2)
+
+
 def test_user_verification_rejects_overlapping_speech(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         _project_with_review_audio(data_root, overlap=True)
