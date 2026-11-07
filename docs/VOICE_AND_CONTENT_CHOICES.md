@@ -11,7 +11,7 @@ The content type chips pass a tone preset into translation. They help the transl
 
 ## Translation style
 
-- **Natural** is the recommended everyday style. For Indian language outputs, English loanwords should be written in the selected language's script.
+- **Natural** is the recommended everyday style. It uses a classic colloquial translation mode and the target language's native script. Numeric values are sent as source text rather than alphabetic markers, which were being read aloud as words such as “X cube.”
 - **Pure** uses formal, more fully native wording. It can produce longer speech, so more clips may need timing fixes.
 
 Changing the style on an existing project asks for confirmation with the eligible clip count and estimated credit cost. Edited, locked, and verified clips are skipped. The scheduler is run again for clips that are re-translated.

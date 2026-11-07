@@ -284,3 +284,12 @@ Exact ffprobe outputs:
 - End-to-end mocked smoke test: `python -m pytest tests/test_resilience_smoke.py -q` passed. Full backend suite and frontend build were rerun after the implementation and passed (207 backend tests; four existing FastAPI lifecycle deprecation warnings; API-prefix check, TypeScript, and Vite build passed).
 - Limitation: external provider uptime and quota accounting are controlled by Sarvam/Gnani. Key rotation prevents one exhausted/rejected Sarvam key from stopping translation while another is usable, but cannot guarantee zero errors during network outages or if all keys are exhausted/invalid.
 - Code commit `e57f42b` was pushed to `main`. Railway's latest deployment `f3f25cd5-11ad-43f2-832c-23ae0f6da6f0` reached `SUCCESS`; production `/health` returned HTTP 200. Recheck is pending only if the progress note itself triggers another deployment.
+
+## Round 16: translation quality across target languages
+
+- Updated Natural style to Sarvam Mayura `classic-colloquial` with `fully-native` target script (English India remains in Latin script); Pure remains formal/native-script.
+- Removed pronounceable alphabetic number placeholders from translation input. This applies to every target, including English, and prevents markers such as `ZXQ0XZ` becoming spoken “X cube”. Numeric checks validate the actual translated number forms.
+- Added/updated mocked coverage across all ten target languages, including English, for style parameters and direct number handling.
+- Backend suite: `python -m pytest tests -q` passed (207 tests; FastAPI lifecycle deprecation warnings only).
+- Frontend: `cd frontend && npm run build` passed (API-prefix check, TypeScript, and Vite build).
+- Screenshots/logs for the earlier geography project show the poor Kannada/Marathi text and separate Hindi duration failure. Existing saved project clips were not rewritten; this fix affects new translations and explicit retranslation only.
