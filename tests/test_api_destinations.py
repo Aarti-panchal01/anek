@@ -435,9 +435,8 @@ def test_project_video_waits_for_background_preview_and_retry_is_explicit(monkey
         monkeypatch.setattr(app_module, "browser_video_path", lambda *_: pytest.fail("GET must not convert media"))
         client = TestClient(app_module.app)
         response = client.get(f"/api/projects/{project_id}/video")
-        assert response.status_code == 202
-        assert response.json()["preview_status"] == "pending"
-        assert response.headers["retry-after"] == "2"
+        assert response.status_code == 409
+        assert response.json()["error"] == "media_unavailable"
 
         queued = []
         monkeypatch.setattr(app_module, "queue_project_preview", lambda project: queued.append(project))
@@ -838,12 +837,45 @@ def _project_with_review_audio(data_root, *, overlap=False):
 def test_user_can_verify_a_saved_audio_take(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         _project_with_review_audio(data_root)
-        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN", app_module.VerifyDecision(confirm_override=True)))
         assert result["human_verified"] is True
         with db.connect() as connection:
             row = connection.execute("SELECT status,reasons_json FROM dubs WHERE id='review-dub-1'").fetchone()
-        assert row["status"] == "green"
+        assert row["status"] == "yellow"
         assert json.loads(row["reasons_json"]) == []
+
+
+def test_human_verification_updates_clip_and_project_counts_and_can_be_undone(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN", app_module.VerifyDecision(confirm_override=True)))
+        assert result["human_verified"] is True
+        clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
+        assert clips[0]["status"] == "green"
+        assert clips[0]["user_verified"] is True
+        summary = _resolve(app_module.project_summary(project["id"]))
+        assert summary["clips"]["green"] == 1
+        undone = _resolve(app_module.unverify_dub_clip("review-clip-1", "hi-IN"))
+        assert undone["human_verified"] is False
+        clips = _resolve(app_module.get_clips(project["id"], "hi-IN"))
+        assert clips[0]["status"] == "yellow"
+        assert clips[0]["user_verified"] is False
+
+
+def test_verification_override_requires_confirmation_and_is_persisted(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute("UPDATE dubs SET reasons_json=? WHERE id=?", (json.dumps(["name mismatch"]), "review-dub-1"))
+        with pytest.raises(app_module.HTTPException) as exc:
+            _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN"))
+        assert exc.value.status_code == 409
+        assert exc.value.detail["confirm_override"] is True
+        result = _resolve(app_module.verify_dub_clip("review-clip-1", "hi-IN", app_module.VerifyDecision(confirm_override=True)))
+        assert result["verify_override"] is True
+        with db.connect() as connection:
+            row = connection.execute("SELECT user_verified,verify_override FROM dubs WHERE id='review-dub-1'").fetchone()
+        assert tuple(row) == (1, 1)
 
 
 def test_user_verification_rejects_overlapping_speech(monkeypatch):

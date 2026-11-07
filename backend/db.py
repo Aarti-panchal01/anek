@@ -55,6 +55,9 @@ def initialize() -> None:
       attempts_json TEXT NOT NULL DEFAULT '[]', audio_path TEXT, audio_hash TEXT,
       duration_s REAL, human_edited INTEGER NOT NULL DEFAULT 0,
       audio_stale INTEGER NOT NULL DEFAULT 0,
+      user_verified INTEGER NOT NULL DEFAULT 0, verified_fingerprint TEXT,
+      verify_override INTEGER NOT NULL DEFAULT 0,
+      timing_offset_s REAL NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(clip_id, lang), FOREIGN KEY(clip_id) REFERENCES clips(id)
     );
@@ -131,6 +134,12 @@ def initialize() -> None:
         dub_columns = {row["name"] for row in db.execute("PRAGMA table_info(dubs)")}
         if "audio_stale" not in dub_columns:
             db.execute("ALTER TABLE dubs ADD COLUMN audio_stale INTEGER NOT NULL DEFAULT 0")
+        for name, definition in (("user_verified", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("verified_fingerprint", "TEXT"),
+                                 ("verify_override", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("timing_offset_s", "REAL NOT NULL DEFAULT 0")):
+            if name not in dub_columns:
+                db.execute(f"ALTER TABLE dubs ADD COLUMN {name} {definition}")
 
 
 def json_value(value):

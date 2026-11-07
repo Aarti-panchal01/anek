@@ -21,6 +21,7 @@ from backend.pipeline.phase3b import (
     normalize_cleanup_changes,
     transcribe_generated_speech,
     timing_character_budget,
+    translation_style_instruction,
     should_reuse_completed_clip,
     prepare_language_retry_checkpoint,
     source_rows_from_report,
@@ -34,6 +35,16 @@ from backend.pipeline.phase3b import (
 from backend.brain.termsheet import TermSheet
 from backend.clients.llm import MockLLMClient
 from backend.pipeline.phase3b import clean_source_detail, meaning_check_reasons, synthesize_sentence_list
+
+
+@pytest.mark.parametrize("target_lang", ["hi-IN", "kn-IN"])
+def test_natural_spoken_translation_style_rejects_unnecessary_english_for_geography_sample(target_lang):
+    source = "So we have studied two things. India is located on the northeastern hemisphere, along with it,"
+    instruction = translation_style_instruction("natural_spoken", target_lang)
+    assert source.startswith("So we have studied two things.")
+    assert "Translate ordinary words, place names, and common number words" in instruction
+    assert "minimal English loanwords" in instruction
+    assert "approved brand/person names" in instruction
 
 
 @pytest.mark.parametrize("target_lang", ["hi-IN", "kn-IN"])

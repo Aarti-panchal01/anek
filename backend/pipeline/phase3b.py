@@ -46,6 +46,15 @@ INITIAL_TARGET_CHARS_PER_SECOND = 12.0
 SENTENCE_ENDINGS = r".!?।॥。！？؟։"
 
 
+def translation_style_instruction(style: str, target_lang: str) -> str:
+    """Keep everyday translation in the target language unless English is requested."""
+    if style == "keep_technical":
+        return "Translate ordinary words and place names into the target language; keep only established technical terms and approved brand/person names in English."
+    if style == "formal":
+        return "Use clear formal spoken target-language phrasing. Translate ordinary words and place names; retain only approved brand/person names in their original form."
+    return "Use natural spoken target-language phrasing with minimal English loanwords. Translate ordinary words, place names, and common number words; retain only approved brand/person names or terms from the term sheet in their required form."
+
+
 def run_command(args: list[str], capture: bool = True) -> str:
     runner = run_atomic_command if Path(args[0]).name.lower().startswith("ffmpeg") else subprocess.run
     result = runner(args, check=True, capture_output=capture, text=True)
@@ -362,13 +371,17 @@ def translation_candidates(
         "formal": "clear, respectful formal spoken register",
         "colloquial": "everyday casual spoken language",
         "marketing": "energetic and persuasive spoken language",
+        "natural_spoken": "natural spoken target-language speech with minimal English",
+        "keep_technical": "natural spoken speech with established English technical terms",
     }.get(translation_style, CONTENT_TONES[content_type])
+    style_instruction = translation_style_instruction(translation_style, target_lang)
     payload = {
             "source_text": source,
             "source_language": source_lang,
             "target_language": target_lang,
             "content_type": content_type,
             "tone": tone,
+            "translation_style_instruction": style_instruction,
             "max_chars": max_chars,
             "terms": terms.model_dump(),
             "source_uncertainties": source_uncertainties or [],
@@ -376,7 +389,7 @@ def translation_candidates(
         }
     response = prompt_json(
         client,
-        "Generate exactly three spoken translations. For Hindi, write Hindi in Devanagari; keep common English words in Latin script where speakers naturally code-mix. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement or infinitive phrase into an instruction, or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun, verb, or brand means. For uncertain phrases, preserve the ASR content without resolving it. Every keep/locked term must appear in its exact approved form, especially 'wig' in lowercase Latin script. Preserve full meaning even when it exceeds the duration budget; duration is a preference for rephrasing concisely, never a reason to remove information. Follow duration_budget.instruction and target_chars as an estimate, not a truncation rule. Return JSON: {candidates:[string,string,string]}.",
+        f"Generate exactly three spoken translations. {style_instruction} Use the target language's native script for ordinary words. Preserve every source proposition, filler, uncertainty, agent, action, object, polarity, modality, and speech act. Do not turn a statement or infinitive phrase into an instruction, or change who does what. Keep uncertain ASR phrases ambiguous; do not guess what an unclear noun, verb, or brand means. For uncertain phrases, preserve the ASR content without resolving it. Every keep/locked term must appear in its exact approved form. Preserve full meaning even when it exceeds the duration budget; duration is a preference for rephrasing concisely, never a reason to remove information. Follow duration_budget.instruction and target_chars as an estimate, not a truncation rule. Return JSON: {{candidates:[string,string,string]}}.",
         payload,
     )
     candidates = response.get("candidates", [])
@@ -413,7 +426,7 @@ def translation_candidates(
             break
         response = prompt_json(
             client,
-            "Return exactly two distinct spoken translations that pass the listed checks. For Hindi, write Hindi in Devanagari and common English words in Latin script. Correct failed candidates while preserving every source proposition, casual register, exact keep terms in lowercase Latin script (write 'wig', not its transliteration), all numbers, and the unresolved meaning of uncertain source phrases. Do not change agents or speech act. Apply duration_budget.instruction only as concise/full phrasing guidance; never omit meaning to fit. Return JSON exactly shaped as {\"candidates\":[\"candidate 1\",\"candidate 2\"]}.",
+            f"Return exactly two distinct spoken translations that pass the listed checks. {style_instruction} Correct failed candidates while preserving every source proposition, all exact keep terms, all numbers, and the unresolved meaning of uncertain source phrases. Do not change agents or speech act. Apply duration_budget.instruction only as concise/full phrasing guidance; never omit meaning to fit. Return JSON exactly shaped as {{\"candidates\":[\"candidate 1\",\"candidate 2\"]}}.",
             {**payload, "candidate_failures": failures, "previous_candidates": candidates, "retry_attempt": retry_attempt + 1},
         )
         candidates = response.get("candidates", [])
@@ -438,12 +451,16 @@ def paragraph_translation_candidates(
         "formal": "clear, respectful spoken register",
         "colloquial": "everyday casual spoken language",
         "marketing": "energetic and persuasive spoken language",
+        "natural_spoken": "natural spoken target-language speech with minimal English",
+        "keep_technical": "natural spoken speech with established English technical terms",
     }.get(translation_style, CONTENT_TONES[content_type])
+    style_instruction = translation_style_instruction(translation_style, target_lang)
     payload = {
         "source_language": source_lang,
         "target_language": target_lang,
         "content_type": content_type,
         "tone": tone,
+        "translation_style_instruction": style_instruction,
         "term_sheet": terms.model_dump(),
         "full_source_paragraph": " ".join(row["cleaned"] for row in rows),
         "timed_source_spans": [
@@ -464,13 +481,11 @@ def paragraph_translation_candidates(
     }
     response = prompt_json(
         client,
-        "Translate the full source paragraph as one coherent piece, using every timed source span as a boundary guide. "
+        f"Translate the full source paragraph as one coherent piece, using every timed source span as a boundary guide. {style_instruction} "
         "Return exactly three candidate objects, each with a translations array in the same order and length as "
         "timed_source_spans. Translate every span fully; do not merge spans or change who does what. Use natural spoken "
         "target-language phrasing and preserve casual register and fillers. The character budget is a timing hint only; "
-        "never drop meaning. For Hindi, use natural educated spoken Hindi in Devanagari; translate ordinary words, "
-        "write common loanwords in Devanagari (कैंसर, डॉक्टर, ऐप, विग, फ़ोन, वीडियो), and do not leave English clauses "
-        "untranslated. Apply equivalent native-script and spoken-language choices for other Indian languages. Do not "
+        "never drop meaning. Use the target language's native script for ordinary words, including place names and number words. Do not "
         "transliterate abstract English words. Keep agents, actions, objects, polarity, modality, numbers, and speech act. "
         "Do not guess unclear source nouns or brands; retain the heard wording and mark uncertainty in review_notes. "
         "Return JSON shaped as {candidates:[{translations:[...],review_notes:[...]}, ...]}.",

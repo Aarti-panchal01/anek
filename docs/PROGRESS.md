@@ -177,3 +177,15 @@ Exact ffprobe outputs:
 - English-target fix validation: python -m pytest tests -q -o addopts='' passed (122 tests, 4 existing lifecycle deprecation warnings); cd frontend && npm run build passed. The corrected provider check awaits deployment.
 - Final live result: Railway deployment a0dd3cdb-fbcb-47e7-a0bf-b9b0398c60b8 ran `python scripts/check_providers.py`: Bengali OK, English OK, Gujarati OK, Hindi OK, Kannada OK, Malayalam OK, Marathi OK, Punjabi OK, Tamil OK, Telugu OK, Saaras STT OK, GNANI_API_KEY CONFIGURED. SARVAM_API_KEY and GNANI_API_KEY were present and non-empty; all six obsolete variable names were absent after removal.
 - Round 10 commits: Part A hotfix `7da1f877a05bdffacec9135316ebc8ac46da90f9`; provider and per-language status `1fb8a79`; image packaging fix `0d6b622`; same-language target fix `43b9544`. Final validation: 122 backend tests passed (4 existing lifecycle warnings) and frontend production build passed. Final live status all target-language checks passed.
+
+## Round 11: verify, elastic timing, timeline
+
+- Started from clean `main` at the end of Round 10. Scope follows the pasted request; never access `/data/voices` or the database file directly.
+- Part A complete: persisted user verification independently from automatic status, fingerprint-bound verification, confirmation override, Undo verified, live row/header counts and Next problem skipping verified clips. Added clearer saved-text/audio-out-of-date wording and Natural spoken, Keep English technical terms, and Formal project style instructions to the Sarvam translation prompts. Added regression tests for verification counts, override confirmation, undo, and Hindi/Kannada natural-style requirements. Full backend tests and frontend production build passed; see Part A commit below.
+- Part B current: implement and test the deterministic elastic scheduler, placement API, timing health, and export/preview placement integration.
+- Part C next: timeline and transcript editor, continuous synchronized playback, drag timing, balance, undo/redo, mobile and visual review.
+- Validation and pushes: after each Part, run `python -m pytest tests -q` and `cd frontend && npm run build`; push only after both pass.
+- Decisions: use the generated mixed server-side dub preview for continuous synchronized playback because it keeps one timing authority across browsers. Keep screenshots and Playwright tooling out of Git. No tests/results are claimed until run.
+- Part A reproduction: `python -m pytest tests/test_api_destinations.py::test_user_can_verify_a_saved_audio_take -q -o addopts=''` passed (1 test), confirming only that the old endpoint sets `status='green'`; it did not cover a separate durable user decision, fingerprint invalidation, or row/header consistency. Added migration fields for those missing semantics. No live DB was read or changed.
+- Part A validation: `python -m pytest tests -q` passed; `cd frontend && npm run build` passed (API-prefix scan, TypeScript, Vite). Existing FastAPI lifecycle deprecation warnings remain.
+- Part A commit: `9774cef` (awaiting push after documentation checkpoint validation).
