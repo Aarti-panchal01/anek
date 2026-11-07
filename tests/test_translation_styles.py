@@ -4,7 +4,8 @@ import pytest
 
 from backend.brain.checks import latin_letter_share
 from backend.brain.numbers import compare_numbers
-from backend.clients.llm import ProviderError, SarvamTranslationClient, SharedSarvamLimiter, _split_at_character_limit
+from backend.clients.llm import (ProviderError, SarvamTranslationClient, SharedSarvamLimiter,
+    _protect_number_tokens, _restore_number_tokens, _split_at_character_limit)
 from backend.config import LANGUAGES
 from backend.translation_style import eligible_style_switch_rows, style_switch_eligible
 
@@ -133,3 +134,34 @@ def test_clip_splitter_keeps_parts_within_limit_and_preserves_content():
     parts = _split_at_character_limit(source, 1000)
     assert all(len(part) <= 1000 for part in parts)
     assert "".join(parts) == source
+
+
+def test_numeric_values_are_protected_during_translation_and_restored(monkeypatch):
+    calls = []
+
+    class Text:
+        def translate(self, **kwargs):
+            calls.append(kwargs["input"])
+            return type("Result", (), {"translated_text": kwargs["input"]})()
+
+    monkeypatch.setattr(SharedSarvamLimiter, "call", classmethod(lambda cls, operation: operation()))
+    instance = _client()
+    instance.client = type("Sarvam", (), {"text": Text()})()
+    source = "Zorvo plan Rs 1,00,000. Call 98765 43210 between 9 AM and 6 PM."
+    result = instance.chat_json([
+        {"role": "system", "content": "Translate the full source paragraph"},
+        {"role": "user", "content": json.dumps({"source_language": "en-IN", "target_language": "hi-IN", "timed_source_spans": [{"source_text": source}]})},
+    ])
+    translated = result["candidates"][0]["translations"][0]
+    assert len(calls) == 1
+    assert "ZXQ0XZ" in calls[0] and "1,00,000" not in calls[0]
+    for value in ("1,00,000", "98765 43210", "9 AM", "6 PM"):
+        assert value in translated
+    assert "ZXQ" not in translated
+
+
+def test_number_placeholders_restore_exact_source_format():
+    original = "Rs 1,00,000, phone 98765 43210, 09:30 AM, 6 PM, 2026-11-07"
+    protected, mapping = _protect_number_tokens(original)
+    assert "1,00,000" not in protected
+    assert _restore_number_tokens(protected, mapping) == original

@@ -239,3 +239,12 @@ Exact ffprobe outputs:
 - Part C validation: `python -m pytest tests -q` passed (158 tests; 4 existing FastAPI lifecycle deprecation warnings). `cd frontend && npm run build` passed (API-prefix check, TypeScript, Vite). The screenshots were captured and inspected; the first loaded take reports 2.856 seconds in Playwright.
 - Part C commit: `8883663` (pushed to `main`).
 - Limits: drag editing currently adjusts clip start only, not the end handle, and does not snap automatically to neighboring clips. The mock visual fixture used generated test-pattern video and synthetic transcript text, not user footage or paid providers. Part B automatic Sarvam shortening and re-synthesis remains deferred as recorded above.
+
+## Round 14: style check, UI stability, go live
+
+- Part A complete. Extended `scripts/check_translation_styles.py` to all ten configured targets, Natural and Pure, four English sample sentences plus Hindi source inputs for English target, CLI filters, UTF-8 output, per-request error continuation, Latin share, and app number checker summary. Added numeric placeholder preservation and exact restore in `backend/clients/llm.py`, covered by mocked Sarvam tests.
+- Before: translation used Mayura `mayura:v1`, Natural `modern-colloquial` with `spoken-form-in-native`, Pure `formal` with `fully-native`; English mixed script came from Mayura's spoken-form output choice and ordinary translation choices. Now same models/modes, but formatted numeric spans are token protected/restored through translation.
+- Live diagnostic was not run: local `SARVAM_API_KEY` is absent. Command `python scripts/check_translation_styles.py --help` passed; the ten-language execution requires the Railway key and is to be run with `python scripts/check_translation_styles.py --out docs/translation-style-results.txt` there. No key values were printed.
+- Part A validation: `python -m pytest tests -q` passed; `cd frontend && npm run build` passed, including the API-prefix guard. Changes are not committed yet.
+- Current step: Part B, polish the translation style selector and document voice and content type choices. Exact commands so far: `Get-Content docs/PROGRESS.md -TotalCount 24` (read completed); `python -m pytest tests/test_translation_styles.py -q` (passed after import-path correction); `python scripts/check_translation_styles.py --help` (passed); `python -m pytest tests -q` (passed); `cd frontend && npm run build` (passed).
+- Next: Parts B and C, then push Part A with Part B/C if checks pass; Part D and final checks before final push.

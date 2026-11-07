@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 from collections import deque
@@ -147,6 +148,31 @@ def _split_at_character_limit(text: str, limit: int) -> list[str]:
     return parts or [""]
 
 
+_PROTECTED_NUMBER_RE = re.compile(
+    r"(?i)(?:\bRs\.?\s*)?\b\d{1,3}(?:,\d{2})*,\d{3}\b|"
+    r"\b\d{5}\s+\d{5}\b|\b\d{1,4}[/-]\d{1,2}(?:[/-]\d{1,4})?\b|"
+    r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b|\b\d+(?:\.\d+)?%?\b"
+)
+
+
+def _protect_number_tokens(text: str) -> tuple[str, dict[str, str]]:
+    """Keep numeric identifiers and formatted values stable through translation."""
+    values: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        token = f"ZXQ{len(values)}XZ"
+        values[token] = match.group(0)
+        return token
+
+    return _PROTECTED_NUMBER_RE.sub(replace, text), values
+
+
+def _restore_number_tokens(text: str, values: dict[str, str]) -> str:
+    for token, value in values.items():
+        text = re.sub(re.escape(token), lambda _match: value, text, flags=re.IGNORECASE)
+    return text
+
+
 class SarvamTranslationClient:
     """Sarvam Translate/Mayura for translations and Sarvam chat for structured QA."""
 
@@ -210,8 +236,9 @@ class SarvamTranslationClient:
                     source_parts = _split_at_character_limit(str(span.get("source_text", "")), 1000)
                     translated_parts = []
                     for source_part in source_parts:
+                        protected_input, number_tokens = _protect_number_tokens(source_part)
                         translate_options = dict(
-                            input=source_part,
+                            input=protected_input,
                             source_language_code=source_language,
                             target_language_code=target,
                             model=self.translation_model,
@@ -234,7 +261,7 @@ class SarvamTranslationClient:
                         translated = getattr(result, "translated_text", None)
                         if not isinstance(translated, str) or not translated.strip():
                             raise ProviderError("Sarvam translation returned no text")
-                        translated_parts.append(translated.strip())
+                        translated_parts.append(_restore_number_tokens(translated.strip(), number_tokens))
                         if translate_options["model"] not in used_models:
                             used_models.append(translate_options["model"])
                 except ProviderError:
