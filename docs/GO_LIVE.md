@@ -29,8 +29,8 @@
 - Sign in and confirm project listing and media playback work through `/api`.
 - Upload a small video, inspect the local preview, run one mocked job in a non-production environment, and check provider status before paid production work.
 - Review the Railway logs for provider names and timing values only. Never print environment variable values.
-- Confirm disk usage and the persistent volume before running long jobs. The configured managed storage budget is 350 MB and no more than two finished projects are retained.
-- Confirm an export can be downloaded and that its expiry is visible in the project.
+- Confirm disk usage and the persistent volume before running long jobs. Existing projects and exports are retained until manually deleted. The managed storage budget limits new uploads but never evicts existing projects.
+- Confirm an export can be downloaded and remains available until its project is manually deleted.
 
 ## Auth and request limits
 

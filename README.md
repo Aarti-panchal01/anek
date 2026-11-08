@@ -85,7 +85,7 @@ General keeps natural English code-switching. Pure translates ordinary English w
 - The normal overrun tolerance is 100 ms, bounded by available silence. Clip speech must not overlap, and exports are checked against the source duration.
 - Jobs save checkpoints and can resume after a restart. Project states include Processing, Interrupted, and Failed. Generated files are written atomically so partial files are not exposed.
 - The editor keeps automatic attempt history, the previous and current takes, and the text changes between attempts.
-- Export includes the mixed dub, subtitles, and a verification report. Exports expire after 24 hours by default.
+- Export includes the mixed dub, subtitles, and a verification report. Projects and exports remain available until you delete the project.
 
 ## Stack
 

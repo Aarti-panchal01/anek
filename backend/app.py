@@ -55,7 +55,6 @@ settings = get_settings()
 LOGGER = logging.getLogger(__name__)
 _shutdown_requested = threading.Event()
 _active_job_tasks: set[asyncio.Task] = set()
-_storage_maintenance_task: asyncio.Task | None = None
 _preview_tasks: dict[str, asyncio.Task] = {}
 _project_language_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
@@ -162,7 +161,6 @@ DATA_ROOT = Path(settings.anek_data_dir)
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 UPLOAD_WORKING_COPY_MULTIPLIER = 2
 STORAGE_BUDGET_BYTES = 350 * 1024 * 1024
-MAX_FINISHED_PROJECTS = 2
 CONSENT_PHRASES = [
     "Today I am recording my voice for an AI dubbing test.",
     "I consent to use this recording to create my own voice model.",
@@ -353,23 +351,11 @@ def managed_data_bytes() -> int:
 def ensure_storage_room(project_id: str, upload_size: int) -> list[dict[str, str]]:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     required = max(0, upload_size) * UPLOAD_WORKING_COPY_MULTIPLIER
-    evicted: list[dict[str, str]] = []
-    while True:
-        disk = shutil.disk_usage(DATA_ROOT)
-        budget = min(disk.total, STORAGE_BUDGET_BYTES)
-        with db.connect() as connection:
-            finished = connection.execute(
-                "SELECT id,name FROM projects WHERE status='complete' AND id<>? ORDER BY created_at ASC,id ASC",
-                (project_id,),
-            ).fetchall()
-        over_budget = managed_data_bytes() + required > budget or disk.free < required
-        over_project_count = len(finished) >= MAX_FINISHED_PROJECTS
-        if not over_budget and not over_project_count:
-            return evicted
-        if not finished:
-            raise StorageFullError("Not enough storage for this video. Delete a project and try again.")
-        oldest = finished[0]
-        evicted.append(_delete_project_data(oldest["id"]))
+    disk = shutil.disk_usage(DATA_ROOT)
+    budget = min(disk.total, STORAGE_BUDGET_BYTES)
+    if managed_data_bytes() + required > budget or disk.free < required:
+        raise StorageFullError("Not enough storage for this video. Delete a project only if you choose to free space.")
+    return []
 
 
 def cleanup_orphaned_files(root: Path) -> list[Path]:
@@ -438,61 +424,6 @@ def cleanup_project_intermediates(project_id: str) -> list[Path]:
                 (project_id,),
             )
     return removed
-
-
-def _utc_datetime(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-
-
-def project_export_expiry(project_id: str) -> datetime | None:
-    with db.connect() as connection:
-        latest = connection.execute(
-            "SELECT lang,MAX(created_at) AS created_at FROM export_events WHERE project_id=? GROUP BY lang",
-            (project_id,),
-        ).fetchall()
-    expiries = [
-        _utc_datetime(row["created_at"]) + timedelta(hours=settings.export_retention_hours)
-        for row in latest if row["created_at"]
-    ]
-    return min(expiries) if expiries else None
-
-
-def cleanup_expired_exports(now: datetime | None = None) -> list[Path]:
-    current = now or datetime.now(timezone.utc)
-    expired: list[Path] = []
-    with db.connect() as connection:
-        latest = connection.execute(
-            "SELECT project_id,lang,MAX(created_at) AS created_at FROM export_events GROUP BY project_id,lang"
-        ).fetchall()
-    for row in latest:
-        if not row["created_at"] or _utc_datetime(row["created_at"]) + timedelta(hours=settings.export_retention_hours) > current:
-            continue
-        folder = DATA_ROOT / "exports" / row["project_id"]
-        if folder.is_dir():
-            for path in folder.rglob("*"):
-                if path.is_file() and f"_{row['lang']}" in path.name:
-                    try:
-                        path.unlink()
-                        expired.append(path)
-                    except OSError:
-                        LOGGER.exception("Could not remove expired export path=%s", path)
-        with db.connect() as connection:
-            connection.execute("DELETE FROM export_events WHERE project_id=? AND lang=?", (row["project_id"], row["lang"]))
-            connection.execute(
-                "UPDATE dubs SET audio_path=NULL WHERE lang=? AND clip_id IN (SELECT id FROM clips WHERE project_id=?)",
-                (row["lang"], row["project_id"]),
-            )
-    return expired
-
-
-async def storage_maintenance_loop() -> None:
-    while not _shutdown_requested.is_set():
-        try:
-            await asyncio.to_thread(cleanup_expired_exports)
-        except Exception:
-            LOGGER.exception("Export expiry cleanup failed")
-        await asyncio.sleep(3600)
 
 
 def enforce_ip_limit(request: Request, category: str) -> None:
@@ -837,7 +768,6 @@ def estimated_job_credits(duration_s: float, language_count: int) -> int:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _storage_maintenance_task
     _shutdown_requested.clear()
     db.initialize()
     log_runtime_configuration()
@@ -868,16 +798,11 @@ async def startup() -> None:
         queue_project_preview(item["id"])
     for item in pending:
         await schedule_job(item["id"])
-    cleanup_expired_exports()
-    _storage_maintenance_task = asyncio.create_task(storage_maintenance_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     _shutdown_requested.set()
-    if _storage_maintenance_task:
-        _storage_maintenance_task.cancel()
-        await asyncio.gather(_storage_maintenance_task, return_exceptions=True)
     if _active_job_tasks:
         await asyncio.wait(tuple(_active_job_tasks), timeout=25)
 
@@ -903,7 +828,6 @@ async def storage_status() -> dict:
         "budget_bytes": budget,
         "budget_percent": round(budget / usage.total * 100, 1) if usage.total else 0,
         "budget_used_percent": round(managed_used / budget * 100, 1) if budget else 0,
-        "export_retention_hours": settings.export_retention_hours,
     }
 
 
@@ -936,7 +860,6 @@ async def get_config() -> dict:
         "languages": {code: LANGUAGES[code] for code in settings.enabled_langs if code in LANGUAGES},
         "max_video_seconds": settings.max_video_seconds,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
-        "export_retention_hours": settings.export_retention_hours,
         "daily_credit_limit": settings.gnani_daily_limit,
         "used_daily_credits": int(used),
         "remaining_daily_credits": max(0, settings.gnani_daily_limit - int(used)),
@@ -1137,10 +1060,7 @@ async def list_projects() -> list[dict]:
             "FROM projects p LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE project_id=p.id ORDER BY created_at DESC LIMIT 1) "
             "ORDER BY p.created_at DESC"
         ).fetchall()
-    return [{
-        **dict(row), "target_langs": json.loads(row["target_langs_json"]),
-        "export_expires_at": (expiry.isoformat() if (expiry := project_export_expiry(row["id"])) else None),
-    } for row in rows]
+    return [{**dict(row), "target_langs": json.loads(row["target_langs_json"])} for row in rows]
 
 
 @app.get("/api/projects/summary")
@@ -1246,11 +1166,10 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
     if suffix not in {".mp4", ".mov", ".webm"}:
         raise HTTPException(415, "Upload an MP4, MOV, or WebM video")
     upload_size = getattr(video, "size", None)
-    evicted_projects: list[dict[str, str]] = []
     if upload_size is not None:
         if upload_size > MAX_UPLOAD_BYTES:
             raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
-        evicted_projects.extend(ensure_storage_room(project_id, upload_size))
+        ensure_storage_room(project_id, upload_size)
     folder = DATA_ROOT / "uploads" / project_id
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"source{suffix}"
@@ -1263,7 +1182,7 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
                 if upload_size is None:
-                    evicted_projects.extend(ensure_storage_room(project_id, size))
+                    ensure_storage_room(project_id, size)
                 target.write(block)
         commit_temporary(temporary, path)
     except HTTPException:
@@ -1295,7 +1214,7 @@ async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict:
         )
     queue_project_preview(project_id)
     return {"filename": safe_upload_name(video.filename), "duration_s": duration, "project_id": project_id,
-            "evicted_projects": evicted_projects, "preview_notice": preview_notice, "preview_status": "pending"}
+            "preview_notice": preview_notice, "preview_status": "pending"}
 
 
 @app.post("/api/media/browser-preview")

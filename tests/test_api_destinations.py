@@ -118,7 +118,6 @@ def test_video_upload_keeps_compatible_source_unchanged(monkeypatch):
         assert project_row.read_bytes() == b"compatible h264 aac bytes"
         assert list(source.parent.iterdir()) == [source]
         assert result["filename"] == "source.mp4"
-        assert result["evicted_projects"] == []
         assert result["preview_status"] == "pending"
 
 
@@ -228,7 +227,7 @@ def test_upload_preflight_rejects_files_over_the_configured_limit(monkeypatch):
         assert "upload limit" in response.json()["detail"]
 
 
-def test_storage_eviction_removes_oldest_finished_only(monkeypatch):
+def test_storage_never_evicts_finished_projects(monkeypatch):
     with _sandbox(monkeypatch):
         _roomy_disk(monkeypatch)
         ids = []
@@ -242,11 +241,27 @@ def test_storage_eviction_removes_oldest_finished_only(monkeypatch):
             connection.execute("UPDATE projects SET status='complete',created_at='2021-01-01' WHERE id=?", (ids[1],))
             connection.execute("UPDATE projects SET status='interrupted' WHERE id=?", (ids[2],))
         removed = app_module.ensure_storage_room(ids[3], 1)
-        assert removed == [{"id": ids[0], "name": "old"}]
+        assert removed == []
         with db.connect() as connection:
             remaining = {row["id"] for row in connection.execute("SELECT id FROM projects")}
-        assert ids[0] not in remaining
-        assert {ids[1], ids[2], ids[3]} <= remaining
+        assert set(ids) == remaining
+
+
+def test_storage_pressure_refuses_new_upload_without_deleting_projects(monkeypatch):
+    with _sandbox(monkeypatch):
+        _roomy_disk(monkeypatch)
+        project_ids = []
+        for name in ("keep one", "keep two"):
+            project = _resolve(app_module.create_project(app_module.ProjectCreate(
+                name=name, source_lang="en-IN", target_langs=["hi-IN"],
+            )))
+            project_ids.append(project["id"])
+        monkeypatch.setattr(app_module, "managed_data_bytes", lambda: app_module.STORAGE_BUDGET_BYTES)
+        with pytest.raises(app_module.StorageFullError):
+            app_module.ensure_storage_room(project_ids[-1], 1)
+        with db.connect() as connection:
+            remaining = {row["id"] for row in connection.execute("SELECT id FROM projects")}
+        assert remaining == set(project_ids)
 
 
 def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
@@ -259,7 +274,6 @@ def test_storage_endpoint_reports_used_and_free_bytes(monkeypatch):
             "total_bytes": 1000, "used_bytes": 750, "managed_used_bytes": 750, "free_bytes": 250,
             "used_percent": 75.0, "free_percent": 25.0,
             "budget_bytes": 1000, "budget_percent": 100.0, "budget_used_percent": 75.0,
-            "export_retention_hours": 24,
         }
 
 
@@ -273,8 +287,7 @@ def test_project_budget_uses_managed_data_not_volume_used_bytes(monkeypatch):
         assert app_module.ensure_storage_room(project["id"], 4096) == []
 
 
-def test_expired_exports_are_removed_after_configured_retention(monkeypatch):
-    from datetime import datetime, timezone
+def test_exports_and_project_rows_are_not_expired_automatically(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Expiring export", source_lang="en-IN", target_langs=["hi-IN"],
@@ -288,12 +301,14 @@ def test_expired_exports_are_removed_after_configured_retention(monkeypatch):
                 "INSERT INTO export_events(id,project_id,lang,formats_json,unresolved_red_json,created_at) VALUES(?,?,?,?,?,?)",
                 ("old-export", project["id"], "hi-IN", '["mp4"]', '[]', "2020-01-01T00:00:00+00:00"),
             )
-        expired = app_module.cleanup_expired_exports(datetime(2020, 1, 2, tzinfo=timezone.utc))
-        assert expired == [final]
-        assert not final.exists()
+        assert final.read_bytes() == b"final"
+        assert not hasattr(app_module, "cleanup_expired_exports")
         with db.connect() as connection:
-            assert connection.execute("SELECT COUNT(*) FROM export_events WHERE id='old-export'").fetchone()[0] == 0
-        assert app_module.project_export_expiry(project["id"]) is None
+            assert connection.execute("SELECT COUNT(*) FROM export_events WHERE id='old-export'").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0] == 1
+        listed = _resolve(app_module.list_projects())
+        assert listed[0]["id"] == project["id"]
+        assert "export_expires_at" not in listed[0]
 
 
 def test_startup_cleanup_removes_orphans_but_preserves_voice_and_database(monkeypatch):
