@@ -13,11 +13,24 @@ Create, review, and export dubbed videos in ten languages.
 
 </div>
 
-## What Anek does
+## Why Anek
 
-Anek turns a single-speaker video into reviewed dubbed versions. It transcribes the source once, applies project terminology, translates and voices each clip, checks timing, and gives you control over edits and approval before export.
+You can dub a video into a language you can't read. That is the problem: if a price, a phone number or a name changes on the way, you won't notice.
 
-Available targets are Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil, and Telugu.
+Anek checks every dubbed clip for numbers and names, flags the ones it is unsure about, and leaves the decision to you. Nothing is fixed silently.
+
+## Demo
+
+Demo video coming soon.
+<!-- Add the demo link here. -->
+
+## Features
+
+- Transcribe once, dub into up to ten languages
+- Term memory for names, mishearings and pronunciation
+- Verified, Review and Needs you states per clip
+- A draggable timeline to fix timing by hand
+- Jobs that resume after a restart
 
 ## Architecture
 
