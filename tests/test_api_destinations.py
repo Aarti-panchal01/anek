@@ -323,6 +323,7 @@ def test_startup_cleanup_removes_orphans_but_preserves_voice_and_database(monkey
 
 def test_delete_project_removes_upload_exports_and_database_records(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
+        monkeypatch.setenv("PRIVACY_DELETE_PASSWORD", "test-only-password")
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Delete project", source_lang="en-IN", target_langs=["hi-IN"],
         )))
@@ -338,7 +339,10 @@ def test_delete_project_removes_upload_exports_and_database_records(monkeypatch)
         with db.connect() as connection:
             connection.execute("UPDATE projects SET video_path=? WHERE id=?", (str(source), project_id))
 
-        assert _resolve(app_module.delete_project(project_id)) == {"deleted": True}
+        response = TestClient(app_module.app).delete(
+            f"/api/projects/{project_id}", headers={"X-Privacy-Delete-Password": "test-only-password"}
+        )
+        assert response.status_code == 200 and response.json() == {"deleted": True}
         assert not upload_dir.exists() and not export_dir.exists()
         with db.connect() as connection:
             assert connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None
@@ -761,6 +765,7 @@ def test_audio_tracks_report_when_saved_track_files_are_missing(monkeypatch):
 
 def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
+        monkeypatch.setenv("PRIVACY_DELETE_PASSWORD", "test-only-password")
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Audio deletion test", source_lang="en-IN", target_langs=["hi-IN"],
         )))
@@ -796,7 +801,11 @@ def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypa
         assert voices == [{"id": "voice-test", "label": "My voice", "consent_confirmed": True,
                            "has_reference": True, "created_at": voices[0]["created_at"]}]
         assert "embedding_json" not in voices[0] and "reference_path" not in voices[0]
-        result = _resolve(app_module.delete_project_audio(project_id))
+        response = TestClient(app_module.app).delete(
+            f"/api/projects/{project_id}/audio", headers={"X-Privacy-Delete-Password": "test-only-password"}
+        )
+        assert response.status_code == 200
+        result = response.json()
         assert result["source_video_removed"] is True
         assert not source_video.exists() and not browser_copy.exists() and not muxed.exists() and not wav.exists()
         assert srt.exists() and report.exists() and reference.exists()
@@ -811,6 +820,7 @@ def test_voice_list_is_redacted_and_project_audio_delete_preserves_text(monkeypa
 
 def test_delete_all_user_data_clears_files_and_database(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
+        monkeypatch.setenv("PRIVACY_DELETE_PASSWORD", "test-only-password")
         project = _resolve(app_module.create_project(app_module.ProjectCreate(
             name="Disposable privacy test", source_lang="en-IN", target_langs=["hi-IN"],
         )))
@@ -819,12 +829,34 @@ def test_delete_all_user_data_clears_files_and_database(monkeypatch):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("disposable test data", encoding="utf-8")
 
-        result = _resolve(app_module.delete_all_user_data())
+        response = TestClient(app_module.app).delete(
+            "/api/data", headers={"X-Privacy-Delete-Password": "test-only-password"}
+        )
+        assert response.status_code == 200
+        result = response.json()
 
         assert result == {"deleted": True}
         assert all(not (data_root / folder).exists() for folder in ("uploads", "exports", "voices"))
         with db.connect() as connection:
             assert connection.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project["id"],)).fetchone()[0] == 0
+
+
+def test_deletion_requires_configured_password_and_rejects_wrong_password(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Protected delete", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        client = TestClient(app_module.app)
+
+        monkeypatch.delenv("PRIVACY_DELETE_PASSWORD", raising=False)
+        unconfigured = client.delete("/api/data")
+        assert unconfigured.status_code == 503
+
+        monkeypatch.setenv("PRIVACY_DELETE_PASSWORD", "test-only-password")
+        rejected = client.delete("/api/data", headers={"X-Privacy-Delete-Password": "wrong"})
+        assert rejected.status_code == 403
+        with db.connect() as connection:
+            assert connection.execute("SELECT 1 FROM projects WHERE id=?", (project["id"],)).fetchone()
 
 
 def _project_with_review_audio(data_root, *, overlap=False):

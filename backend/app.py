@@ -149,6 +149,15 @@ def log_runtime_configuration(config=settings, environment: dict[str, str] | Non
     elif overrides:
         LOGGER.info("Timing environment overrides code defaults: %s", ", ".join(overrides))
 app = FastAPI(title=settings.app_name)
+
+
+def _require_privacy_delete_password(request: Request) -> None:
+    expected = os.getenv("PRIVACY_DELETE_PASSWORD", "")
+    if not expected:
+        raise HTTPException(503, "Deletion password is not configured on the server.")
+    supplied = request.headers.get("x-privacy-delete-password", "")
+    if not supplied or not hmac.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(403, "Deletion password is incorrect.")
 DATA_ROOT = Path(settings.anek_data_dir)
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 UPLOAD_WORKING_COPY_MULTIPLIER = 2
@@ -202,7 +211,7 @@ if origins or settings.cors_origin_regex:
         allow_origin_regex=settings.cors_origin_regex or None,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-Privacy-Delete-Password"],
     )
 
 
@@ -1623,7 +1632,8 @@ async def create_voice(
 
 
 @app.delete("/api/voices/{voice_id}")
-async def delete_voice(voice_id: str) -> dict:
+async def delete_voice(voice_id: str, request: Request) -> dict:
+    _require_privacy_delete_password(request)
     with db.connect() as connection:
         row = connection.execute("SELECT reference_path FROM voices WHERE id=?", (voice_id,)).fetchone()
         if row is None:
@@ -1648,8 +1658,9 @@ async def list_voices() -> list[dict]:
 
 
 @app.delete("/api/projects/{project_id}/audio")
-async def delete_project_audio(project_id: str) -> dict:
+async def delete_project_audio(project_id: str, request: Request) -> dict:
     """Remove source and generated audio/video assets while retaining text and reports."""
+    _require_privacy_delete_password(request)
     project = project_row(project_id)
     data_root = DATA_ROOT.resolve()
     upload_dir = (DATA_ROOT / "uploads" / project_id).resolve()
@@ -3250,14 +3261,16 @@ async def project_audio_tracks(project_id: str, lang: str) -> dict:
 
 
 @app.delete("/api/projects/{project_id}")
-async def delete_project(project_id: str) -> dict:
+async def delete_project(project_id: str, request: Request) -> dict:
+    _require_privacy_delete_password(request)
     _delete_project_data(project_id)
     return {"deleted": True}
 
 
 @app.delete("/api/data")
-async def delete_all_user_data() -> dict:
+async def delete_all_user_data(request: Request) -> dict:
     """Remove local uploads, generated exports, voice references, cached responses and database rows."""
+    _require_privacy_delete_password(request)
     for folder in ("uploads", "exports", "voices"):
         shutil.rmtree(DATA_ROOT / folder, ignore_errors=True)
     with db.connect() as connection:
