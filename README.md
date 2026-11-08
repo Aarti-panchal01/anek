@@ -19,18 +19,38 @@ Anek turns a single-speaker video into reviewed dubbed versions. It transcribes 
 
 Available targets are Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil, and Telugu.
 
-## How a dub is made
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[Upload video] --> B[Consent and voice setup]
-    B --> C[Sarvam source transcription]
-    C --> D[Term rules]
-    D --> E[Sarvam translation]
-    E --> F[Gnani speech synthesis]
-    F --> G[Timing and quality checks]
-    G --> H[Review and edit]
-    H --> I[Export]
+    Browser[Browser] --> Web[React app on Vercel]
+    Web -->|HTTPS API and media| API[FastAPI service on Railway]
+    subgraph Railway[Railway service]
+        API --> Jobs[Job runner]
+        Jobs --> Pipeline[Dubbing pipeline]
+        API --> DB[(SQLite project and checkpoint data)]
+        Jobs --> Volume[(Persistent media volume)]
+        Pipeline --> Media[FFmpeg and ffprobe]
+    end
+    Pipeline --> Sarvam[Sarvam: transcription and translation]
+    Pipeline --> Gnani[Gnani: speech synthesis]
+```
+
+The frontend is hosted separately from the API. Project records and job checkpoints are stored with SQLite; uploads, takes, tracks, and exports live on the persistent Railway volume.
+
+## Processing flow
+
+```mermaid
+flowchart TD
+    A[Upload source video] --> B[Consent and voice setup]
+    B --> C[Transcribe source once with Sarvam]
+    C --> D[Apply project and global term rules]
+    D --> E[Translate clips with selected style]
+    E --> F[Generate speech with Gnani]
+    F --> G[Fit speech and run quality checks]
+    G --> H[Save clips and checkpoints]
+    H --> I[Review, edit, and verify]
+    I --> J[Build and validate export]
 ```
 
 ### Provider responsibilities
@@ -107,7 +127,7 @@ For a no-cost local pipeline smoke, set `GNANI_MOCK=1` and `LLM_MOCK=1` in `.env
 
 ## Configuration
 
-Copy `.env.example` to `.env` for local development. Set production secrets in Railway, not in the frontend or repository.
+Copy `.env.example` to `.env` for local development. It contains the full list of supported settings. Keep provider keys and passwords in the backend environment, never in frontend variables or committed files.
 
 ### Vercel
 
@@ -115,42 +135,19 @@ Copy `.env.example` to `.env` for local development. Set production secrets in R
 | --- | --- |
 | `VITE_API_BASE_URL` | Railway API origin, optionally ending in `/api` |
 
-Set the Vercel Root Directory to `frontend`, Framework Preset to **Vite**, Build Command to `npm run build`, and Output Directory to `dist`.
+Set Root Directory to `frontend`, Framework Preset to **Vite**, Build Command to `npm run build`, and Output Directory to `dist`.
 
 ### Railway
 
 | Variable | Purpose |
 | --- | --- |
 | `GNANI_API_KEY` | Gnani speech synthesis and voice services |
-| `GNANI_BASE_URL` | Gnani API host |
-| `SARVAM_API_KEY_1`, `SARVAM_API_KEY_2`, `SARVAM_API_KEY_3`, `SARVAM_API_KEY_4`, `SARVAM_API_KEY_5` | Sarvam keys; rotate across configured keys when a key is rejected or quota-limited |
-| `SARVAM_API_KEY` | Single-key fallback when numbered keys are not configured |
-| `SARVAM_TRANSLATION_MODEL` | Translation model; defaults to `mayura:v1` |
-| `SARVAM_REWRITE_MODEL` | Rewrite and quality retry model |
-| `ANEK_DATA_DIR` | Database and project data directory; mount the persistent volume here |
-| `REQUIRE_ACCESS_AUTH` | Enables the app access gate |
-| `ANEK_ACCESS_PASSWORD` | Password for the app access gate when enabled |
-| `ANEK_AUTH_SECRET` | Signs app access tokens |
-| `PRIVACY_DELETE_PASSWORD` | Required by destructive Privacy actions |
-| `CORS_ORIGINS` | Comma-separated allowed frontend origins; include the deployed Vercel domain |
-| `CORS_ORIGIN_REGEX` | Optional allowed-origin pattern for preview deployments |
-| `MAX_VIDEO_SECONDS` | Maximum accepted video duration, up to 120 seconds |
-| `EXPORT_RETENTION_HOURS` | How long generated exports are kept |
-| `GNANI_DAILY_LIMIT` | Daily speech-service credit limit |
-| `MAX_CREDITS_PER_JOB` | Optional per-job credit cap; `0` disables this cap |
-| `PER_IP_LIMITS` | Per-IP limits for voice cloning, previews, and jobs |
-| `APP_NAME` | App name shown by the API |
-| `NUMERAL_STYLE` | Default numeral style in generated text |
-| `ENABLED_LANGS` | Comma-separated language codes enabled by the service |
-| `LOW_TRUST_VERIFY_LANGS` | Languages requiring stricter review checks |
-| `FIT_TOLERANCE` | Text-length timing estimate multiplier |
-| `MAX_STRETCH` | Maximum legacy timing stretch ratio |
-| `SIMILARITY_THRESHOLD` | Similarity threshold for quality checks |
-| `CONSENT_MATCH_THRESHOLD` | Voice-consent match threshold |
-| `GNANI_MOCK` | Uses mocked Gnani responses for local testing only |
-| `LLM_MOCK` | Uses mocked translation responses for local testing only |
+| `SARVAM_API_KEY_1` to `SARVAM_API_KEY_5` | Sarvam transcription and translation; numbered keys support rotation |
+| `ANEK_DATA_DIR` | Set to `/data` and mount the Railway persistent volume there |
+| `CORS_ORIGINS` | Allow the production Vercel domain to call the API |
+| `PRIVACY_DELETE_PASSWORD` | Protects destructive actions in Privacy settings |
 
-Timing behavior also uses a 100 ms overrun tolerance, up to 15% audio speed-up, and silent-gap spill when it does not overlap speech.
+For a single Sarvam key, `SARVAM_API_KEY` is supported. Optional app access protection uses `REQUIRE_ACCESS_AUTH`, `ANEK_ACCESS_PASSWORD`, and `ANEK_AUTH_SECRET`. See `.env.example` for other tuning, limits, and local mock settings.
 
 ## Deploy
 
@@ -193,14 +190,15 @@ The build runs the API-prefix check, TypeScript validation, and Vite production 
 ## Project layout
 
 ```text
-backend/       FastAPI app, provider clients, pipeline, checks, and static build
-frontend/      React and TypeScript app, Vite config, and API-prefix build check
-scripts/       Provider and project diagnostics
-tests/         Backend API, pipeline, timing, and resilience tests
-docs/          Deployment and product documentation
-Dockerfile     Railway image build
-railway.toml   Railway build and health-check settings
-pyproject.toml Python dependencies and pytest configuration
+anek/
+├── backend/        API, providers, pipeline, checks, and served frontend build
+├── frontend/       React app, Vite config, and API URL build check
+├── scripts/        Provider and project diagnostics
+├── tests/          Backend and pipeline tests
+├── docs/           Deployment and product documentation
+├── Dockerfile      Railway container build
+├── railway.toml    Railway deploy and health check
+└── pyproject.toml  Python dependencies and pytest settings
 ```
 
 ## Credits
