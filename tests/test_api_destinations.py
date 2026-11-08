@@ -1094,6 +1094,31 @@ def test_manual_verification_ignores_advisory_automatic_flags(monkeypatch):
         assert red_check["passed"] is True
 
 
+def test_export_does_not_block_manually_verified_red_clip(monkeypatch):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE dubs SET status='red',user_verified=1 WHERE id='review-dub-1'"
+            )
+        monkeypatch.setattr(app_module, "_language_artifacts", lambda *_: {})
+        monkeypatch.setattr(app_module, "cleanup_project_intermediates", lambda *_: None)
+        monkeypatch.setattr(app_module, "_export_preflight", lambda project_id, lang, formats: {
+            "project_id": project_id, "lang": lang, "requested_formats": formats,
+            "checks": [{"name": "red_clips", "passed": True}],
+            "unresolved_red_clips": [], "downloads": {},
+        })
+
+        response = TestClient(app_module.app).post(
+            f"/api/projects/{project['id']}/export",
+            json={"lang": "hi-IN", "formats": ["report"]},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["exported"] is True
+        assert response.json()["unresolved_red_clips"] == []
+
+
 def test_balance_endpoint_persists_language_specific_placements(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _project_with_review_audio(data_root)

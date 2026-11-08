@@ -3004,7 +3004,7 @@ async def export_project(request: Request, project_id: str, body: ExportRequest)
         with db.connect() as connection:
             red = connection.execute(
                 "SELECT c.idx FROM clips c JOIN dubs d ON d.clip_id=c.id "
-                "WHERE c.project_id=? AND d.lang=? AND d.status='red' ORDER BY c.idx",
+                "WHERE c.project_id=? AND d.lang=? AND d.status='red' AND COALESCE(d.user_verified,0)=0 ORDER BY c.idx",
                 (project_id, body.lang),
             ).fetchall()
         if red:
