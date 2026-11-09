@@ -716,6 +716,52 @@ def test_project_summary_export_preflight_and_report_download(monkeypatch):
         assert json.loads(report_path.read_text(encoding="utf-8"))["language"] == "hi-IN"
 
 
+@pytest.mark.parametrize("cached_mp4", [None, b"truncated mp4"])
+def test_missing_or_truncated_dubbed_mp4_download_is_rebuilt_from_saved_tracks(monkeypatch, cached_mp4):
+    with _sandbox(monkeypatch) as (_, data_root):
+        project = _project_with_review_audio(data_root)
+        source = data_root / "uploads" / project["id"] / "source.mp4"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"source fixture")
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE projects SET video_path=?,original_video_path=? WHERE id=?",
+                (str(source), str(source), project["id"]),
+            )
+        if cached_mp4 is not None:
+            export_dir = data_root / "exports" / project["id"]
+            export_dir.mkdir(parents=True, exist_ok=True)
+            (export_dir / "old_hi-IN_phase3d_ai-dubbed.mp4").write_bytes(cached_mp4)
+
+        rebuilt_paths = []
+
+        def rebuild(project_id, lang, source_path, output_dir):
+            assert project_id == project["id"]
+            assert lang == "hi-IN"
+            assert source_path == source
+            output_dir.mkdir(parents=True, exist_ok=True)
+            result = output_dir / f"source_{lang}_phase3d_ai-dubbed.mp4"
+            result.write_bytes(b"rebuilt mp4")
+            rebuilt_paths.append(result)
+            return result
+
+        monkeypatch.setattr(app_module, "_rebuild_dubbed_preview", rebuild)
+        def validate(path):
+            if path.read_bytes() != b"rebuilt mp4":
+                raise ValueError("invalid or truncated video")
+
+        monkeypatch.setattr(app_module, "_validate_media_file", validate)
+        response = TestClient(app_module.app).get(
+            f"/api/projects/{project['id']}/downloads/mp4?lang=hi-IN"
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("video/mp4")
+        assert response.content == b"rebuilt mp4"
+        assert len(rebuilt_paths) == 1
+        assert app_module._language_artifacts(project["id"], "hi-IN")["mp4"] == rebuilt_paths[0]
+
+
 def test_clip_api_surfaces_raw_transcript_and_prisma_disagreements(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(

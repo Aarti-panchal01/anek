@@ -3132,8 +3132,8 @@ def _rebuild_dubbed_preview(project_id: str, lang: str, source: Path, output_dir
     if not has_video:
         raise ValueError("Original upload has no video stream")
     output_dir.mkdir(parents=True, exist_ok=True)
-    rebuilt = output_dir / f"{source.stem}_{lang}_recovered.mp4"
-    temporary = output_dir / f".{source.stem}_{lang}_recovered.part.mp4"
+    rebuilt = output_dir / f"{source.stem}_{lang}_phase3d_ai-dubbed.mp4"
+    temporary = output_dir / f".{source.stem}_{lang}_phase3d_ai-dubbed.part.mp4"
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-i", str(playable_source), "-i", str(dubbed_track),
@@ -3162,8 +3162,30 @@ async def download_project_artifact(project_id: str, artifact: str, lang: str):
     download_keys = {"mp4": "mp4", "srt": "srt", "report": "report", "audio": "audio_wav", "audio-mp3": "audio_mp3"}
     if artifact not in download_keys:
         raise HTTPException(404, "Artifact format is not supported")
-    project_row(project_id)
+    project = project_row(project_id)
     path = _language_artifacts(project_id, lang).get(download_keys[artifact])
+    if artifact == "mp4":
+        mp4_usable = False
+        if path is not None and path.is_file():
+            try:
+                _validate_media_file(path)
+                mp4_usable = True
+            except Exception as error:
+                LOGGER.warning("Dubbed download is invalid; rebuilding project=%s lang=%s path=%s error=%s",
+                               project_id, lang, path, str(error)[:300])
+        if not mp4_usable:
+            source_value = (
+                project.get("preview_path") if project.get("preview_status") == "ready"
+                else project.get("original_video_path") or project.get("video_path")
+            )
+            if source_value:
+                try:
+                    path = _rebuild_dubbed_preview(
+                        project_id, lang, Path(source_value), DATA_ROOT / "exports" / project_id
+                    )
+                    LOGGER.info("Rebuilt missing or invalid dubbed download project=%s lang=%s path=%s", project_id, lang, path)
+                except Exception:
+                    LOGGER.exception("Could not rebuild missing or invalid dubbed download project=%s lang=%s", project_id, lang)
     if not path:
         raise HTTPException(404, f"{artifact} download not found for {lang}")
     media_types = {"mp4": "video/mp4", "srt": "application/x-subrip", "report": "application/json", "audio": "audio/wav", "audio-mp3": "audio/mpeg"}
