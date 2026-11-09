@@ -21,8 +21,9 @@ Anek checks every dubbed clip for numbers and names, flags the ones it is unsure
 
 ## Demo
 
-Demo video coming soon.
-<!-- Add the demo link here. -->
+
+https://github.com/user-attachments/assets/28f1392b-8269-4348-8f5c-aa922ea20d2b
+
 
 ## Features
 
