@@ -77,7 +77,20 @@ def _status_code(error: Exception) -> int | None:
         return None
 
 
-def _provider_call(operation, *, attempts: int = 4, respect_breaker: bool = True):
+def _provider_error_body(error: Exception) -> str:
+    """Return a short, redacted provider error without request or credential data."""
+    response = getattr(error, "response", None)
+    body = getattr(response, "text", None)
+    if not isinstance(body, str) or not body:
+        body = str(error)
+    body = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[redacted]", body)
+    body = re.sub(r"(?i)(api[_ -]?key|subscription[_ -]?key)([\"']?\s*[:=]\s*[\"']?)[^\s,\"'}]+", r"\1\2[redacted]", body)
+    body = re.sub(r"https?://[^\s\"']+", "[provider-url]", body)
+    return " ".join(body.split())[:300] or "No provider response body"
+
+
+def _provider_call(operation, *, attempts: int = 4, respect_breaker: bool = True,
+                   context: dict[str, Any] | None = None):
     for attempt in range(attempts):
         try:
             result = SharedSarvamLimiter.call(operation, respect_breaker=respect_breaker)
@@ -88,6 +101,16 @@ def _provider_call(operation, *, attempts: int = 4, respect_breaker: bool = True
             if isinstance(exc, ProviderError) and "circuit is open" in str(exc):
                 raise
             status = _status_code(exc)
+            detail = _provider_error_body(exc) if status is not None and status >= 400 else ""
+            if status is not None and status >= 400:
+                safe_context = context or {}
+                LOGGER.error(
+                    "Sarvam HTTP failure path=%s model=%s source_language=%s target_language=%s mode=%s status=%s body=%s",
+                    "/text/translate", safe_context.get("model", "unknown"),
+                    safe_context.get("source_language_code", "unknown"),
+                    safe_context.get("target_language_code", "unknown"),
+                    safe_context.get("mode", "unknown"), status, detail,
+                )
             if status in {401, 403, 402}:
                 error_type = CredentialError
             elif status == 429:
@@ -105,7 +128,8 @@ def _provider_call(operation, *, attempts: int = 4, respect_breaker: bool = True
             if respect_breaker and error_type not in {CredentialError, RateLimitedError, BadInputError}:
                 with SharedSarvamLimiter._lock:
                     SharedSarvamLimiter._unavailable_until = time.monotonic() + 300.0
-            raise error_type(f"Sarvam request failed ({error_type.code})") from exc
+            suffix = f": {detail}" if detail else ""
+            raise error_type(f"Sarvam request failed ({error_type.code}){suffix}") from exc
 
 
 class MockLLMClient:
@@ -175,7 +199,7 @@ class SarvamTranslationClient:
         self._key_fingerprints = [hashlib.sha256(key.encode("utf-8")).hexdigest() for key in self.api_keys]
         self._rotation_index = 0
 
-    def _call_with_key_rotation(self, operation):
+    def _call_with_key_rotation(self, operation, *, context: dict[str, Any] | None = None):
         clients = getattr(self, "clients", [self.client])
         fingerprints = getattr(self, "_key_fingerprints", ["legacy-key"])
         now = time.monotonic()
@@ -195,6 +219,7 @@ class SarvamTranslationClient:
             try:
                 result = _provider_call(
                     lambda: operation(clients[index]), attempts=1, respect_breaker=False,
+                    context=context,
                 )
                 self._rotation_index = (index + 1) % len(clients)
                 return result
@@ -212,7 +237,12 @@ class SarvamTranslationClient:
         raise ProviderError("All configured Sarvam keys are in a 5-minute cooldown")
 
     def translate_text(self, **options):
-        return self._call_with_key_rotation(lambda client: client.text.translate(**options))
+        context = {key: options.get(key) for key in (
+            "model", "source_language_code", "target_language_code", "mode",
+        )}
+        return self._call_with_key_rotation(
+            lambda client: client.text.translate(**options), context=context,
+        )
 
     def _chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         try:

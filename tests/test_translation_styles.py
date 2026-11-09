@@ -5,7 +5,7 @@ import pytest
 from backend.brain.checks import latin_letter_share
 from backend.brain.numbers import compare_numbers
 from backend.clients.llm import (ProviderError, SarvamTranslationClient, SharedSarvamLimiter,
-    _split_at_character_limit)
+    BadInputError, _provider_call, _split_at_character_limit)
 from backend.config import LANGUAGES
 from backend.translation_style import eligible_style_switch_rows, style_switch_eligible
 
@@ -136,6 +136,30 @@ def test_clip_splitter_keeps_parts_within_limit_and_preserves_content():
     parts = _split_at_character_limit(source, 1000)
     assert all(len(part) <= 1000 for part in parts)
     assert "".join(parts) == source
+
+
+def test_sarvam_http_400_keeps_redacted_provider_reason_in_log_and_error(monkeypatch, caplog):
+    class Response:
+        status_code = 400
+        text = '{"error":"invalid target_language_code","api_key":"do-not-log"}'
+
+    class ProviderFailure(Exception):
+        status_code = 400
+        response = Response()
+
+    monkeypatch.setattr(
+        SharedSarvamLimiter, "call",
+        classmethod(lambda cls, operation, **kwargs: operation()),
+    )
+    with pytest.raises(BadInputError, match="invalid target_language_code"):
+        _provider_call(
+            lambda: (_ for _ in ()).throw(ProviderFailure()), attempts=1,
+            context={"model": "mayura:v1", "source_language_code": "en-IN",
+                     "target_language_code": "hi-IN", "mode": "code-mixed"},
+        )
+    assert "path=/text/translate" in caplog.text
+    assert "target_language=hi-IN" in caplog.text
+    assert "do-not-log" not in caplog.text
 
 
 def test_numeric_values_are_sent_as_words_not_pronounceable_placeholders(monkeypatch):
