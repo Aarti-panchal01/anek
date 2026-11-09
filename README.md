@@ -6,7 +6,7 @@
 
 Create, review, and export dubbed videos in ten languages.
 
-[![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF)](https://anek-tau.vercel.app)
+[![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF)](https://anekstudio.vercel.app)
 [![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://github.com/Aarti-panchal01/anek)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)](pyproject.toml)
 [![Deployment](https://img.shields.io/badge/deployed%20with-Vercel%20%2B%20Railway-111111)](docs/GO_LIVE.md)
