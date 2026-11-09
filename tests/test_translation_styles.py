@@ -139,13 +139,13 @@ def test_clip_splitter_keeps_parts_within_limit_and_preserves_content():
 
 
 def test_sarvam_http_400_keeps_redacted_provider_reason_in_log_and_error(monkeypatch, caplog):
-    class Response:
-        status_code = 400
-        text = '{"error":"invalid target_language_code","api_key":"do-not-log"}'
-
     class ProviderFailure(Exception):
+        headers = {"api-key": "never-print-this"}
         status_code = 400
-        response = Response()
+        body = {"error": "invalid target_language_code", "api_key": "do-not-log"}
+
+        def __str__(self):
+            return f"headers: {self.headers}, status_code: {self.status_code}, body: {self.body}"
 
     monkeypatch.setattr(
         SharedSarvamLimiter, "call",
@@ -160,6 +160,7 @@ def test_sarvam_http_400_keeps_redacted_provider_reason_in_log_and_error(monkeyp
     assert "path=/text/translate" in caplog.text
     assert "target_language=hi-IN" in caplog.text
     assert "do-not-log" not in caplog.text
+    assert "never-print-this" not in caplog.text
 
 
 def test_numeric_values_are_sent_as_words_not_pronounceable_placeholders(monkeypatch):

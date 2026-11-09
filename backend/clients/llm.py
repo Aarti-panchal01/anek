@@ -81,8 +81,17 @@ def _provider_error_body(error: Exception) -> str:
     """Return a short, redacted provider error without request or credential data."""
     response = getattr(error, "response", None)
     body = getattr(response, "text", None)
+    if not body:
+        body = getattr(error, "body", None)
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    elif isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
     if not isinstance(body, str) or not body:
-        body = str(error)
+        # Some SDK exceptions stringify response headers as well as the body.
+        # Never use str(error) here because those headers may contain credentials.
+        args = getattr(error, "args", ())
+        body = " ".join(str(value) for value in args if value)
     body = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[redacted]", body)
     body = re.sub(r"(?i)(api[_ -]?key|subscription[_ -]?key)([\"']?\s*[:=]\s*[\"']?)[^\s,\"'}]+", r"\1\2[redacted]", body)
     body = re.sub(r"https?://[^\s\"']+", "[provider-url]", body)
