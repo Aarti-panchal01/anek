@@ -363,6 +363,25 @@ def test_delete_project_removes_upload_exports_and_database_records(monkeypatch)
             assert connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None
 
 
+def test_rename_project_requires_privacy_password_and_updates_name(monkeypatch):
+    with _sandbox(monkeypatch):
+        monkeypatch.setenv("PRIVACY_DELETE_PASSWORD", "test-only-password")
+        project = _resolve(app_module.create_project(app_module.ProjectCreate(
+            name="Before", source_lang="en-IN", target_langs=["hi-IN"],
+        )))
+        client = TestClient(app_module.app)
+        denied = client.patch(f"/api/projects/{project['id']}/name", json={"name": "After"})
+        assert denied.status_code == 403
+        renamed = client.patch(
+            f"/api/projects/{project['id']}/name",
+            json={"name": "  All Languages Demo  "},
+            headers={"X-Privacy-Delete-Password": "test-only-password"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json() == {"id": project["id"], "name": "All Languages Demo"}
+        assert app_module.project_row(project["id"])["name"] == "All Languages Demo"
+
+
 def test_export_cleanup_removes_intermediates_but_keeps_source_final_and_resume_files(monkeypatch):
     with _sandbox(monkeypatch) as (_, data_root):
         project = _resolve(app_module.create_project(app_module.ProjectCreate(

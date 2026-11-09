@@ -456,6 +456,10 @@ class ProjectCreate(BaseModel):
     translation_style: str = "natural"
 
 
+class ProjectRename(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
 class TranslationStyleChange(BaseModel):
     style: str
     confirm: bool = False
@@ -1100,6 +1104,18 @@ async def create_project(body: ProjectCreate) -> dict:
             (project_id, body.name, body.source_lang, json.dumps(body.target_langs), body.translation_style),
         )
     return {"id": project_id, "name": body.name, "status": "created", "translation_style": body.translation_style}
+
+
+@app.patch("/api/projects/{project_id}/name")
+async def rename_project(project_id: str, body: ProjectRename, request: Request) -> dict:
+    _require_privacy_delete_password(request)
+    project_row(project_id)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, "Project name cannot be empty")
+    with db.connect() as connection:
+        connection.execute("UPDATE projects SET name=? WHERE id=?", (name, project_id))
+    return {"id": project_id, "name": name}
 
 
 @app.post("/api/projects/{project_id}/translation-style/preview")
