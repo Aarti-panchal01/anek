@@ -6,6 +6,8 @@
 
 Create, review, and export dubbed videos in ten languages.
 
+*Built for Gnani AI's Great Indian AI Internship Challenge (Creator category).*
+
 [![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF)](https://anekstudio.vercel.app)
 [![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://github.com/Aarti-panchal01/anek)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)](pyproject.toml)
@@ -32,6 +34,8 @@ https://github.com/user-attachments/assets/28f1392b-8269-4348-8f5c-aa922ea20d2b
 - Verified, Review and Needs you states per clip
 - A draggable timeline to fix timing by hand
 - Jobs that resume after a restart
+
+Available targets are Bengali, English, Gujarati, Hindi, Kannada, Malayalam, Marathi, Punjabi, Tamil, and Telugu.
 
 ## Architecture
 
@@ -102,6 +106,10 @@ dropped number, translated brand, swapped phone digit).
 translation quality. The corruptions are synthetic and the autocorrect step was
 exercised with scripted responses, so these numbers verify the checker's logic,
 not real-world accuracy. Full report: [EVAL.md](EVAL.md).
+
+## Language coverage
+
+All ten languages are enabled and pass through the same checks. Automated end-to-end smoke tests (with mocked providers) currently cover Hindi and Kannada. No language has been verified by a native speaker yet, so review the translation and the dub before you publish.
 
 ## Stack
 
