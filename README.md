@@ -88,6 +88,21 @@ General keeps natural English code-switching. Pure translates ordinary English w
 - The editor keeps automatic attempt history, the previous and current takes, and the text changes between attempts.
 - Export includes the mixed dub, subtitles, and a verification report. Projects and exports remain available until you delete the project.
 
+## Evaluation
+
+Anek's deterministic text checks were tested on ten authored fixtures across
+all ten languages, each with four deliberately corrupted variants (wrong digit,
+dropped number, translated brand, swapped phone digit).
+
+- Caught: 40/40 corruptions per language
+- False alarms: 0/10 correct translations per language
+
+**What this covers:** number and protected-term checks, in every supported script.
+**What it does not cover:** ASR, speech synthesis, timing, voice cloning, or
+translation quality. The corruptions are synthetic and the autocorrect step was
+exercised with scripted responses, so these numbers verify the checker's logic,
+not real-world accuracy. Full report: [EVAL.md](EVAL.md).
+
 ## Stack
 
 | Area | Technology |
